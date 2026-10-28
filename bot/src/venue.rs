@@ -14,22 +14,9 @@ use alloy::{
 use anyhow::Result;
 
 use crate::{dex::ExitRoute, executor::Payload, protocol::LendingProtocol};
+pub use onchain_core::sim::{SimAt, SimFee, SimReverted};
 
-/// The fee fields a simulated call carries: what the real tx would bid. Venues read tx.gasprice
-/// (priority-fee taxes, dynamic fees), so a simulation at gas price 0 can overstate the profit.
-#[derive(Debug, Clone, Copy)]
-pub struct SimFee {
-    pub max_fee_per_gas: u128,
-    pub max_priority_fee_per_gas: u128,
-}
-
-/// Execute a simulation as block `number` with timestamp `time`.
-#[derive(Debug, Clone, Copy)]
-pub struct SimAt {
-    pub number: u64,
-    pub time: u64,
-}
-
+/// A venue's simulation, decoded: the profit its contract reports.
 pub struct SimResult {
     pub profit: U256,
     pub gas_used: u64,
@@ -40,23 +27,6 @@ pub struct SimResult {
     /// The probed oracle's `price()` in the simulated state, read just before the call.
     pub probe_price: Option<U256>,
 }
-
-/// A simulation that ran and reverted; `block_number` = the block the node simulated (see
-/// SimResult::block_number).
-#[derive(Debug)]
-pub struct SimReverted {
-    pub message: String,
-    pub block_number: Option<u64>,
-    pub probe_price: Option<U256>,
-}
-
-impl std::fmt::Display for SimReverted {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "sim reverted: {}", self.message)
-    }
-}
-
-impl std::error::Error for SimReverted {}
 
 pub trait LiquidationVenue<L: LendingProtocol>: Send + Sync {
     /// The contract the liquidation tx (or operation) is sent to.

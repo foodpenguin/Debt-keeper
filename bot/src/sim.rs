@@ -24,6 +24,8 @@ use crate::{
     venue::LiquidationVenue,
 };
 pub use crate::venue::{SimAt, SimFee, SimResult, SimReverted};
+pub use onchain_core::sim::{RawSim, probe_gas_call};
+use onchain_core::sim::Probe;
 
 /// Packed entry (MorphoLiquidator fallback): bytes [125, 141) hold minProfit as uint128.
 pub const PACKED_MIN_PROFIT: MinProfitSlot = MinProfitSlot { offset: 125, width: 16 };
@@ -33,7 +35,6 @@ pub const ABI_LIQUIDATE_MIN_PROFIT: MinProfitSlot = MinProfitSlot { offset: 4 + 
 
 /// Where the liquidator lives in simulations when no deployed address is configured.
 pub const SIM_LIQUIDATOR: Address = address!("00000000000000000000000000000000000b0771");
-const GAS_PRICE_ORACLE: Address = address!("420000000000000000000000000000000000000F");
 /// `price()` (Morpho oracle interface).
 const PRICE_SELECTOR: [u8; 4] = [0xa0, 0x35, 0xb1, 0xfe];
 
@@ -43,9 +44,6 @@ use crate::contracts::{IMorphoLiquidator, LMarketParams};
 sol! {
     interface IAllowance {
         function allowance(address owner, address spender) external view returns (uint256);
-    }
-    interface IGasPriceOracle {
-        function getL1FeeUpperBound(uint256 unsignedTxSize) external view returns (uint256);
     }
 }
 
@@ -128,97 +126,12 @@ impl LiquidatorCode {
     }
 }
 
-/// One simulated call (see `simulate_call`).
-pub struct RawSim {
-    pub return_data: Bytes,
-    pub gas_used: u64,
-    pub l1_fee_wei: U256,
-    pub block_number: Option<u64>,
-    pub probe_price: Option<U256>,
-}
-
-/// Runs `calldata` from `from` to `to` on top of `block`'s state plus `ov` with eth_simulateV1, as
-/// the next block when `at` is given, and returns what it returned with the gas actually used and
-/// the L1 fee of its calldata. A revert is a `SimReverted` error.
-///
-/// One `eth_simulateV1` call returns both the result and the gas actually used. (eth_call +
-/// eth_estimateGas cannot do this: Base's reth nodes ignore block overrides in estimateGas, so the
-/// estimate would run at the wrong block.) `probe` = an oracle whose `price()` is read in the same
-/// simulated state just before the call: same request, so same node and state.
+/// `onchain_core::sim::simulate_call` with the probe a Morpho oracle's `price()` (read in the same
+/// simulated state just before the call; see `RawSim::probe`).
 #[allow(clippy::too_many_arguments)]
-pub async fn simulate_call<P: Provider>(p: &P, from: Address, to: Address, calldata: Bytes, block: BlockId, ov: &StateOverride, at: Option<SimAt>, fee: Option<SimFee>, probe: Option<Address>) -> Result<RawSim> {
-    let mut call = serde_json::json!({
-        "from": from,
-        "to": to,
-        "data": calldata,
-        "gas": "0x1c9c380", // 30M: generous ceiling, gasUsed is what we report
-    });
-    // Priced like the real tx: pools that read tx.gasprice (priority-fee taxes, dynamic fees) pay
-    // out what they would at this bid, not at gas price 0. With validation off the simulated block's
-    // base fee is 0, so tx.gasprice = the priority fee (what such taxes are levied on). Nodes still
-    // check the sender can pay gas x maxFeePerGas (measured on Base, 2026-10-28), so the sender gets
-    // a balance override.
-    let mut ov = ov.clone();
-    if let Some(f) = fee {
-        call["maxFeePerGas"] = serde_json::json!(format!("0x{:x}", f.max_fee_per_gas));
-        call["maxPriorityFeePerGas"] = serde_json::json!(format!("0x{:x}", f.max_priority_fee_per_gas));
-        ov.entry(from).or_default().balance = Some(U256::from(u128::MAX));
-    }
-    let mut calls: Vec<serde_json::Value> = probe
-        .map(|oracle| serde_json::json!({ "from": from, "to": oracle, "data": Bytes::from_static(&PRICE_SELECTOR), "gas": "0x7a120" }))
-        .into_iter()
-        .collect();
-    let idx = calls.len();
-    calls.push(call);
-    let mut block_calls = serde_json::json!({ "stateOverrides": ov, "calls": calls });
-    if let Some(a) = at {
-        block_calls["blockOverrides"] = serde_json::json!({ "number": format!("0x{:x}", a.number), "time": format!("0x{:x}", a.time) });
-    }
-    let payload = serde_json::json!({ "blockStateCalls": [block_calls], "validation": false });
-    let tag = match block {
-        BlockId::Number(alloy::eips::BlockNumberOrTag::Number(n)) => serde_json::json!(format!("0x{n:x}")),
-        BlockId::Number(alloy::eips::BlockNumberOrTag::Pending) => serde_json::json!("pending"),
-        _ => serde_json::json!("latest"),
-    };
-    // The L1 fee only depends on the calldata size: fetch it alongside the simulation.
-    let (r, l1) = tokio::join!(p.raw_request::<_, serde_json::Value>("eth_simulateV1".into(), (payload, tag)), l1_fee(p, calldata.len(), block));
-    let r = r.map_err(|e| anyhow::anyhow!("simulation unavailable (eth_simulateV1): {e}"))?;
-    let block_number = r[0]["number"].as_str().and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-    let probe_price = probe.and_then(|_| {
-        let pc = &r[0]["calls"][0];
-        let data: Bytes = pc["returnData"].as_str().filter(|_| pc["status"].as_str() == Some("0x1"))?.parse().ok()?;
-        (data.len() == 32).then(|| U256::from_be_slice(&data))
-    });
-    let c = &r[0]["calls"][idx];
-    if c["status"].as_str() != Some("0x1") {
-        let msg = c["error"]["message"].as_str().unwrap_or("reverted");
-        let data = c["returnData"].as_str().or_else(|| c["error"]["data"].as_str()).unwrap_or("");
-        return Err(SimReverted { message: format!("{msg} {data}"), block_number, probe_price }.into());
-    }
-    let return_data: Bytes = c["returnData"].as_str().context("simulateV1: no returnData")?.parse()?;
-    let gas_used = c["gasUsed"]
-        .as_str()
-        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-        .context("simulateV1: no gasUsed")?;
-    Ok(RawSim { return_data, gas_used, l1_fee_wei: l1.unwrap_or(U256::ZERO), block_number, probe_price })
-}
-
-/// Debug aid: does the call succeed under each fixed gas limit?
-pub async fn probe_gas_call<P: Provider>(p: &P, from: Address, to: Address, calldata: Bytes, block: BlockId, ov: &StateOverride, limits: &[u64]) -> Vec<(u64, bool)> {
-    let mut out = Vec::new();
-    for &g in limits {
-        let tx = TransactionRequest::default().with_from(from).with_to(to).with_input(calldata.clone()).with_gas_limit(g);
-        out.push((g, p.call(tx).block(block).overrides(ov.clone()).await.is_ok()));
-    }
-    out
-}
-
-/// L1 data fee upper bound (Base) for a tx with this much calldata.
-async fn l1_fee<P: Provider>(p: &P, calldata_len: usize, block: BlockId) -> Result<U256> {
-    let data: Bytes = IGasPriceOracle::getL1FeeUpperBoundCall { unsignedTxSize: U256::from(calldata_len + 100) }.abi_encode().into();
-    let tx = TransactionRequest::default().with_to(GAS_PRICE_ORACLE).with_input(data);
-    let out = p.call(tx).block(block).await?;
-    Ok(IGasPriceOracle::getL1FeeUpperBoundCall::abi_decode_returns(&out)?)
+pub async fn simulate_call<P: Provider>(p: &P, from: Address, to: Address, calldata: Bytes, block: BlockId, ov: &StateOverride, at: Option<SimAt>, fee: Option<SimFee>, oracle: Option<Address>) -> Result<RawSim> {
+    let probe = oracle.map(|to| Probe { to, data: Bytes::from_static(&PRICE_SELECTOR) });
+    onchain_core::sim::simulate_call(p, from, to, calldata, block, ov, at, fee, probe).await
 }
 
 /// True if `owner` has granted `spender` an effectively unlimited allowance.
@@ -358,7 +271,7 @@ impl Simulator {
         let r = simulate_call(p, self.executor, self.liquidator, calldata, block, &self.overrides(extra), at, fee, probe).await?;
         // Every entrypoint returns a single uint256 profit.
         let profit = IMorphoLiquidator::liquidateCall::abi_decode_returns(&r.return_data)?;
-        Ok(SimResult { profit, gas_used: r.gas_used, l1_fee_wei: r.l1_fee_wei, block_number: r.block_number, probe_price: r.probe_price })
+        Ok(SimResult { profit, gas_used: r.gas_used, l1_fee_wei: r.l1_fee_wei, block_number: r.block_number, probe_price: r.probe })
     }
 
     /// Debug aid: does the call succeed under each fixed gas limit?

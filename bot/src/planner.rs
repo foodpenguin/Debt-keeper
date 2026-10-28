@@ -262,7 +262,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         if let Some(q) = c.price_probe {
             let seen = match &res {
                 Ok(r) => r.probe_price,
-                Err(e) => e.downcast_ref::<SimReverted>().and_then(|s| s.probe_price),
+                Err(e) => e.downcast_ref::<SimReverted>().and_then(|s| s.probe),
             };
             if !q.is_new(seen) {
                 plan.stale_price = true;

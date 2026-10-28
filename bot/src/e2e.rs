@@ -109,8 +109,7 @@ async fn e2e_live_send_on_anvil_fork() {
             gas_limit: 1_500_000,
             base_fee_wei: base_fee.max(1),
             priority_fee_wei: 1_000_000,
-            market: 0,
-            user: WETH_BORROWER,
+            key: executor::TxKey::of_address(0, WETH_BORROWER),
             block,
             deadline_block: deadline,
         }
@@ -140,7 +139,7 @@ async fn e2e_live_send_on_anvil_fork() {
     ex = ex.with_max_inflight(2);
     let b = reader.get_block_number().await.unwrap();
     let mut other = mk(b, b + 2, U256::from(1u64));
-    other.market = 1; // another position (same borrower, a second slice of its collateral)
+    other.key.group = 1; // another position (same borrower, a second slice of its collateral)
     let i1 = ex.send(mk(b, b + 2, U256::from(1u64))).await.unwrap();
     assert!(ex.send(mk(b, b + 2, U256::from(1u64))).await.is_err(), "this position is already in flight");
     let i2 = ex.send(other).await.unwrap();
@@ -178,7 +177,7 @@ async fn e2e_live_send_on_anvil_fork() {
     let recorded: Vec<u64> = std::fs::read_to_string(&nonce_file).unwrap().split_whitespace().filter_map(|x| x.parse().ok()).collect();
     assert_eq!(recorded[0], start_nonce + 6, "the shared file holds the next nonce");
     let _ = std::fs::remove_file(&nonce_file);
-    let _ = executor::deadline_blocks(4.0, 2.0);
+    let _ = crate::gates::deadline_blocks(4.0, 2.0);
 }
 
 /// Fix for "lookahead candidates are simulated at the current block": a position that is healthy
@@ -371,8 +370,7 @@ async fn e2e_stuck_tx_is_replaced_by_a_cancel() {
         gas_limit: 100_000,
         base_fee_wei: base_fee.max(1),
         priority_fee_wei: 1_000_000,
-        market: 0,
-        user: Address::ZERO,
+        key: executor::TxKey::of_address(0, Address::ZERO),
         block: b,
         deadline_block: b + 1,
     };

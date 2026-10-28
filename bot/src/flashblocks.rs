@@ -1,6 +1,5 @@
-//! Flashblocks stream (Base, until Denim): ~200 ms sub-blocks pushed over WebSocket as
-//! brotli-compressed JSON. Message `index` 0 opens a block (`base`), 1..=10 add transactions
-//! (`diff.transactions`, raw EIP-2718 bytes). There are no receipts in the stream, so oracle
+//! Oracle updates from the Flashblocks stream (Base, until Denim; the reconnecting reader and the
+//! message decoding are `onchain_core::flashblocks`). There are no receipts in the stream, so oracle
 //! updates are recognised from the transactions themselves: a Chainlink transmitter calls
 //! `forward(aggregator, transmit(...))` on a forwarder (or `transmit` directly), and the new
 //! answer is the median of the report's observations (checked equal to `AnswerUpdated`).
@@ -10,23 +9,21 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io::Read,
     sync::{Arc, Mutex, RwLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use alloy::{
     consensus::{Transaction, TxEnvelope, transaction::SignerRecoverable},
     eips::eip2718::Decodable2718,
-    primitives::{Address, B256, Bytes, U256, keccak256},
+    primitives::{Address, B256, U256, keccak256},
     sol,
     sol_types::SolCall,
 };
-use anyhow::{Context, Result};
-use futures::StreamExt;
-use serde::Deserialize;
+pub use onchain_core::flashblocks::{Decoded, decode_message};
+use onchain_core::flashblocks::run_stream;
 use tokio::sync::{mpsc, watch};
-use tracing::{info, warn};
+use tracing::warn;
 
 sol! {
     function forward(address target, bytes data);
@@ -105,61 +102,6 @@ pub struct Stream {
 
 const KEEP_BLOCKS: u64 = 60;
 
-#[derive(Deserialize)]
-struct Msg {
-    #[serde(default)]
-    index: u64,
-    #[serde(default)]
-    base: Option<MsgBase>,
-    #[serde(default)]
-    diff: Option<MsgDiff>,
-    #[serde(default)]
-    metadata: Option<MsgMeta>,
-}
-#[derive(Deserialize)]
-struct MsgBase {
-    block_number: String,
-    #[serde(default)]
-    timestamp: Option<String>,
-    #[serde(default)]
-    base_fee_per_gas: Option<String>,
-}
-#[derive(Deserialize)]
-struct MsgDiff {
-    #[serde(default)]
-    transactions: Vec<Bytes>,
-}
-#[derive(Deserialize)]
-struct MsgMeta {
-    block_number: u64,
-}
-
-/// One decoded flashblock.
-pub struct Decoded {
-    pub block: u64,
-    pub index: u64,
-    pub txs: Vec<Bytes>,
-    /// Block timestamp and base fee, carried by index 0 only.
-    pub timestamp: Option<u64>,
-    /// Parsed from the flashblock base; unused on the liquidation path.
-    #[allow(dead_code)]
-    pub base_fee: Option<u128>,
-}
-
-pub fn decode_message(compressed: &[u8]) -> Result<Decoded> {
-    let mut s = String::new();
-    brotli::Decompressor::new(compressed, 4096).read_to_string(&mut s).context("brotli")?;
-    let m: Msg = serde_json::from_str(&s).context("flashblock json")?;
-    let block = match (&m.metadata, &m.base) {
-        (Some(md), _) => md.block_number,
-        (None, Some(b)) => u64::from_str_radix(b.block_number.trim_start_matches("0x"), 16)?,
-        _ => anyhow::bail!("flashblock without block number"),
-    };
-    let timestamp = m.base.as_ref().and_then(|b| b.timestamp.as_deref()).and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok());
-    let base_fee = m.base.as_ref().and_then(|b| b.base_fee_per_gas.as_deref()).and_then(|t| u128::from_str_radix(t.trim_start_matches("0x"), 16).ok());
-    Ok(Decoded { block, index: m.index, txs: m.diff.map(|d| d.transactions).unwrap_or_default(), timestamp, base_fee })
-}
-
 /// Who may move an aggregator's answer: `aggregator.getTransmitters()` are forwarder contracts
 /// (each with `getAuthorizedSenders()` EOAs) or, for direct transmits, the EOAs themselves.
 #[derive(Debug, Clone, Default)]
@@ -233,39 +175,6 @@ fn median(report: &[u8]) -> Option<U256> {
     }
     let limbs = m.into_raw().into_limbs();
     Some(U256::from_limbs([limbs[0], limbs[1], limbs[2], 0]))
-}
-
-/// Connects (and reconnects, with backoff) in the background and hands every decoded flashblock to
-/// `on_msg` with its arrival time. `stream` names it in the logs.
-fn run_stream(url: String, stream: &'static str, mut on_msg: impl FnMut(Decoded, Instant) + Send + 'static) {
-    tokio::spawn(async move {
-        let mut backoff = Duration::from_secs(1);
-        loop {
-            match tokio_tungstenite::connect_async(url.as_str()).await {
-                Ok((mut ws, _)) => {
-                    info!(stream, "flashblocks stream connected");
-                    backoff = Duration::from_secs(1);
-                    while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
-                        let Ok(tokio_tungstenite::tungstenite::Message::Binary(b)) = msg else {
-                            if msg.is_err() {
-                                break;
-                            }
-                            continue;
-                        };
-                        let at = Instant::now();
-                        match decode_message(&b) {
-                            Ok(d) => on_msg(d, at),
-                            Err(e) => warn!(stream, error = %e, "flashblock decode failed"),
-                        }
-                    }
-                    warn!(stream, "flashblocks stream stalled or closed; reconnecting");
-                }
-                Err(e) => warn!(stream, error = %e, backoff_s = backoff.as_secs(), "flashblocks connect failed"),
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(30));
-        }
-    });
 }
 
 /// Connects (and reconnects) to the stream in the background.

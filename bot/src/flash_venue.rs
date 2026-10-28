@@ -118,7 +118,7 @@ impl<L: DirectLiquidation> LiquidationVenue<L> for FlashLiquidatorVenue<L> {
     async fn simulate<P: Provider>(&self, p: &P, calldata: Bytes, block: BlockId, overrides: &StateOverride, at: Option<SimAt>, fee: Option<SimFee>, probe: Option<Address>) -> Result<SimResult> {
         let r = sim::simulate_call(p, self.executor, self.liquidator, calldata, block, &self.overrides(overrides), at, fee, probe).await?;
         let profit = IFlashLiquidator::liquidateCall::abi_decode_returns(&r.return_data)?;
-        Ok(SimResult { profit, gas_used: r.gas_used, l1_fee_wei: r.l1_fee_wei, block_number: r.block_number, probe_price: r.probe_price })
+        Ok(SimResult { profit, gas_used: r.gas_used, l1_fee_wei: r.l1_fee_wei, block_number: r.block_number, probe_price: r.probe })
     }
 
     async fn probe_gas<P: Provider>(&self, p: &P, calldata: Bytes, block: BlockId, overrides: &StateOverride, limits: &[u64]) -> Vec<(u64, bool)> {

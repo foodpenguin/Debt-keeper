@@ -1454,29 +1454,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bot"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
- "brotli",
- "clap",
- "futures",
- "rand 0.8.8",
- "reqwest",
- "rpassword",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "toml",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "brotli"
 version = "8.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3095,6 +3072,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "liquidation-framework"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "brotli",
+ "clap",
+ "futures",
+ "onchain-core",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3267,6 +3265,25 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "onchain-core"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "brotli",
+ "futures",
+ "reqwest",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tower",
+ "tracing",
+]
 
 [[package]]
 name = "openssl-probe"

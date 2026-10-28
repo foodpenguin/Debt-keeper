@@ -1,33 +1,6 @@
-mod atlas;
-mod atlas_venue;
-mod chain;
-mod config;
-mod contracts;
-mod dash;
-mod dex;
-mod engine;
-mod protocol;
-mod executor;
-mod flash_venue;
-mod funding;
-mod flashblocks;
-#[cfg(test)]
-mod e2e;
-mod heads;
-mod live;
-mod loss;
-mod morpho;
-mod num;
-mod oracle;
-mod planner;
-mod risk;
-mod router;
-mod v3router;
-mod rpc;
-mod sim;
-#[cfg(test)]
-mod testkit;
-mod venue;
+//! Liquidation bot — entry point (scan / watch / dashboard / live / loss / value-auction). The
+//! framework is the `liquidation_framework` library (see lib.rs); this binary runs it for Morpho
+//! Blue on Base.
 
 use std::{
     collections::HashMap,
@@ -50,7 +23,9 @@ use tracing::{info, warn};
 
 use alloy::sol;
 
-use crate::{
+use liquidation_framework::{
+    actor::{self, ExecHandle},
+    atlas, atlas_venue, config, dash, dex, executor, flash_venue, flashblocks, funding, gates, heads, live, loss, morpho, oracle, planner, protocol, risk, rpc, sim, v3router, venue,
     config::Config,
     engine::JournalRow,
     heads::Head,
@@ -473,7 +448,7 @@ async fn plan_one<P: Provider>(engine: &mut MorphoEngine<P>, market: &str, user:
     let v3 = build_v3(engine).await?;
     let meta = &engine.metas[mi];
     let planner = Planner { protocol: &engine.protocol, aggregator: &kyber, venue: &simulator, cfg: &engine.cfg.exec, v3: Some(&v3), mode: &engine.cfg.router.mode };
-    let deadline_block = h.number + executor::deadline_blocks(engine.cfg.exec.deadline_secs, DEFAULT_BLOCK_TIME);
+    let deadline_block = h.number + gates::deadline_blocks(engine.cfg.exec.deadline_secs, DEFAULT_BLOCK_TIME);
     let sim_time = h.timestamp + engine.cfg.lookahead_secs(DEFAULT_BLOCK_TIME);
     let ctx = PlanCtx { meta, snap: &snap, view: &view, block: h.number, base_fee_wei: h.base_fee, eth_usd, overrides, deadline_block, sim_time, pending, price_probe: None };
     let plan = planner.plan(&engine.provider, &ctx).await?;
@@ -755,7 +730,7 @@ async fn on_fb_event<P: Provider + Clone + 'static>(
     block_time: f64,
     parts: &Arc<PlannerParts>,
     budget: &mut risk::DailyBudget,
-    exec: &mut Option<executor::Executor<P>>,
+    exec: Option<&ExecHandle>,
     journal: &mut std::fs::File,
 ) -> Result<()> {
     match ev {
@@ -1072,7 +1047,7 @@ async fn on_oracle_update<P: Provider + Clone>(
     block_time: f64,
     parts: &PlannerParts,
     budget: &mut risk::DailyBudget,
-    exec: &mut Option<executor::Executor<P>>,
+    exec: Option<&ExecHandle>,
     journal: &mut std::fs::File,
 ) -> Result<()> {
     let queue_ms = u.seen.elapsed().as_millis() as u64;
@@ -1113,7 +1088,7 @@ async fn on_oracle_update<P: Provider + Clone>(
     // (it trails the stream by ~50-100 ms) the plan counts as stale and is retried briefly. Only a
     // fresh, probed pending plan may send (see below).
     let planner = parts.planner(&engine.cfg.flashblocks.router);
-    let deadline_block = u.block + executor::deadline_blocks(engine.cfg.exec.deadline_secs, block_time);
+    let deadline_block = u.block + gates::deadline_blocks(engine.cfg.exec.deadline_secs, block_time);
     for (mi, price) in moved {
         fb.last_oracle.insert(mi, (u.block, u.index, u.seen));
         let meta = &engine.metas[mi];
@@ -1232,8 +1207,13 @@ async fn on_oracle_update<P: Provider + Clone>(
             Ok(None)
         };
         let ctx_of = |i: usize, state: &'static str| if state == "pending" { &ctxs[i].1 } else { &ctxs[i].0 };
-        plan_and_send(ready, exec, parts, &provider, "flashblock", journal, on_plan, ctx_of).await?;
+        plan_and_send(ready, exec, parts, &provider, "flashblock", journal, on_plan, ctx_of, None, no_side).await?;
     }
+    Ok(())
+}
+
+/// `plan_and_send` without side events (the same-block path itself).
+async fn no_side(_: flashblocks::FbEvent, _: &mut std::fs::File) -> Result<()> {
     Ok(())
 }
 
@@ -1284,14 +1264,14 @@ async fn checked_priority<P: Provider>(parts: &PlannerParts, provider: &P, c: &P
 /// Live send of an approved plan (skips at max_inflight, when this position or another one in the
 /// same market is in flight, or when the wallet cannot cover the worst-case gas). `bid` = the risk
 /// gate's priority, checked at its own priority first. `path` = "block" or "flashblock".
-async fn send_approved<P: Provider>(e: &mut executor::Executor<P>, parts: &PlannerParts, provider: &P, c: &PlanCtx<'_, Morpho>, plan: &planner::Plan, bid: u128, path: &str) -> Option<executor::Inflight> {
+async fn send_approved<P: Provider>(e: &ExecHandle, parts: &PlannerParts, provider: &P, c: &PlanCtx<'_, Morpho>, plan: &planner::Plan, bid: u128, path: &str) -> Option<executor::Inflight> {
     let (meta, v, cfg) = (c.meta, c.view, &parts.exec);
-    if !e.can_send() || e.is_inflight(v.market, v.user) {
+    if !e.can_send() || e.is_inflight(tx_key(v)) {
         return None;
     }
     // Plans are simulated on a state without the txs in flight: one in the same market sells the
     // same collateral through the same pools first, so this plan's price would no longer hold.
-    if e.is_market_inflight(v.market) {
+    if e.is_group_inflight(v.market as u64) {
         info!(market = %meta.name, user = %v.user, path, "a liquidation in this market is in flight; not sending another on a stale price");
         return None;
     }
@@ -1305,7 +1285,7 @@ async fn send_approved<P: Provider>(e: &mut executor::Executor<P>, parts: &Plann
     // the first reading.
     let spendable = match e.spendable() {
         Some(b) => Ok(b),
-        None => e.balance().await,
+        None => provider.get_balance(e.address()).await.map_err(anyhow::Error::from),
     };
     match spendable {
         Ok(b) if b < U256::from(worst_wei) => {
@@ -1318,7 +1298,7 @@ async fn send_approved<P: Provider>(e: &mut executor::Executor<P>, parts: &Plann
         }
         _ => {}
     }
-    let req = executor::SendRequest { payload, min_profit, gas_limit, base_fee_wei, priority_fee_wei, market: v.market, user: v.user, block, deadline_block };
+    let req = executor::SendRequest { payload, min_profit, gas_limit, base_fee_wei, priority_fee_wei, key: tx_key(v), block, deadline_block };
     match e.send(req).await {
         Ok(inf) => {
             info!(hash = %inf.hash, block, deadline_block, market = %meta.name, user = %v.user, path, "LIVE tx SENT");
@@ -1331,70 +1311,93 @@ async fn send_approved<P: Provider>(e: &mut executor::Executor<P>, parts: &Plann
     }
 }
 
+/// The executor key of a liquidation: the market is the group (one tx per market in flight), the
+/// borrower the item.
+fn tx_key(v: &PositionView) -> executor::TxKey {
+    executor::TxKey::of_address(v.market as u64, v.user)
+}
+
 /// Plans the candidates in `ready` (each yields its index and plan result) and sends the approved
-/// ones, one send at a time, WITHOUT pausing the planning of the others: the executor is moved into
-/// the send future and back. `on_plan` journals a plan and returns the bid to send it at (None =
-/// not sent); `ctx_of(i, plan_state)` gives the context it was planned on.
+/// ones as soon as each is ready, WITHOUT pausing the planning of the others; several sends run at
+/// once (their bid re-simulations in parallel; the executor task broadcasts them in turn). One per
+/// market per batch: a second plan in a market already being sent waits for the next batch, priced
+/// on a state that includes the first. `on_plan` journals a plan and returns the bid to send it at
+/// (None = not sent); `ctx_of(i, plan_state)` gives the context it was planned on.
+///
+/// `side` = flashblock events that must not wait for this batch (the block path passes the
+/// stream): each one is handled by `on_side` the moment it arrives, ahead of the batch, whose
+/// planning resumes afterwards.
 #[allow(clippy::too_many_arguments)]
-async fn plan_and_send<'c, P, S, R, F, C>(
+async fn plan_and_send<'c, P, S, R, F, C, G>(
     mut ready: S,
-    exec: &mut Option<executor::Executor<P>>,
+    exec: Option<&ExecHandle>,
     parts: &PlannerParts,
     provider: &P,
     path: &str,
     journal: &mut std::fs::File,
     mut on_plan: F,
     ctx_of: C,
+    mut side: Option<&mut tokio::sync::mpsc::Receiver<flashblocks::FbEvent>>,
+    mut on_side: G,
 ) -> Result<()>
 where
     P: Provider,
     S: futures::Stream<Item = R> + Unpin,
     F: FnMut(R, &mut std::fs::File) -> Result<Option<(usize, &'static str, planner::Plan, u128)>>,
     C: Fn(usize, &'static str) -> &'c PlanCtx<'c, Morpho>,
+    G: AsyncFnMut(flashblocks::FbEvent, &mut std::fs::File) -> Result<()>,
 {
-    use futures::{FutureExt, StreamExt};
-    let mut queue: std::collections::VecDeque<(usize, &'static str, planner::Plan, u128)> = Default::default();
-    let mut idle = exec.take();
-    let mut sending: Option<futures::future::BoxFuture<'_, (executor::Executor<P>, Option<executor::Inflight>)>> = None;
+    use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
+    let mut sending: FuturesUnordered<futures::future::BoxFuture<'_, Option<executor::Inflight>>> = FuturesUnordered::new();
+    let mut claimed: std::collections::HashSet<usize> = Default::default();
     let mut planning = true;
-    loop {
-        if sending.is_none()
-            && let Some((i, state, plan, bid)) = queue.pop_front()
-            && let Some(mut e) = idle.take()
-        {
-            let c = ctx_of(i, state);
-            sending = Some(async move {
-                let inf = send_approved(&mut e, parts, provider, c, &plan, bid, path).await;
-                (e, inf)
-            }
-            .boxed());
-        }
-        if !planning && sending.is_none() && (queue.is_empty() || idle.is_none()) {
-            break;
-        }
+    while planning || !sending.is_empty() {
         tokio::select! {
+            biased;
+            ev = async { side.as_mut().expect("guarded").recv().await }, if side.is_some() => match ev {
+                Some(ev) => on_side(ev, journal).await?,
+                None => side = None,
+            },
             next = ready.next(), if planning => match next {
                 Some(r) => {
-                    if let Some(job) = on_plan(r, journal)? {
-                        queue.push_back(job);
+                    if let (Some((i, state, plan, bid)), Some(e)) = (on_plan(r, journal)?, exec) {
+                        let c = ctx_of(i, state);
+                        if claimed.insert(c.view.market) {
+                            sending.push(async move { send_approved(e, parts, provider, c, &plan, bid, path).await }.boxed());
+                        } else {
+                            info!(market = %c.meta.name, user = %c.view.user, path, "another liquidation in this market is being sent; this one waits for a fresh plan");
+                        }
                     }
                 }
                 None => planning = false,
             },
-            (e, inf) = async { sending.as_mut().expect("guarded").await }, if sending.is_some() => {
-                sending = None;
-                idle = Some(e);
+            Some(inf) = sending.next(), if !sending.is_empty() => {
                 if let Some(inf) = inf {
                     writeln!(journal, "{}", json!({ "kind": "sent", "block": inf.sent_block, "path": path, "tx": inf }))?;
                 }
             }
         }
     }
-    *exec = idle;
     Ok(())
 }
 
-async fn watch<P: Provider + Clone + 'static>(
+/// A tx the executor task settled: journaled, and a revert's real cost charged to the daily budget
+/// (a success paid for itself).
+fn on_settled(s: actor::Settled, block: u64, now_unix: u64, eth_usd: f64, cooldown_secs: u64, budget: &mut risk::DailyBudget, journal: &mut std::fs::File) -> Result<()> {
+    let actor::Settled { inflight, outcome, cooldown_started } = s;
+    if let executor::Outcome::Included { success: false, gas_used, effective_gas_price, l1_fee_wei, .. } = &outcome {
+        let cost = (*gas_used as f64 * *effective_gas_price as f64 + *l1_fee_wei as f64) / 1e18 * eth_usd;
+        budget.charge(now_unix, cost);
+    }
+    info!(hash = %inflight.hash, ?outcome, "LIVE tx outcome");
+    writeln!(journal, "{}", json!({ "kind": "outcome", "block": block, "tx": inflight, "outcome": outcome }))?;
+    if cooldown_started {
+        warn!(cooldown_s = cooldown_secs, "LIVE sending paused after a burst of failed txs; resumes by itself");
+    }
+    Ok(())
+}
+
+async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     engine: &mut MorphoEngine<P>,
     from_block: Option<u64>,
     pool: rpc::RpcPool,
@@ -1419,23 +1422,28 @@ async fn watch<P: Provider + Clone + 'static>(
     // Candidate -> block it was last planned at.
     let mut last_planned: HashMap<(usize, Address), u64> = HashMap::new();
     let mut tracker = loss::LossTracker::default();
-    let mut budget = risk::DailyBudget::default();
-    // Live sending (None = shadow). The key never leaves the keystore decrypt.
-    let mut exec = match live {
-        None => None,
+    // Shared by the block path and the flashblock events handled while it plans (see plan_and_send).
+    let budget = std::cell::RefCell::new(risk::DailyBudget::default());
+    // Live sending (None = shadow). The key never leaves the keystore decrypt. The executor runs
+    // as its own task (onchain_core::actor): sends go to it as messages, it polls receipts on every
+    // block announced on `blocks_tx`, and settled txs come back on `settled`.
+    let (blocks_tx, blocks_rx) = watch::channel(0u64);
+    let (exec, mut settled) = match live {
+        None => (None, None),
         Some((signer, broadcast)) => {
             preflight_live(engine, signer.address()).await?;
             let b = executor::Broadcaster::new(executor::Broadcaster::client()?, broadcast);
             b.spawn_keepalive(executor::KEEPALIVE_EVERY);
-            let c = &engine.cfg.exec;
-            let policy = executor::FailurePolicy { max_in_window: c.max_failures_in_window, window: Duration::from_secs(c.failure_window_secs), cooldown: Duration::from_secs(c.failure_cooldown_secs) };
             let nonce_file = engine.cfg.exec.nonce_path(signer.address());
             info!(nonce_file = %nonce_file.display(), "shared hot-wallet nonce file");
-            let mut e = executor::Executor::new(engine.provider.clone(), signer, engine.cfg.chain_id, b, policy).with_shared_nonce(nonce_file).with_max_inflight(engine.cfg.exec.max_inflight);
+            let mut e = executor::Executor::new(engine.provider.clone(), signer, engine.cfg.chain_id, b, engine.cfg.exec.failure_policy())
+                .with_shared_nonce(nonce_file)
+                .with_max_inflight(engine.cfg.exec.max_inflight);
             e.sync_nonce().await?;
             e.spawn_nonce_watch(executor::NONCE_WATCH_EVERY);
             warn!(address = %e.address, "LIVE MODE: approved plans WILL be sent");
-            Some(e)
+            let (h, s) = actor::spawn(e, blocks_rx);
+            (Some(h), Some(s))
         }
     };
     // Background borrower refresh (see the end of the loop).
@@ -1502,7 +1510,7 @@ async fn watch<P: Provider + Clone + 'static>(
                     Ev::Head(h) => break h,
                     Ev::Oracle(Some(u)) => {
                         if let (Some(f), Some(snaps), Some((h, eth_usd, bt))) = (fb.as_mut(), prev_snaps.as_ref(), last_ctx.as_ref()) {
-                            on_fb_event(engine, f, u, snaps, h, *eth_usd, *bt, &parts, &mut budget, &mut exec, &mut journal).await?;
+                            on_fb_event(engine, f, u, snaps, h, *eth_usd, *bt, &parts, &mut budget.borrow_mut(), exec.as_ref(), &mut journal).await?;
                             drain_journal(&mut journal_rx, &mut journal)?;
                         }
                     }
@@ -1523,6 +1531,8 @@ async fn watch<P: Provider + Clone + 'static>(
         };
         known_tip = known_tip.max(h.number);
         let number = h.number;
+        // The executor task checks its txs in flight on this block, alongside the fetch below.
+        blocks_tx.send_replace(number);
         if !replaying && bt_anchor.is_none() {
             bt_anchor = Some((number, h.timestamp));
         }
@@ -1530,7 +1540,7 @@ async fn watch<P: Provider + Clone + 'static>(
             Some((n0, t0)) if number >= n0 + 10 && h.timestamp > t0 => (h.timestamp - t0) as f64 / (number - n0) as f64,
             _ => DEFAULT_BLOCK_TIME,
         };
-        let deadline_block = number + executor::deadline_blocks(engine.cfg.exec.deadline_secs, block_time);
+        let deadline_block = number + gates::deadline_blocks(engine.cfg.exec.deadline_secs, block_time);
         let t0 = Instant::now();
 
         let gap = number - last_block;
@@ -1571,7 +1581,7 @@ async fn watch<P: Provider + Clone + 'static>(
                     r = &mut fetch => break r,
                     Some(u) = f.stream.updates.recv() => {
                         if let (Some(prev), Some((lh, eth, bt))) = (prev_snaps.as_ref(), last_ctx.as_ref()) {
-                            on_fb_event(engine, f, u, prev, lh, *eth, *bt, &parts, &mut budget, &mut exec, &mut journal).await?;
+                            on_fb_event(engine, f, u, prev, lh, *eth, *bt, &parts, &mut budget.borrow_mut(), exec.as_ref(), &mut journal).await?;
                             drain_journal(&mut journal_rx, &mut journal)?;
                         }
                     }
@@ -1601,24 +1611,10 @@ async fn watch<P: Provider + Clone + 'static>(
         last_block = number;
         let eth_usd = engine.eth_usd(&snaps);
 
-        // Live: settle the txs in flight first.
-        if let Some(e) = exec.as_mut() {
-            match e.poll(number).await {
-                Ok(outcomes) => {
-                    for (inf, outcome) in outcomes {
-                        // Only reverts eat into the daily gas budget (a success paid for itself).
-                        if let executor::Outcome::Included { success: false, gas_used, effective_gas_price, l1_fee_wei, .. } = &outcome {
-                            let cost = (*gas_used as f64 * *effective_gas_price as f64 + *l1_fee_wei as f64) / 1e18 * eth_usd;
-                            budget.charge(h.timestamp, cost);
-                        }
-                        info!(hash = %inf.hash, ?outcome, failures = e.consecutive_failures, "LIVE tx outcome");
-                        writeln!(journal, "{}", json!({ "kind": "outcome", "block": number, "tx": inf, "outcome": outcome }))?;
-                    }
-                    if e.halted() {
-                        warn!(failures = e.consecutive_failures, cooldown_s = engine.cfg.exec.failure_cooldown_secs, "LIVE sending paused after a burst of failed txs; resumes by itself");
-                    }
-                }
-                Err(err) => warn!(error = %err, "receipt poll failed"),
+        // Live: the txs the executor task has settled since the last block.
+        if let Some(rx) = settled.as_mut() {
+            while let Ok(s) = rx.try_recv() {
+                on_settled(s, number, h.timestamp, eth_usd, engine.cfg.exec.failure_cooldown_secs, &mut budget.borrow_mut(), &mut journal)?;
             }
         }
 
@@ -1711,7 +1707,7 @@ async fn watch<P: Provider + Clone + 'static>(
                 Ok(plan) => {
                     tracker.on_plan((v.market, v.user), number, plan.net_usd, plan.error.clone());
                     let kill = std::path::Path::new(&engine.cfg.exec.kill_switch_file).exists();
-                    let decision = risk::decide(&engine.cfg.exec, &mut budget, &plan, eth_usd, h.base_fee, h.timestamp, kill);
+                    let decision = risk::decide(&engine.cfg.exec, &mut budget.borrow_mut(), &plan, eth_usd, h.base_fee, h.timestamp, kill);
                     info!(
                         block = number, market = %meta.name, user = %v.user, hf = v.hf,
                         quoted_gross = plan.quoted_gross, net_usd = ?plan.net_usd, error = ?plan.error, decision = ?decision,
@@ -1728,7 +1724,27 @@ async fn watch<P: Provider + Clone + 'static>(
             }
             Ok(None)
         };
-        plan_and_send(ready, &mut exec, &parts, &engine.provider, "block", &mut journal, on_plan, |i, _| &ctxs[i]).await?;
+        // Oracle updates seen while this batch is planned are handled at once (on the previous
+        // block's snapshots, like those seen during the fetch above), not after the batch: the
+        // stream's receiver is lent to plan_and_send for the duration.
+        let mut fb_events = fb.as_mut().map(|f| std::mem::replace(&mut f.stream.updates, tokio::sync::mpsc::channel(1).1));
+        let batch = {
+            let (fb, budget, journal_rx) = (&mut fb, &budget, &mut journal_rx);
+            let (prev_snaps, last_ctx, parts, exec) = (&prev_snaps, &last_ctx, &parts, exec.as_ref());
+            let engine = &*engine;
+            let on_side = async move |ev: flashblocks::FbEvent, journal: &mut std::fs::File| -> Result<()> {
+                if let (Some(f), Some(prev), Some((lh, eth, bt))) = (fb.as_mut(), prev_snaps.as_ref(), last_ctx.as_ref()) {
+                    on_fb_event(engine, f, ev, prev, lh, *eth, *bt, parts, &mut budget.borrow_mut(), exec, journal).await?;
+                    drain_journal(journal_rx, journal)?;
+                }
+                Ok(())
+            };
+            plan_and_send(ready, exec, parts, &engine.provider, "block", &mut journal, on_plan, |i, _| &ctxs[i], fb_events.as_mut(), on_side).await
+        };
+        if let (Some(f), Some(rx)) = (fb.as_mut(), fb_events) {
+            f.stream.updates = rx;
+        }
+        batch?;
         // The plans borrow this block's snapshots and the engine: release them before both move on.
         drop(ctxs);
         last_ctx = Some((h, eth_usd, block_time));
