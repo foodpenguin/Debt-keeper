@@ -19,7 +19,10 @@ rustls and SQLite is bundled, so no OpenSSL or system SQLite is needed.
 
 ## 2. Code
 
+The bot builds on the `onchain-core` crate (by path), so clone both side by side:
+
 ```bash
+git clone <onchain-core-url> onchain-core
 git clone --recurse-submodules <repo-url> liquidation-framework
 cd liquidation-framework
 git submodule update --init --recursive    # if you cloned without --recurse-submodules (forge-std)
@@ -57,8 +60,12 @@ any other.
 
 Other keys worth knowing:
 
-- `exec.max_inflight` (default 3): liquidation txs in flight at once, with consecutive nonces; 1 =
-  one at a time.
+- `exec.max_inflight` (default 1): liquidation txs in flight at once (consecutive nonces, at most
+  one per market); raise it to take several liquidations in a crash.
+- Bidding: `priority_fee_wei` (base), `max_priority_fee_wei` (cap), `priority_fee_share` /
+  `bid_share_large` / `bid_large_net_usd` (how much of the net a bid may use, by size), and the
+  competition model (`bid_quantile`, `bid_outbid_bps`, `bid_min_samples`, `bid_window_secs`); see
+  "Bidding" in `docs/architecture.md`.
 - `exec.kill_switch_file`: a relative path is resolved from the config file's directory, not from
   the directory you start the bot in.
 - `accrual_lookahead_secs`: leave it unset to follow the measured block time (rounded up, 1 to 2 s).
@@ -76,7 +83,9 @@ Liquidation contract (`[exec] venue`):
   Only aggregator exits are used with this venue (it has no packed-route entry).
 
 `[atlas.solver] simulate = true` additionally simulates each valued SVR auction's top position as
-an Atlas solver operation (journal only, nothing is signed or sent); see `docs/architecture.md`.
+an Atlas solver operation (journaled). `submit = true` also signs and submits it, in live mode only,
+once the solver is deployed and atlETH is bonded: see "Bidding in SVR auctions: operator steps" in
+`docs/architecture.md`.
 
 ## 5. Build and run in shadow mode
 
@@ -99,7 +108,7 @@ grows ~10x: check your plan's quota. `bot dashboard` (or `scripts/dashboard_loop
 cargo test                                      # unit tests (no network)
 cargo test e2e -- --ignored --nocapture         # LOCAL anvil fork (needs anvil; BASE_FORK_URL optional): live send path,
                                                 # several txs in flight, stuck-tx cancel, flash-funded
-                                                # venue, Atlas solver op
+                                                # venue, Atlas solver op, Atlas EIP-712 digest vs Base
 cd ../contracts
 forge test --no-match-contract Fork -vv         # tests that need no RPC
 BASE_RPC_URL=<your url> forge test -j 1 -vv     # fork tests; -j 1 keeps free RPC plans under their rate limit

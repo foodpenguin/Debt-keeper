@@ -17,7 +17,10 @@ curl -L https://foundry.paradigm.xyz | bash && ~/.foundry/bin/foundryup  # forge
 
 ## 2. 取得程式碼
 
+bot 以路徑依賴 `onchain-core` crate，所以兩個 repo 要並排 clone：
+
 ```bash
+git clone <onchain-core-url> onchain-core
 git clone --recurse-submodules <repo-url> liquidation-framework
 cd liquidation-framework
 git submodule update --init --recursive    # 如果 clone 時沒加 --recurse-submodules（forge-std）
@@ -46,7 +49,8 @@ cp config.example.toml config.local.toml   # config.local.toml 已被 gitignore
 
 其他值得知道的設定：
 
-- `exec.max_inflight`（預設 3）：同時在飛的清算交易數，nonce 連續；設 1 就是一次一筆。
+- `exec.max_inflight`（預設 1）：同時在飛的清算交易數（nonce 連續，每個市場最多一筆）；調高可以在暴跌時同時接下好幾筆清算。
+- 出價：`priority_fee_wei`（基本值）、`max_priority_fee_wei`（上限）、`priority_fee_share` / `bid_share_large` / `bid_large_net_usd`（依規模決定出價最多可以用掉多少淨利），以及競爭模型（`bid_quantile`、`bid_outbid_bps`、`bid_min_samples`、`bid_window_secs`）；見 `docs/architecture.zh-TW.md` 的「出價」。
 - `exec.kill_switch_file`：相對路徑以設定檔所在目錄為基準，而不是你啟動 bot 時所在的目錄。
 - `accrual_lookahead_secs`：不設定時跟著實測的出塊時間（無條件進位，1 到 2 秒）。
 - 啟動時會檢查設定：`exec.venue = "flash"` 搭配 `router.mode = "direct"`，或搭配 `[flashblocks] enabled = true` 且 `flashblocks.router = "direct"`，都會被拒絕（這個 venue 只用聚合器出場）。
@@ -56,7 +60,7 @@ cp config.example.toml config.local.toml   # config.local.toml 已被 gitignore
 - `"callback"`（預設）：MorphoLiquidator，由 Morpho 的清算 callback 籌措還款。
 - `"flash"`：FlashLiquidator，先閃電借入還款（給沒有 callback 的協議用）。`flash_funding = "morpho"`（Morpho 閃電貸）或 `"v4"`（Uniswap V4 閃電記帳，需要 `pool_manager`）；`flash_headroom_bps` 是在規劃的還款之上多借的比例；`flash_liquidator` 是已部署的合約（未設定時用注入的 bytecode 模擬）。這個 venue 只會使用聚合器出場（它沒有 packed 路線入口）。
 
-設定 `[atlas.solver] simulate = true` 時，每場被估值的 SVR 拍賣，最大倉位還會被模擬成一個 Atlas solver operation（只寫 journal，不會簽名也不會送出）；見 `docs/architecture.zh-TW.md`。
+設定 `[atlas.solver] simulate = true` 時，每場被估值的 SVR 拍賣，最大倉位還會被模擬成一個 Atlas solver operation（寫進 journal）。`submit = true` 還會簽名並送出它，只在實跑模式下、而且 solver 已部署、atlETH 已 bond 之後才會：見 `docs/architecture.zh-TW.md` 的「SVR 拍賣出價：操作者步驟」。
 
 ## 5. 編譯並以影子模式執行
 
@@ -75,8 +79,8 @@ cargo build --release
 ```bash
 cargo test                                      # 單元測試（不需網路）
 cargo test e2e -- --ignored --nocapture         # 本地 anvil fork（需要 anvil；BASE_FORK_URL 可選）：實跑送單路徑、
-                                                # 多筆交易同時在途、卡住交易的取消、閃電出資的 venue、
-                                                # Atlas solver op
+                                                # 多筆交易同時在飛、卡住交易的取消、閃電出資的 venue、
+                                                # Atlas solver op、Atlas EIP-712 digest 和 Base 對照
 cd ../contracts
 forge test --no-match-contract Fork -vv         # 不需要 RPC 的測試
 BASE_RPC_URL=<你的 url> forge test -j 1 -vv     # fork 測試；-j 1 避免免費方案的 RPC 被限流
