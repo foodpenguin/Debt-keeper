@@ -25,7 +25,7 @@ use self::{
 };
 use crate::{
     config::Config,
-    protocol::{BorrowerInfo, DirectLiquidation, Evaluation, LendingProtocol, LiquidationTx, MarketInfo, Touched},
+    protocol::{BorrowerInfo, DirectLiquidation, Evaluation, LendingProtocol, LiquidationOption, LiquidationTx, MarketInfo, Pair, Touched},
 };
 
 /// Morpho Blue on one chain: the singleton address, its indexer API and the configured markets.
@@ -136,38 +136,39 @@ impl LendingProtocol for Morpho {
         let (borrow_shares, collateral) = *position;
         let lltv = meta.params.lltv;
         let health = math::health(borrow_shares, collateral, snap.price, lltv, snap.totals);
-        let (max_seize, quote, bonus) = if health.is_liquidatable() && !collateral.is_zero() {
+        // An isolated market: one pair, one option when liquidatable.
+        let options = if health.is_liquidatable() && !collateral.is_zero() {
             let seize = math::max_seizable(borrow_shares, collateral, snap.price, lltv, snap.totals);
             let q = math::quote_by_seized(seize, snap.price, lltv, snap.totals);
             let seized_value = math::mul_div_down(seize, snap.price, ORACLE_PRICE_SCALE);
             let bonus = math::units(seized_value.saturating_sub(q.repaid_assets), meta.loan_decimals)
                 - math::units(q.repaid_assets.saturating_sub(seized_value), meta.loan_decimals);
-            (seize, Some(q), bonus)
+            vec![LiquidationOption { pair: pair_of(meta), max_seize: seize, quote: Some(q), bonus }]
         } else {
-            (U256::ZERO, None, 0.0)
+            vec![]
         };
-        Evaluation { hf: health.factor(), debt: math::units(health.borrowed, meta.loan_decimals), health, max_seize, quote, bonus }
+        Evaluation { hf: health.factor(), debt: math::units(health.borrowed, meta.loan_decimals), health, main: pair_of(meta), options }
     }
 
-    fn exit_tokens(&self, m: &MarketMeta) -> (Address, Address) {
-        (m.params.collateralToken, m.params.loanToken)
+    fn token_decimals(&self, m: &MarketMeta, token: Address) -> u8 {
+        if token == m.params.collateralToken { m.collateral_decimals } else { m.loan_decimals }
     }
 
-    fn loan_decimals(&self, m: &MarketMeta) -> u8 {
-        m.loan_decimals
-    }
-
-    fn repay_for_seize(&self, m: &MarketMeta, snap: &MarketSnapshot, seize: U256) -> U256 {
+    fn repay_for_seize(&self, m: &MarketMeta, snap: &MarketSnapshot, _pair: Pair, seize: U256) -> U256 {
         math::quote_by_seized(seize, snap.price, m.params.lltv, snap.totals).repaid_assets
     }
 
-    fn collateral_value(&self, _m: &MarketMeta, snap: &MarketSnapshot, amount: U256) -> U256 {
+    fn collateral_value(&self, _m: &MarketMeta, snap: &MarketSnapshot, _pair: Pair, amount: U256) -> U256 {
         math::mul_div_down(amount, snap.price, ORACLE_PRICE_SCALE)
     }
 
     /// USD stablecoins at 1, WETH at the ETH price; anything else has no model (refused at start).
-    fn loan_usd(&self, m: &MarketMeta, _snap: &MarketSnapshot, eth_usd: f64) -> Option<f64> {
-        loan_usd_model(self.chain_id, m.params.loanToken, eth_usd)
+    fn loan_usd(&self, _m: &MarketMeta, _snap: &MarketSnapshot, debt_token: Address, eth_usd: f64) -> Option<f64> {
+        loan_usd_model(self.chain_id, debt_token, eth_usd)
+    }
+
+    fn pairs(&self, m: &MarketMeta) -> Vec<Pair> {
+        vec![pair_of(m)]
     }
 
     /// ETH price in USD from a tracked WETH/USD* market.
@@ -184,7 +185,7 @@ impl LendingProtocol for Morpho {
 /// the collateral, so a caller that already holds the repayment (a flash-funded liquidator) can use
 /// it like any callback-free protocol.
 impl DirectLiquidation for Morpho {
-    fn liquidation_call(&self, m: &MarketMeta, user: Address, seize: U256, _repay: U256) -> LiquidationTx {
+    fn liquidation_call(&self, m: &MarketMeta, user: Address, _pair: Pair, seize: U256, _repay: U256) -> LiquidationTx {
         let calldata = onchain::IMorpho::liquidateCall { marketParams: m.params.clone(), borrower: user, seizedAssets: seize, repaidShares: U256::ZERO, data: Default::default() }.abi_encode().into();
         LiquidationTx { target: self.address, calldata, debt_token: m.params.loanToken, collateral_token: m.params.collateralToken }
     }
@@ -204,6 +205,11 @@ const WETH: Address = address!("4200000000000000000000000000000000000006");
 
 /// USD per loan token by address: Base USD stablecoins at 1, WETH at `eth_usd`, else None (other
 /// chains have no model yet: their markets are refused rather than mispriced).
+/// The one pair of an isolated Morpho market.
+pub fn pair_of(m: &MarketMeta) -> Pair {
+    Pair { collateral: m.params.collateralToken, debt: m.params.loanToken }
+}
+
 pub fn loan_usd_model(chain_id: u64, token: Address, eth_usd: f64) -> Option<f64> {
     match chain_id {
         8453 if BASE_USD_STABLES.contains(&token) => Some(1.0),

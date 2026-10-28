@@ -282,7 +282,7 @@ async fn e2e_flash_venue_simulates_a_flash_funded_liquidation() {
         let route = ExitRoute::Call { target: UNI_ROUTER, calldata: swap.into() };
         // An upper bound on the repayment is enough: Morpho pulls exactly what it computes and the
         // unspent part goes back to the funder with the loan.
-        let payload = venue.encode(&meta, WETH_BORROWER, seize, U256::from(1_000_000_000u64), &route, U256::from(1u8), n + 5);
+        let payload = venue.encode(&meta, WETH_BORROWER, crate::morpho::pair_of(&meta), seize, U256::from(1_000_000_000u64), &route, U256::from(1u8), n + 5);
         let r = venue.simulate(&p, payload.calldata.clone(), BlockId::number(n), &StateOverride::default(), None, None, None).await.unwrap_or_else(|e| panic!("{name}: {e}"));
         // Priced like a real send (the sender gets a balance override): same profit, since no pool
         // on this route reads tx.gasprice.
@@ -336,7 +336,7 @@ async fn e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation() {
     let mut nets = vec![];
     for bid_wei in [U256::ZERO, U256::from(10u64).pow(U256::from(15)), U256::from(10u64).pow(U256::from(18))] {
         let venue = AtlasBid { solver: &solver, bid_wei };
-        let payload = venue.encode(&meta, WETH_BORROWER, seize, U256::ZERO, &route, U256::ZERO, n + 5);
+        let payload = venue.encode(&meta, WETH_BORROWER, crate::morpho::pair_of(&meta), seize, U256::ZERO, &route, U256::ZERO, n + 5);
         let r = venue.simulate(&p, payload.calldata, BlockId::number(n), &StateOverride::default(), None, None, None).await;
         println!("e2e atlas solver: bid {bid_wei} wei -> {:?}", r.as_ref().map(|s| (s.profit, s.gas_used)).map_err(|e| e.to_string()));
         nets.push(r.ok().map(|s| s.profit));

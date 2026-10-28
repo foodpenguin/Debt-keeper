@@ -224,9 +224,15 @@ async fn build_v3<P: Provider>(engine: &MorphoEngine<P>) -> Result<v3router::V3R
     if rc.factories.is_empty() {
         warn!("no [[router.factories]] configured: direct router disabled, aggregator only");
     }
-    for (mi, m) in engine.metas.iter().enumerate() {
-        let labels = v3.discover(&engine.provider, mi, m.params.collateralToken, m.params.loanToken).await?.labels();
-        info!(market = %m.name, legs = labels.len(), ?labels, "direct routes discovered");
+    // One route set per (collateral, debt) pair any tracked market may be liquidated on.
+    for m in &engine.metas {
+        for pair in protocol::LendingProtocol::pairs(&engine.protocol, m) {
+            if v3.routes.contains_key(&pair) {
+                continue;
+            }
+            let labels = v3.discover(&engine.provider, pair).await?.labels();
+            info!(market = %m.name, legs = labels.len(), ?labels, "direct routes discovered");
+        }
     }
     Ok(v3)
 }
@@ -261,10 +267,10 @@ impl venue::LiquidationVenue<Morpho> for Venue {
             Venue::Flash(v) => v.swap_recipient(),
         }
     }
-    fn encode(&self, m: &MarketMeta, user: Address, seize: U256, repay: U256, route: &dex::ExitRoute, min_profit: U256, deadline_block: u64) -> executor::Payload {
+    fn encode(&self, m: &MarketMeta, user: Address, pair: protocol::Pair, seize: U256, repay: U256, route: &dex::ExitRoute, min_profit: U256, deadline_block: u64) -> executor::Payload {
         match self {
-            Venue::Callback(v) => v.encode(m, user, seize, repay, route, min_profit, deadline_block),
-            Venue::Flash(v) => v.encode(m, user, seize, repay, route, min_profit, deadline_block),
+            Venue::Callback(v) => v.encode(m, user, pair, seize, repay, route, min_profit, deadline_block),
+            Venue::Flash(v) => v.encode(m, user, pair, seize, repay, route, min_profit, deadline_block),
         }
     }
     async fn simulate<P: Provider>(&self, p: &P, calldata: alloy::primitives::Bytes, block: alloy::eips::BlockId, overrides: &StateOverride, at: Option<venue::SimAt>, fee: Option<venue::SimFee>, probe: Option<Address>) -> Result<venue::SimResult> {
@@ -982,10 +988,10 @@ async fn valuation<P: Provider>(
         overrides.insert(m.meta.params.oracle, AccountOverride { code: Some(sim::constant_price_oracle(m.snap.price)), ..Default::default() });
         // One solver op holds only so many liquidations: bundle the largest that fit (liq is sorted
         // by bonus) instead of pricing an op that cannot exist.
-        let fit = &m.liq[..m.liq.len().min(planner::bundle_capacity(atlas.solver_gas_limit))];
+        let fit = &m.liq[..m.liq.len().min(atlas_venue::bundle_capacity(atlas.solver_gas_limit))];
         let bundle = match fit.is_empty() {
             true => None,
-            false => Some(planner.quote_bundle(provider, &m.meta, &m.snap, fit, head.number, &overrides, head.base_fee, eth_usd, planner::bundle_swap_budget(atlas.solver_gas_limit, fit.len()), live).await),
+            false => Some(planner.quote_bundle(provider, &m.meta, &m.snap, fit, head.number, &overrides, head.base_fee, eth_usd, atlas_venue::bundle_swap_budget(atlas.solver_gas_limit, fit.len()), atlas_venue::ATLAS_BUNDLE_GAS, live).await),
         };
         let bundle_ms = a.seen.elapsed().as_millis() as u64;
         let ctxs: Vec<PlanCtx<Morpho>> = m
@@ -1246,7 +1252,7 @@ async fn checked_priority<P: Provider>(parts: &PlannerParts, provider: &P, c: &P
     let fee = venue::SimFee { max_fee_per_gas: c.base_fee_wei * 2 + bid, max_priority_fee_per_gas: bid };
     let r = venue::LiquidationVenue::<Morpho>::simulate(&parts.venue, provider, payload.calldata.clone(), c.block_id(), &c.overrides, c.sim_at(), Some(fee), None).await;
     // The same USD price the plan was scored with.
-    let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, c.meta, c.snap, c.eth_usd).unwrap_or(0.0);
+    let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, c.meta, c.snap, c.view.pair.debt, c.eth_usd).unwrap_or(0.0);
     let at_bid = r.as_ref().ok().map(|s| {
         let p = math::units(s.profit, c.meta.loan_decimals);
         let cost = gas as f64 * (c.base_fee_wei + bid) as f64 / 1e18 * c.eth_usd + plan.l1_fee_usd.unwrap_or(0.0);

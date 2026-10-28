@@ -21,7 +21,7 @@ use crate::{
     dex::{Dex, ExitRoute},
     engine::PositionView,
     num,
-    protocol::LendingProtocol,
+    protocol::{LendingProtocol, Pair},
     v3router::{self, V3Router},
     venue::{LiquidationVenue, SimAt, SimFee, SimResult, SimReverted},
 };
@@ -30,24 +30,13 @@ use crate::{
 const SEIZE_FRACTIONS_BPS: [u64; 3] = [10_000, 5_000, 2_500];
 /// Gas a second, third... direct path adds beyond its own swap (pool call + callback + transfer).
 const GAS_PER_EXTRA_PATH: u64 = 60_000;
-/// Bundle valuation: gas per liquidated borrower inside one solver op. Calibrated on an observed
-/// Base SVR metacall: 32 liquidations + Aave supply/borrow + oracle update = 3.73M gas.
-pub const BUNDLE_GAS_PER_POSITION: u64 = 110_000;
-/// Bundle valuation: gas of a solver op besides liquidations and the swap (oracle update inside
-/// the metacall, Atlas bookkeeping, paying the bid).
-pub const BUNDLE_OVERHEAD_GAS: u64 = 600_000;
-/// Least gas worth leaving a bundle's swap (a 1-2 path exit of a big bundle: ~0.5-1M).
-const MIN_BUNDLE_SWAP_GAS: u64 = 1_000_000;
-
-/// How many positions one solver op of `solver_gas_limit` can liquidate while leaving
-/// MIN_BUNDLE_SWAP_GAS for the swap (6M -> 40).
-pub fn bundle_capacity(solver_gas_limit: u64) -> usize {
-    (solver_gas_limit.saturating_sub(BUNDLE_OVERHEAD_GAS + MIN_BUNDLE_SWAP_GAS) / BUNDLE_GAS_PER_POSITION) as usize
-}
-
-/// Gas a bundle of `n` positions leaves its swap inside one solver op.
-pub fn bundle_swap_budget(solver_gas_limit: u64, n: usize) -> u64 {
-    solver_gas_limit.saturating_sub(BUNDLE_OVERHEAD_GAS + BUNDLE_GAS_PER_POSITION * n as u64)
+/// Gas of a bundle valuation (`Planner::quote_bundle`): per liquidated position and for the rest
+/// of the operation besides the swap. The venue that runs bundles knows these (see
+/// `atlas_venue::ATLAS_BUNDLE_GAS`).
+#[derive(Debug, Clone, Copy)]
+pub struct BundleGas {
+    pub per_position: u64,
+    pub overhead: u64,
 }
 
 /// Gas of one liquidation outside its swap (protocol liquidate, callback, checks, transfers): what a
@@ -83,7 +72,7 @@ type BundleExit = (&'static str, u64, f64, u64);
 
 /// Total collateral a bundle seizes and the debt it repays (each position at its max seize).
 fn bundle_totals<L: LendingProtocol>(protocol: &L, market: &L::Market, snap: &L::Snapshot, views: &[PositionView<L>]) -> (U256, U256) {
-    views.iter().fold((U256::ZERO, U256::ZERO), |(s, r), v| (s + v.max_seize, r + protocol.repay_for_seize(market, snap, v.max_seize)))
+    views.iter().fold((U256::ZERO, U256::ZERO), |(s, r), v| (s + v.max_seize, r + protocol.repay_for_seize(market, snap, v.pair, v.max_seize)))
 }
 
 /// Debt repaid when a bundle seizes `s` of its `total_seize`: linear at a fixed price, rounded up.
@@ -218,7 +207,7 @@ fn pending_staleness(sim_block: Option<u64>, sim_ok: bool, floor: u64) -> Option
 
 impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
     pub async fn plan<P: Provider>(&self, p: &P, c: &PlanCtx<'_, L>) -> Result<Plan> {
-        let pools = self.v3.is_some_and(|v| v.routes.get(&c.view.market).is_some_and(|r| !r.is_empty()));
+        let pools = self.v3.is_some_and(|v| v.routes.get(&c.view.pair).is_some_and(|r| !r.is_empty()));
         // The direct router's route is packed: only a venue with a packed entry can take it.
         let direct_ok = pools && self.venue.packed_routes();
         match self.mode {
@@ -248,9 +237,9 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         SimFee { max_fee_per_gas: c.base_fee_wei * 2 + self.cfg.priority_fee_wei, max_priority_fee_per_gas: self.cfg.priority_fee_wei }
     }
 
-    /// USD per loan token for this plan, or the error that refuses the market.
-    fn loan_usd(&self, meta: &L::Market, snap: &L::Snapshot, eth_usd: f64) -> Result<f64, String> {
-        self.protocol.loan_usd(meta, snap, eth_usd).filter(|u| *u > 0.0).ok_or_else(|| "loan token has no USD price model (market refused)".to_string())
+    /// USD per `debt` token for this plan, or the error that refuses it.
+    fn loan_usd(&self, meta: &L::Market, snap: &L::Snapshot, debt: Address, eth_usd: f64) -> Result<f64, String> {
+        self.protocol.loan_usd(meta, snap, debt, eth_usd).filter(|u| *u > 0.0).ok_or_else(|| "debt token has no USD price model (refused)".to_string())
     }
 
     /// Fills sim-derived fields and applies the sanity checks shared by both routers.
@@ -278,14 +267,14 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         }
         match res {
             Ok(r) => {
-                let loan_usd = match self.loan_usd(c.meta, c.snap, c.eth_usd) {
+                let loan_usd = match self.loan_usd(c.meta, c.snap, c.view.pair.debt, c.eth_usd) {
                     Ok(u) => u,
                     Err(e) => {
                         plan.error = Some(e);
                         return;
                     }
                 };
-                let profit = num::units(r.profit, self.protocol.loan_decimals(c.meta));
+                let profit = num::units(r.profit, self.protocol.token_decimals(c.meta, c.view.pair.debt));
                 let gas_wei = U256::from(r.gas_used) * U256::from(c.base_fee_wei + self.cfg.priority_fee_wei) + r.l1_fee_wei;
                 let gas_usd = num::units(gas_wei, 18) * c.eth_usd;
                 plan.sim_profit = Some(profit);
@@ -316,7 +305,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         (base_fee_wei + self.cfg.priority_fee_wei.max(self.cfg.planning_priority_fee_wei)) as f64
     }
 
-    /// Best direct-router exit for selling up to `max_seize` collateral of `market` at `block`:
+    /// Best direct-router exit for selling up to `max_seize` of `pair.collateral` at `block`:
     /// one grid quote, then the allocation that maximises out - repay(seize) - extra-leg gas.
     /// Err = the quote failed, Ok(None) = no profitable allocation.
     #[allow(clippy::too_many_arguments)]
@@ -324,7 +313,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         &self,
         p: &P,
         meta: &L::Market,
-        market: usize,
+        pair: Pair,
         snap: &L::Snapshot,
         max_seize: U256,
         eth_usd: f64,
@@ -335,17 +324,17 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         gas_budget: Option<u64>,
     ) -> Result<Option<(v3router::Grid, v3router::Allocation)>, String> {
         let v3 = self.v3.expect("checked by caller");
-        let loan_dec = self.protocol.loan_decimals(meta);
+        let loan_dec = self.protocol.token_decimals(meta, pair.debt);
         // Connector grid range: what all seizable collateral is worth in the connector (WETH, 18
         // decimals) at the oracle price, with 25% headroom for price differences.
-        let seize_value = num::units(self.protocol.collateral_value(meta, snap, max_seize), loan_dec);
-        let max_conn = U256::from((seize_value / eth_usd.max(1.0) * 1.25 * 1e18) as u128);
-        let loan_usd = self.loan_usd(meta, snap, eth_usd)?;
+        let loan_usd = self.loan_usd(meta, snap, pair.debt, eth_usd)?;
+        let seize_value_usd = num::units(self.protocol.collateral_value(meta, snap, pair, max_seize), loan_dec) * loan_usd;
+        let max_conn = U256::from((seize_value_usd / eth_usd.max(1.0) * 1.25 * 1e18) as u128);
         // Quotes priced like the send: pools that read tx.gasprice answer what the tx would get.
         let fee = SimFee { max_fee_per_gas: base_fee_wei * 2 + self.cfg.priority_fee_wei, max_priority_fee_per_gas: self.cfg.priority_fee_wei };
-        let grid = v3.grid(p, market, max_seize, max_conn, block, overrides, Some(fee)).await.map_err(|e| format!("grid quote failed: {e}"))?;
+        let grid = v3.grid(p, pair, max_seize, max_conn, block, overrides, Some(fee)).await.map_err(|e| format!("grid quote failed: {e}"))?;
         let gas_price = self.route_gas_price(base_fee_wei);
-        let n_direct = v3.routes[&market].direct.len();
+        let n_direct = v3.routes[&pair].direct.len();
         // The extra-path gas cost is weighed against output in loan-token units.
         match v3router::allocate_within(&grid, n_direct, repay, GAS_PER_EXTRA_PATH, gas_price / 1e18 * eth_usd / loan_usd, |x| num::units(x, loan_dec), gas_budget) {
             Ok(a) => Ok(a.map(|a| (grid, a))),
@@ -353,8 +342,9 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         }
     }
 
-    /// Solver valuation: all `views` (liquidatable positions of one market at `snap`) liquidated
-    /// in one bundle, their collateral sold as ONE exit, so price impact accumulates as it would
+    /// Solver valuation: all `views` (liquidatable positions of one market at `snap`, on the pair
+    /// of the first; others are left out) liquidated in one bundle, their collateral sold as ONE
+    /// exit, so price impact accumulates as it would
     /// for an Atlas solver op (planning each position alone assumes each gets the whole pool).
     /// Repayment is linear in the seized amount at a fixed price, so the bundle sizes like one
     /// big position. Both exits are tried in parallel and must fit `swap_gas_budget` (what the
@@ -374,13 +364,20 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         base_fee_wei: u128,
         eth_usd: f64,
         swap_gas_budget: u64,
+        bundle_gas: BundleGas,
         use_kyber: bool,
     ) -> BundleQuote {
         let t0 = Instant::now();
-        let (collateral, loan) = self.protocol.exit_tokens(meta);
-        let loan_dec = self.protocol.loan_decimals(meta);
+        let Some(pair) = views.first().map(|v| v.pair) else {
+            return BundleQuote { swap_gas_budget, error: Some("nothing to seize".into()), ..Default::default() };
+        };
+        // One exit sells one collateral for one debt token: positions on other pairs are left out.
+        let views: Vec<PositionView<L>> = views.iter().filter(|v| v.pair == pair).cloned().collect();
+        let views = &views[..];
+        let (collateral, loan) = (pair.collateral, pair.debt);
+        let loan_dec = self.protocol.token_decimals(meta, loan);
         let mut q = BundleQuote { positions: views.len(), swap_gas_budget, ..Default::default() };
-        let loan_usd = match self.loan_usd(meta, snap, eth_usd) {
+        let loan_usd = match self.loan_usd(meta, snap, loan, eth_usd) {
             Ok(u) => u,
             Err(e) => {
                 q.error = Some(e);
@@ -395,11 +392,10 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let repay = |s: U256| bundle_repay(s, total_seize, total_repaid);
         let gross = |out: U256, s: U256| (num::units(out, loan_dec) - num::units(repay(s), loan_dec)) * loan_usd;
         let direct = async {
-            let market = views[0].market;
-            if !self.v3.is_some_and(|v| v.routes.get(&market).is_some_and(|r| !r.is_empty())) {
-                return Err("no direct pools for this market".to_string());
+            if !self.v3.is_some_and(|v| v.routes.get(&pair).is_some_and(|r| !r.is_empty())) {
+                return Err("no direct pools for this pair".to_string());
             }
-            match self.direct_exit(p, meta, market, snap, total_seize, eth_usd, base_fee_wei, BlockId::number(block), overrides, repay, Some(swap_gas_budget)).await? {
+            match self.direct_exit(p, meta, pair, snap, total_seize, eth_usd, base_fee_wei, BlockId::number(block), overrides, repay, Some(swap_gas_budget)).await? {
                 None => Err("no profitable direct allocation".into()),
                 Some((_, a)) => Ok(("direct", (num::u256_f64(a.seize) / num::u256_f64(total_seize) * 1e4) as u64, gross(a.expected_out, a.seize), a.est_swap_gas)),
             }
@@ -429,7 +425,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let (direct, kyber) = tokio::join!(direct, kyber);
         q.quote_ms = t0.elapsed().as_millis() as u64;
         let gas_price = self.route_gas_price(base_fee_wei);
-        let gas_units = |e: &BundleExit| e.3 + BUNDLE_GAS_PER_POSITION * views.len() as u64 + BUNDLE_OVERHEAD_GAS;
+        let gas_units = |e: &BundleExit| e.3 + bundle_gas.per_position * views.len() as u64 + bundle_gas.overhead;
         let net = |e: &BundleExit| e.2 - gas_units(e) as f64 * gas_price / 1e18 * eth_usd;
         q.direct_net_usd = direct.as_ref().ok().map(net);
         q.kyber_net_usd = kyber.as_ref().ok().map(net);
@@ -449,9 +445,10 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let v3 = self.v3.expect("checked by caller");
         let t0 = Instant::now();
         let mut plan = Plan { router: "direct".into(), ..Default::default() };
-        let repay = |s| self.protocol.repay_for_seize(c.meta, c.snap, s);
+        let pair = c.view.pair;
+        let repay = |s| self.protocol.repay_for_seize(c.meta, c.snap, pair, s);
         let budget = Some(self.cfg.max_gas.saturating_sub(LIQUIDATION_OVERHEAD_GAS));
-        let exit = self.direct_exit(p, c.meta, c.view.market, c.snap, c.view.max_seize, c.eth_usd, c.base_fee_wei, c.block_id(), &c.overrides, repay, budget).await;
+        let exit = self.direct_exit(p, c.meta, pair, c.snap, c.view.max_seize, c.eth_usd, c.base_fee_wei, c.block_id(), &c.overrides, repay, budget).await;
         plan.quote_ms = t0.elapsed().as_millis() as u64;
         let (grid, alloc) = match exit {
             Ok(Some(x)) => x,
@@ -464,7 +461,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
                 return Ok(plan);
             }
         };
-        let loan_dec = self.protocol.loan_decimals(c.meta);
+        let loan_dec = self.protocol.token_decimals(c.meta, pair.debt);
         let repaid = repay(alloc.seize);
         plan.seize = alloc.seize.to_string();
         plan.repaid = repaid.to_string();
@@ -474,10 +471,10 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         plan.hops = alloc.legs_used();
         plan.est_swap_gas = Some(alloc.est_swap_gas);
 
-        let route: Bytes = v3.encode(c.view.market, &grid, &alloc);
+        let route: Bytes = v3.encode(pair, &grid, &alloc);
         let t1 = Instant::now();
         // Simulate exactly what would be sent: the venue's encoding of the packed route.
-        let payload = self.venue.encode(c.meta, c.view.user, alloc.seize, repaid, &ExitRoute::Packed(route), U256::ZERO, c.deadline_block);
+        let payload = self.venue.encode(c.meta, c.view.user, pair, alloc.seize, repaid, &ExitRoute::Packed(route), U256::ZERO, c.deadline_block);
         let calldata = payload.calldata.clone();
         plan.payload = Some(payload);
         let res = self.venue.simulate(p, calldata, c.block_id(), &c.overrides, c.sim_at(), Some(self.sim_fee(c)), c.price_probe.map(|q| q.oracle)).await;
@@ -502,8 +499,9 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
     }
 
     async fn plan_aggregator_sizes<P: Provider>(&self, p: &P, c: &PlanCtx<'_, L>, fractions: &[u64]) -> Result<Plan> {
-        let (collateral, loan) = self.protocol.exit_tokens(c.meta);
-        let loan_dec = self.protocol.loan_decimals(c.meta);
+        let pair = c.view.pair;
+        let (collateral, loan) = (pair.collateral, pair.debt);
+        let loan_dec = self.protocol.token_decimals(c.meta, loan);
         let t0 = Instant::now();
 
         // 1. Quote every candidate size in parallel; keep the best gross margin.
@@ -520,7 +518,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         for ((f, seize), q) in sizes.iter().zip(quotes) {
             match q {
                 Ok(q) => {
-                    let repaid = self.protocol.repay_for_seize(c.meta, c.snap, *seize);
+                    let repaid = self.protocol.repay_for_seize(c.meta, c.snap, pair, *seize);
                     let gross = num::units(self.aggregator.amount_out(&q), loan_dec) - num::units(repaid, loan_dec);
                     if best.as_ref().is_none_or(|b| gross > b.4) {
                         best = Some((*f, *seize, repaid, q, gross));
@@ -555,7 +553,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             return Ok(plan);
         }
         let route = ExitRoute::Call { target: built.target, calldata: built.calldata };
-        let payload = self.venue.encode(c.meta, c.view.user, seize, repaid, &route, U256::ZERO, c.deadline_block);
+        let payload = self.venue.encode(c.meta, c.view.user, pair, seize, repaid, &route, U256::ZERO, c.deadline_block);
         let calldata = payload.calldata.clone();
         plan.payload = Some(payload);
         if std::env::var_os("BOT_GAS_PROBE").is_some() {
@@ -586,9 +584,11 @@ mod tests {
             health: Health { borrowed: U256::from(2u8), max_borrow: U256::from(1u8) },
             hf: 0.99,
             debt: 0.0,
+            pair: crate::protocol::Pair { collateral: Address::ZERO, debt: Address::ZERO },
             max_seize: U256::from(max_seize),
             quote: None,
             bonus: 0.0,
+            options: vec![],
         }
     }
 
@@ -633,16 +633,6 @@ mod pending_tests {
     use super::*;
 
     #[test]
-    fn solver_op_capacity() {
-        // 6M solverGasLimit: 600k overhead + 1M swap floor leave room for 40 liquidations.
-        assert_eq!(bundle_capacity(6_000_000), 40);
-        assert_eq!(bundle_swap_budget(6_000_000, 40), 1_000_000);
-        // A 31-position auction leaves 1.99M for the swap.
-        assert_eq!(bundle_swap_budget(6_000_000, 31), 1_990_000);
-        assert_eq!(bundle_capacity(1_000_000), 0);
-    }
-
-    #[test]
     fn pending_plan_is_trusted_only_on_the_in_progress_block() {
         // Snapshot at 100, oracle update in block 101 (in progress): the sim must be block >= 102.
         let floor = 102;
@@ -678,7 +668,7 @@ mod generic_tests {
     use super::*;
     use crate::{
         engine::view,
-        testkit::{MockDex, MockVenue, Mk, Toy, cfg, key, user},
+        testkit::{MockDex, MockVenue, Mk, TOY_PAIR, Toy, cfg, key, user},
     };
 
     #[tokio::test]
@@ -692,7 +682,7 @@ mod generic_tests {
         assert_eq!(v.max_seize, U256::from(90u64));
 
         let planner = Planner { protocol: &toy, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, false).await;
+        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000 }, false).await;
         assert_eq!(q.positions, 1);
         let err = q.error.unwrap();
         assert!(err.contains("no direct pools") && err.contains("mockdex: off (mockdex quotes"), "{err}");
@@ -702,9 +692,9 @@ mod generic_tests {
         assert_eq!((plan.router.as_str(), plan.error.as_deref()), ("direct", Some("no direct pools for this market")));
 
         // The venue decides the encoding: a packed route and an external call differ.
-        let packed = venue.encode(&m, user(1), U256::from(90u64), U256::from(90u64), &ExitRoute::Packed(Bytes::new()), U256::ZERO, 3);
-        let call = venue.encode(&m, user(1), U256::from(90u64), U256::from(90u64), &ExitRoute::Call { target: Address::ZERO, calldata: Bytes::new() }, U256::ZERO, 3);
-        assert_eq!((packed.to, packed.calldata[0], call.calldata[0]), (venue.target(), 1, 2));
+        let packed = LiquidationVenue::<Toy>::encode(&venue, &m, user(1), TOY_PAIR, U256::from(90u64), U256::from(90u64), &ExitRoute::Packed(Bytes::new()), U256::ZERO, 3);
+        let call = LiquidationVenue::<Toy>::encode(&venue, &m, user(1), TOY_PAIR, U256::from(90u64), U256::from(90u64), &ExitRoute::Call { target: Address::ZERO, calldata: Bytes::new() }, U256::ZERO, 3);
+        assert_eq!((packed.to, packed.calldata[0], call.calldata[0]), (LiquidationVenue::<Toy>::target(&venue), 1, 2));
     }
 
     #[tokio::test]
@@ -726,7 +716,7 @@ mod generic_tests {
         cfg.exec.allowed_targets.push(Address::repeat_byte(0x22));
         let plan = Planner { protocol: &toy, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "kyber" }.plan(&provider, &ctx).await.unwrap();
         let payload = plan.payload.as_ref().expect("encoded");
-        assert_eq!((payload.to, payload.calldata[0]), (venue.target(), 2));
+        assert_eq!((payload.to, payload.calldata[0]), (LiquidationVenue::<Toy>::target(&venue), 2));
         assert!(plan.error.as_deref().is_some_and(|e| e.contains("mock venue: no simulation")), "{:?}", plan.error);
     }
 
@@ -750,5 +740,47 @@ mod generic_tests {
         // Toy repays 1 per collateral unit: seize 90 -> borrow 90 + 1 wei (no headroom here).
         assert_eq!((call.funding, call.debtAmount, call.swaps[0].target), (2, U256::from(91u64), Address::repeat_byte(0x22)));
         assert!(plan.error.as_deref().is_some_and(|e| e.contains("simulation unavailable")), "simulated against the venue: {:?}", plan.error);
+    }
+}
+
+#[cfg(test)]
+mod account_level_tests {
+    //! The planner on an account-level protocol (one pool, several collateral and debt reserves
+    //! per account): it liquidates the pair the protocol ranks best, and every amount it computes
+    //! (repayment, profit token, USD price) follows that pair.
+    use alloy::providers::ProviderBuilder;
+
+    use super::*;
+    use crate::{
+        engine::view,
+        testkit::{MockDex, MockVenue, Mk, RES_A, RES_B, RES_X, RES_Y, ToyPool, cfg, key, user},
+    };
+
+    #[tokio::test]
+    async fn the_best_pair_is_liquidated_and_every_amount_follows_it() {
+        let provider = ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap());
+        let (pool, venue, mut cfg) = (ToyPool::default(), MockVenue, cfg());
+        cfg.exec.allowed_targets.push(Address::repeat_byte(0x22));
+        let m = Mk { key: key(9), name: "pool".into() };
+        // Collateral 60 A + 40 B, debt 50 X + 50 Y, Y priced at 2: hf = 0.8 x 100 / 150.
+        let snap = [1.0, 1.0, 1.0, 2.0];
+        let v = view(&pool, 0, user(1), &m, &snap, &[60, 40, 50, 50]);
+        assert!((v.hf - 80.0 / 150.0).abs() < 1e-9);
+        assert_eq!(v.options.len(), 4, "every (collateral, debt) pair the account holds");
+        // Repaying half of Y ($50) against A pays the largest bonus.
+        assert_eq!(v.pair, Pair { collateral: RES_A, debt: RES_Y });
+        assert_eq!(v.max_seize, U256::from(52u64), "$50 x 1.05 of A");
+        assert_eq!(v.with_option(1).pair, Pair { collateral: RES_B, debt: RES_Y });
+        assert!(v.with_option(3).pair.debt == RES_X);
+
+        let ctx = PlanCtx { meta: &m, snap: &snap, view: &v, block: 1, base_fee_wei: 0, eth_usd: 2000.0, overrides: StateOverride::default(), deadline_block: 3, sim_time: 0, pending: false, price_probe: None };
+        let plan = Planner { protocol: &pool, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "aggregator" }.plan(&provider, &ctx).await.unwrap();
+        // The repayment is in Y (52 A at $1 / 1.05 / $2 per Y, rounded up), and the venue got that pair.
+        assert_eq!((plan.seize.as_str(), plan.repaid.as_str()), ("52", "25"));
+        let cd = &plan.payload.as_ref().expect("encoded").calldata;
+        assert_eq!((&cd[21..41], &cd[41..61]), (RES_A.as_slice(), RES_Y.as_slice()));
+        // MockDex pays 2 out per unit in: 104 Y out, 25 repaid -> gross 79 Y.
+        assert!((plan.quoted_gross - 79.0).abs() < 1e-9, "{}", plan.quoted_gross);
+        assert!(plan.error.as_deref().is_some_and(|e| e.contains("mock venue: no simulation")), "{:?}", plan.error);
     }
 }

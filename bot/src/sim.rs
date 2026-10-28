@@ -21,6 +21,7 @@ use crate::{
     dex::ExitRoute,
     executor::{MinProfitSlot, Payload},
     morpho::{Morpho, onchain::{MarketMeta, MarketParams}},
+    protocol::Pair,
     venue::LiquidationVenue,
 };
 pub use crate::venue::{SimAt, SimFee, SimResult, SimReverted};
@@ -287,7 +288,7 @@ impl LiquidationVenue<Morpho> for Simulator {
         self.liquidator
     }
 
-    fn encode(&self, m: &MarketMeta, user: Address, seize: U256, _repay: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload {
+    fn encode(&self, m: &MarketMeta, user: Address, _pair: Pair, seize: U256, _repay: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload {
         match route {
             ExitRoute::Packed(r) => Payload { to: self.liquidator, calldata: self.calldata_packed(&m.params, user, seize, r, min_profit, deadline_block), min_profit: PACKED_MIN_PROFIT },
             ExitRoute::Call { target, calldata } => {

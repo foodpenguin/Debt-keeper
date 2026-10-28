@@ -13,7 +13,11 @@ use alloy::{
 };
 use anyhow::Result;
 
-use crate::{dex::ExitRoute, executor::Payload, protocol::LendingProtocol};
+use crate::{
+    dex::ExitRoute,
+    executor::Payload,
+    protocol::{LendingProtocol, Pair},
+};
 pub use onchain_core::sim::{SimAt, SimFee, SimReverted};
 
 /// A venue's simulation, decoded: the profit its contract reports.
@@ -45,12 +49,12 @@ pub trait LiquidationVenue<L: LendingProtocol>: Send + Sync {
         true
     }
 
-    /// The liquidation of `seize` collateral of `user` in `market`, repaying `repay` of debt
+    /// The liquidation of `seize` of `pair.collateral` from `user` in `market`, repaying `repay` of `pair.debt`
     /// (`LendingProtocol::repay_for_seize`), selling the collateral along `route`, as a sendable
     /// payload (calldata + where minProfit sits so it can be patched at send time). A venue that
     /// funds the repayment itself (flash loan) borrows `repay`; a callback venue may ignore it.
     #[allow(clippy::too_many_arguments)]
-    fn encode(&self, market: &L::Market, user: Address, seize: U256, repay: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload;
+    fn encode(&self, market: &L::Market, user: Address, pair: Pair, seize: U256, repay: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload;
 
     /// Simulates `calldata` against `target()` at `block` (plus `overrides`), as the next block at
     /// `at` when given, priced at `fee`; `probe` = an oracle whose price to read in the simulated

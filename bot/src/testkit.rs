@@ -17,7 +17,7 @@ use crate::{
     config::Config,
     dex::{Dex, ExitRoute, SwapCall},
     executor::{MinProfitSlot, Payload},
-    protocol::{BorrowerInfo, DirectLiquidation, Evaluation, LendingProtocol, LiquidationTx, MarketInfo, Touched},
+    protocol::{BorrowerInfo, DirectLiquidation, Evaluation, LendingProtocol, LiquidationOption, LiquidationTx, MarketInfo, Pair, Touched},
     venue::{LiquidationVenue, SimAt, SimFee, SimResult},
 };
 
@@ -86,29 +86,32 @@ impl LendingProtocol for Toy {
     }
     fn evaluate(&self, _m: &Mk, price: &f64, p: &(u64, u64)) -> Evaluation<(), ()> {
         let hf = p.1 as f64 * price / p.0 as f64;
-        let max_seize = if hf < 1.0 { U256::from(p.1) } else { U256::ZERO };
-        Evaluation { health: (), hf, debt: p.0 as f64, max_seize, quote: None, bonus: 0.0 }
+        let options = if hf < 1.0 { vec![LiquidationOption { pair: TOY_PAIR, max_seize: U256::from(p.1), quote: None, bonus: 0.0 }] } else { vec![] };
+        Evaluation { health: (), hf, debt: p.0 as f64, main: TOY_PAIR, options }
     }
-    fn exit_tokens(&self, _m: &Mk) -> (Address, Address) {
-        (Address::repeat_byte(0xc0), Address::repeat_byte(0x10))
-    }
-    fn loan_decimals(&self, _m: &Mk) -> u8 {
+    fn token_decimals(&self, _m: &Mk, _token: Address) -> u8 {
         0
     }
-    fn repay_for_seize(&self, _m: &Mk, _snap: &f64, seize: U256) -> U256 {
+    fn repay_for_seize(&self, _m: &Mk, _snap: &f64, _pair: Pair, seize: U256) -> U256 {
         seize
     }
-    fn collateral_value(&self, _m: &Mk, _snap: &f64, amount: U256) -> U256 {
+    fn collateral_value(&self, _m: &Mk, _snap: &f64, _pair: Pair, amount: U256) -> U256 {
         amount
     }
-    fn loan_usd(&self, _m: &Mk, _snap: &f64, _eth_usd: f64) -> Option<f64> {
+    fn loan_usd(&self, _m: &Mk, _snap: &f64, _debt: Address, _eth_usd: f64) -> Option<f64> {
         Some(1.0)
+    }
+    fn pairs(&self, _m: &Mk) -> Vec<Pair> {
+        vec![TOY_PAIR]
     }
 }
 
+/// The toy's one pair: collateral 0xc0.., debt 0x10...
+pub const TOY_PAIR: Pair = Pair { collateral: Address::repeat_byte(0xc0), debt: Address::repeat_byte(0x10) };
+
 /// Toy liquidation call: `liquidate(user, repay)` on a fixed protocol address (0x70..).
 impl DirectLiquidation for Toy {
-    fn liquidation_call(&self, _m: &Mk, user: Address, _seize: U256, repay: U256) -> LiquidationTx {
+    fn liquidation_call(&self, _m: &Mk, user: Address, _pair: Pair, _seize: U256, repay: U256) -> LiquidationTx {
         let mut d = user.to_vec();
         d.extend_from_slice(&repay.to_be_bytes::<32>());
         LiquidationTx { target: Address::repeat_byte(0x70), calldata: Bytes::from(d), debt_token: Address::repeat_byte(0x10), collateral_token: Address::repeat_byte(0xc0) }
@@ -122,7 +125,7 @@ impl LiquidationVenue<Toy> for MockVenue {
     fn target(&self) -> Address {
         Address::repeat_byte(0x11)
     }
-    fn encode(&self, _m: &Mk, user: Address, seize: U256, _repay: U256, route: &ExitRoute, min_profit: U256, _deadline: u64) -> Payload {
+    fn encode(&self, _m: &Mk, user: Address, _pair: Pair, seize: U256, _repay: U256, route: &ExitRoute, min_profit: U256, _deadline: u64) -> Payload {
         let tag = match route {
             ExitRoute::Packed(_) => 1u8,
             ExitRoute::Call { .. } => 2u8,
@@ -131,7 +134,120 @@ impl LiquidationVenue<Toy> for MockVenue {
         d.extend_from_slice(user.as_slice());
         d.extend_from_slice(&seize.to_be_bytes::<32>());
         d.extend_from_slice(&min_profit.to_be_bytes::<32>());
-        Payload { to: self.target(), calldata: Bytes::from(d), min_profit: MinProfitSlot { offset: 53, width: 32 } }
+        Payload { to: Address::repeat_byte(0x11), calldata: Bytes::from(d), min_profit: MinProfitSlot { offset: 53, width: 32 } }
+    }
+    async fn simulate<P: Provider>(&self, _p: &P, _calldata: Bytes, _block: BlockId, _overrides: &StateOverride, _at: Option<SimAt>, _fee: Option<SimFee>, _probe: Option<Address>) -> Result<SimResult> {
+        anyhow::bail!("mock venue: no simulation")
+    }
+    async fn probe_gas<P: Provider>(&self, _p: &P, _calldata: Bytes, _block: BlockId, _overrides: &StateOverride, _limits: &[u64]) -> Vec<(u64, bool)> {
+        vec![]
+    }
+}
+
+/// An account-level toy (Aave-style): one pool; an account holds collateral in two reserves (A, B)
+/// and owes two (X, Y), all in whole units; the snapshot is the four prices. Health is computed
+/// over the whole account (liquidation threshold 0.8); a liquidation repays up to half of one debt
+/// reserve and seizes 1.05x its value from one collateral reserve. Every (collateral, debt) pair the
+/// account holds is an option, largest bonus (in USD) first.
+#[derive(Default)]
+pub struct ToyPool {
+    pub accounts: Mutex<HashMap<Address, [u64; 4]>>,
+}
+
+pub const RES_A: Address = Address::repeat_byte(0xa1);
+pub const RES_B: Address = Address::repeat_byte(0xb1);
+pub const RES_X: Address = Address::repeat_byte(0xe1);
+pub const RES_Y: Address = Address::repeat_byte(0xf1);
+const POOL_TOKENS: [Address; 4] = [RES_A, RES_B, RES_X, RES_Y];
+const POOL_BONUS: f64 = 1.05;
+
+fn pool_price(snap: &[f64; 4], token: Address) -> f64 {
+    POOL_TOKENS.iter().position(|t| *t == token).map_or(0.0, |i| snap[i])
+}
+
+impl LendingProtocol for ToyPool {
+    type Market = Mk;
+    type Position = [u64; 4];
+    type Snapshot = [f64; 4];
+    type Health = ();
+    type Quote = ();
+    type Liquidation = &'static str;
+
+    async fn load_markets<P: Provider>(&self, _p: &P) -> Result<Vec<Mk>> {
+        Ok(vec![Mk { key: key(9), name: "pool".into() }])
+    }
+    fn borrower_job(&self, _http: reqwest::Client, markets: &[Mk]) -> BoxFuture<'static, Vec<(usize, Result<Vec<BorrowerInfo>>)>> {
+        let users: Vec<Address> = self.accounts.lock().unwrap().keys().copied().collect();
+        let n = markets.len();
+        Box::pin(async move { (0..n).map(|i| (i, Ok(users.iter().map(|u| BorrowerInfo { user: *u, api_health_factor: None }).collect()))).collect() })
+    }
+    async fn load_positions<P: Provider>(&self, _p: &P, keys: &[(B256, Address)], _block: BlockId) -> Result<Vec<Option<[u64; 4]>>> {
+        let a = self.accounts.lock().unwrap();
+        Ok(keys.iter().map(|(_, u)| Some(a.get(u).copied().unwrap_or_default())).collect())
+    }
+    fn has_debt(&self, p: &[u64; 4]) -> bool {
+        p[2] + p[3] > 0
+    }
+    async fn touched<P: Provider>(&self, _p: &P, _markets: &[B256], _from: u64, _to: u64) -> Result<Touched<&'static str>> {
+        Ok(Touched::default())
+    }
+    async fn snapshots<P: Provider>(&self, _p: &P, markets: &[Mk], _block: BlockId, _timestamp: u64, _prev: Option<&[Option<[f64; 4]>]>) -> Result<Vec<Option<[f64; 4]>>> {
+        Ok(markets.iter().map(|_| Some([1.0; 4])).collect())
+    }
+    fn evaluate(&self, _m: &Mk, snap: &[f64; 4], p: &[u64; 4]) -> Evaluation<(), ()> {
+        let collateral_usd = p[0] as f64 * snap[0] + p[1] as f64 * snap[1];
+        let debt_usd = p[2] as f64 * snap[2] + p[3] as f64 * snap[3];
+        let hf = if debt_usd > 0.0 { 0.8 * collateral_usd / debt_usd } else { f64::INFINITY };
+        let mut options = vec![];
+        if hf < 1.0 {
+            for (ci, collateral) in [(0, RES_A), (1, RES_B)] {
+                for (di, debt) in [(2, RES_X), (3, RES_Y)] {
+                    if p[ci] == 0 || p[di] == 0 {
+                        continue;
+                    }
+                    let repay_usd = (0.5 * p[di] as f64 * snap[di]).min(p[ci] as f64 * snap[ci] / POOL_BONUS);
+                    let seize = (repay_usd * POOL_BONUS / snap[ci]).floor() as u64;
+                    let bonus = (seize as f64 * snap[ci] - repay_usd) / snap[di];
+                    options.push(LiquidationOption { pair: Pair { collateral, debt }, max_seize: U256::from(seize), quote: None, bonus });
+                }
+            }
+            options.sort_by(|a, b| (b.bonus * pool_price(snap, b.pair.debt)).total_cmp(&(a.bonus * pool_price(snap, a.pair.debt))));
+        }
+        Evaluation { health: (), hf, debt: p[2] as f64 + p[3] as f64, main: Pair { collateral: RES_A, debt: RES_X }, options }
+    }
+    fn token_decimals(&self, _m: &Mk, _token: Address) -> u8 {
+        0
+    }
+    fn repay_for_seize(&self, _m: &Mk, snap: &[f64; 4], pair: Pair, seize: U256) -> U256 {
+        let s: u64 = seize.saturating_to();
+        U256::from((s as f64 * pool_price(snap, pair.collateral) / POOL_BONUS / pool_price(snap, pair.debt)).ceil() as u64)
+    }
+    fn collateral_value(&self, _m: &Mk, snap: &[f64; 4], pair: Pair, amount: U256) -> U256 {
+        let a: u64 = amount.saturating_to();
+        U256::from((a as f64 * pool_price(snap, pair.collateral) / pool_price(snap, pair.debt)) as u64)
+    }
+    fn loan_usd(&self, _m: &Mk, snap: &[f64; 4], debt: Address, _eth_usd: f64) -> Option<f64> {
+        Some(pool_price(snap, debt)).filter(|p| *p > 0.0)
+    }
+    fn pairs(&self, _m: &Mk) -> Vec<Pair> {
+        [RES_A, RES_B].iter().flat_map(|c| [RES_X, RES_Y].map(|d| Pair { collateral: *c, debt: d })).collect()
+    }
+}
+
+/// The mock venue on the account-level toy: the pair goes into the calldata, so tests can see
+/// which one the planner liquidates (`[tag, user, collateral, debt, seize, minProfit]`).
+impl LiquidationVenue<ToyPool> for MockVenue {
+    fn target(&self) -> Address {
+        Address::repeat_byte(0x11)
+    }
+    fn encode(&self, _m: &Mk, user: Address, pair: Pair, seize: U256, _repay: U256, route: &ExitRoute, min_profit: U256, _deadline: u64) -> Payload {
+        let mut d = vec![if matches!(route, ExitRoute::Packed(_)) { 1u8 } else { 2u8 }];
+        for a in [user, pair.collateral, pair.debt] {
+            d.extend_from_slice(a.as_slice());
+        }
+        d.extend_from_slice(&seize.to_be_bytes::<32>());
+        d.extend_from_slice(&min_profit.to_be_bytes::<32>());
+        Payload { to: Address::repeat_byte(0x11), calldata: Bytes::from(d), min_profit: MinProfitSlot { offset: 93, width: 32 } }
     }
     async fn simulate<P: Provider>(&self, _p: &P, _calldata: Bytes, _block: BlockId, _overrides: &StateOverride, _at: Option<SimAt>, _fee: Option<SimFee>, _probe: Option<Address>) -> Result<SimResult> {
         anyhow::bail!("mock venue: no simulation")

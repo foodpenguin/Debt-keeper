@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use futures::future::join_all;
 use serde::Deserialize;
 
-use crate::{morpho::onchain::multicall, venue::SimFee};
+use crate::{morpho::onchain::multicall, protocol::Pair, venue::SimFee};
 
 /// Placeholder address the quoter is injected at (never deployed).
 pub const SIM_QUOTER: Address = address!("00000000000000000000000000000000000b0772");
@@ -208,8 +208,8 @@ pub struct V3Router {
     pub factories: Vec<FactoryEntry>,
     pub connectors: Vec<Address>,
     quoter_code: Bytes,
-    /// market index -> legs
-    pub routes: HashMap<usize, MarketRoutes>,
+    /// (collateral, debt) pair -> legs
+    pub routes: HashMap<Pair, MarketRoutes>,
     pub max_legs: usize,
     pub grid_points: u64,
 }
@@ -264,8 +264,10 @@ impl V3Router {
         Ok(out.into_iter().map(|(a, l, _)| (a, l)).collect())
     }
 
-    /// Discovers direct, connector and sink legs for one market (first connector with pools wins).
-    pub async fn discover<P: Provider>(&mut self, p: &P, market: usize, collateral: Address, loan: Address) -> Result<&MarketRoutes> {
+    /// Discovers direct, connector and sink legs for selling `pair.collateral` for `pair.debt`
+    /// (first connector with pools wins).
+    pub async fn discover<P: Provider>(&mut self, p: &P, pair: Pair) -> Result<&MarketRoutes> {
+        let (collateral, loan) = (pair.collateral, pair.debt);
         let leg = |pool: Address, label: String, input: Address, output: Address| Leg { pool, zero_for_one: input < output, label };
         let mut r = MarketRoutes::default();
         for (pool, label) in self.pools_for(p, collateral, loan, loan).await?.into_iter().take(self.max_legs) {
@@ -284,8 +286,8 @@ impl V3Router {
             r.sinks = sinks.into_iter().take(3).map(|(pool, l)| leg(pool, l, k, loan)).collect();
             break;
         }
-        self.routes.insert(market, r);
-        Ok(&self.routes[&market])
+        self.routes.insert(pair, r);
+        Ok(&self.routes[&pair])
     }
 
     async fn quote_legs<P: Provider>(&self, p: &P, legs: &[&Leg], unit: U256, block: BlockId, ov: &StateOverride, fee: Option<SimFee>) -> Vec<Curve> {
@@ -323,8 +325,8 @@ impl V3Router {
     /// `fee` = the fee fields the quote calls carry, so pools that read tx.gasprice (priority-fee
     /// taxes, dynamic fees) quote what the real tx would get; the caller gets a balance override.
     #[allow(clippy::too_many_arguments)]
-    pub async fn grid<P: Provider>(&self, p: &P, market: usize, max_seize: U256, max_conn: U256, block: BlockId, extra: &StateOverride, fee: Option<SimFee>) -> Result<Grid> {
-        let r = self.routes.get(&market).context("no routes discovered for market")?;
+    pub async fn grid<P: Provider>(&self, p: &P, pair: Pair, max_seize: U256, max_conn: U256, block: BlockId, extra: &StateOverride, fee: Option<SimFee>) -> Result<Grid> {
+        let r = self.routes.get(&pair).context("no routes discovered for this pair")?;
         let k = self.grid_points.max(1);
         let unit = max_seize / U256::from(k);
         let conn_unit = max_conn / U256::from(k);
@@ -342,8 +344,8 @@ impl V3Router {
 
     /// Route bytes for an allocation: direct and connector legs with exact amounts, then the sink
     /// legs splitting the pooled connector balance by bps share (last sink takes the rest).
-    pub fn encode(&self, market: usize, grid: &Grid, alloc: &Allocation) -> Bytes {
-        let r = &self.routes[&market];
+    pub fn encode(&self, pair: Pair, grid: &Grid, alloc: &Allocation) -> Bytes {
+        let r = &self.routes[&pair];
         let sources: Vec<&Leg> = r.direct.iter().chain(&r.to_conn).collect();
         let mut out = Vec::new();
         let mut push = |leg: &Leg, flags: u8, amount: u128| {
@@ -567,7 +569,7 @@ mod tests {
         let pool = |b: u8| Address::repeat_byte(b);
         let mut r = V3Router { factories: vec![], connectors: vec![], quoter_code: Bytes::new(), routes: HashMap::new(), max_legs: 4, grid_points: 4 };
         r.routes.insert(
-            0,
+            Pair { collateral: Address::ZERO, debt: Address::ZERO },
             MarketRoutes {
                 direct: vec![Leg { pool: pool(1), zero_for_one: false, label: "d".into() }],
                 to_conn: vec![Leg { pool: pool(2), zero_for_one: false, label: "c".into() }],
@@ -579,7 +581,7 @@ mod tests {
         );
         let g = Grid { unit: U256::from(5u64), ..Default::default() };
         let a = Allocation { source_units: vec![1, 2], sink_units: vec![3, 1], ..Default::default() };
-        let b = r.encode(0, &g, &a);
+        let b = r.encode(Pair { collateral: Address::ZERO, debt: Address::ZERO }, &g, &a);
         assert_eq!(b.len(), 4 * 37);
         let amt = |i: usize| u128::from_be_bytes(b[i * 37 + 21..i * 37 + 37].try_into().unwrap());
         assert_eq!((b[20], amt(0)), (0, 5)); // direct, exact 5

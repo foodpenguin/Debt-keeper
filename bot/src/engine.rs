@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::Config,
-    protocol::{BorrowerInfo, LendingProtocol, MarketInfo, Touched},
+    protocol::{BorrowerInfo, LendingProtocol, LiquidationOption, MarketInfo, Pair, Touched},
 };
 
 pub struct Engine<P, L: LendingProtocol> {
@@ -34,24 +34,50 @@ pub struct Engine<P, L: LendingProtocol> {
     pub ever_tracked: HashSet<(usize, Address)>,
 }
 
-/// One tracked position evaluated against its market's snapshot.
+/// One tracked position evaluated against its market's snapshot. `pair`, `max_seize`, `quote`
+/// and `bonus` describe its best liquidation option (the account's main pair and zeros while it is
+/// healthy); `options` lists every option, best first (an account-level protocol may have several).
 pub struct PositionView<L: LendingProtocol> {
     pub market: usize,
     pub user: Address,
     pub health: L::Health,
     pub hf: f64,
-    /// Debt in loan-token units.
+    /// Debt in units of the account's main debt token.
     pub debt: f64,
+    pub pair: Pair,
     pub max_seize: U256,
     pub quote: Option<L::Quote>,
-    /// Seized value at the oracle price minus repaid debt, in loan-token units (before swap costs and gas).
+    /// Seized value at the oracle price minus repaid debt, in debt-token units (before swap costs and gas).
     pub bonus: f64,
+    pub options: Vec<LiquidationOption<L::Quote>>,
+}
+
+impl<L: LendingProtocol> PositionView<L> {
+    /// This view liquidated on another of its options (`options[i]`).
+    pub fn with_option(&self, i: usize) -> Self {
+        let mut v = self.clone();
+        if let Some(o) = self.options.get(i) {
+            (v.pair, v.max_seize, v.quote, v.bonus) = (o.pair, o.max_seize, o.quote.clone(), o.bonus);
+        }
+        v
+    }
 }
 
 // Manual impls: a derive would also require the protocol type itself to be Clone/Debug.
 impl<L: LendingProtocol> Clone for PositionView<L> {
     fn clone(&self) -> Self {
-        Self { market: self.market, user: self.user, health: self.health.clone(), hf: self.hf, debt: self.debt, max_seize: self.max_seize, quote: self.quote.clone(), bonus: self.bonus }
+        Self {
+            market: self.market,
+            user: self.user,
+            health: self.health.clone(),
+            hf: self.hf,
+            debt: self.debt,
+            pair: self.pair,
+            max_seize: self.max_seize,
+            quote: self.quote.clone(),
+            bonus: self.bonus,
+            options: self.options.clone(),
+        }
     }
 }
 impl<L: LendingProtocol> std::fmt::Debug for PositionView<L> {
@@ -62,9 +88,11 @@ impl<L: LendingProtocol> std::fmt::Debug for PositionView<L> {
             .field("health", &self.health)
             .field("hf", &self.hf)
             .field("debt", &self.debt)
+            .field("pair", &self.pair)
             .field("max_seize", &self.max_seize)
             .field("quote", &self.quote)
             .field("bonus", &self.bonus)
+            .field("options", &self.options.len())
             .finish()
     }
 }
@@ -226,7 +254,19 @@ impl<P: Provider, L: LendingProtocol> Engine<P, L> {
 /// Evaluates one position and attaches its market index and account.
 pub fn view<L: LendingProtocol>(protocol: &L, market: usize, user: Address, m: &L::Market, snap: &L::Snapshot, position: &L::Position) -> PositionView<L> {
     let e = protocol.evaluate(m, snap, position);
-    PositionView { market, user, health: e.health, hf: e.hf, debt: e.debt, max_seize: e.max_seize, quote: e.quote, bonus: e.bonus }
+    let best = e.options.first();
+    PositionView {
+        market,
+        user,
+        hf: e.hf,
+        debt: e.debt,
+        pair: best.map_or(e.main, |o| o.pair),
+        max_seize: best.map_or(U256::ZERO, |o| o.max_seize),
+        quote: best.and_then(|o| o.quote.clone()),
+        bonus: best.map_or(0.0, |o| o.bonus),
+        health: e.health,
+        options: e.options,
+    }
 }
 
 #[cfg(test)]

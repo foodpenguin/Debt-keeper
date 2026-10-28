@@ -19,7 +19,7 @@ use crate::{
     dex::ExitRoute,
     executor::{MinProfitSlot, Payload},
     funding::FlashSource,
-    protocol::DirectLiquidation,
+    protocol::{DirectLiquidation, Pair},
     sim::{self, LiquidatorCode},
     venue::{LiquidationVenue, SimAt, SimFee, SimResult},
 };
@@ -89,8 +89,8 @@ impl<L: DirectLiquidation> LiquidationVenue<L> for FlashLiquidatorVenue<L> {
         false
     }
 
-    fn encode(&self, market: &L::Market, user: Address, seize: U256, repay: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload {
-        let tx = self.protocol.liquidation_call(market, user, seize, repay);
+    fn encode(&self, market: &L::Market, user: Address, pair: Pair, seize: U256, repay: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload {
+        let tx = self.protocol.liquidation_call(market, user, pair, seize, repay);
         // No packed entry: a packed route (which the planner never sends here) yields no swap and
         // fails the profit check in simulation instead of being misread.
         let swaps = match route {
@@ -132,7 +132,7 @@ mod tests {
     use crate::{
         executor::patch_min_profit,
         funding::{MorphoBlue, UniswapV4},
-        testkit::{Mk, Toy, key, user},
+        testkit::{Mk, TOY_PAIR, Toy, key, user},
     };
 
     fn venue(source: Box<dyn FlashSource>) -> FlashLiquidatorVenue<Toy> {
@@ -144,13 +144,13 @@ mod tests {
         let v = venue(Box::new(UniswapV4 { pool_manager: Address::repeat_byte(4) }));
         let m = Mk { key: key(1), name: "alpha".into() };
         let route = ExitRoute::Call { target: Address::repeat_byte(0x22), calldata: Bytes::from_static(b"swap") };
-        let p = v.encode(&m, user(7), U256::from(90u64), U256::from(10_000u64), &route, U256::from(5u8), 42);
+        let p = v.encode(&m, user(7), TOY_PAIR, U256::from(90u64), U256::from(10_000u64), &route, U256::from(5u8), 42);
         assert_eq!(p.to, Address::repeat_byte(0xf1));
         let call = IFlashLiquidator::liquidateCall::abi_decode(&p.calldata).unwrap();
         assert_eq!(call.funding, 2, "V4 flash accounting");
         // 10_000 repay + 10 bps headroom + 1 wei.
         assert_eq!(call.debtAmount, U256::from(10_011u64));
-        let tx = Toy::default().liquidation_call(&m, user(7), U256::from(90u64), U256::from(10_000u64));
+        let tx = Toy::default().liquidation_call(&m, user(7), TOY_PAIR, U256::from(90u64), U256::from(10_000u64));
         assert_eq!((call.debtToken, call.collateralToken, call.liquidation.target, call.liquidation.data), (tx.debt_token, tx.collateral_token, tx.target, tx.calldata));
         assert_eq!((call.swaps.len(), call.swaps[0].target, call.swaps[0].amountIn), (1, Address::repeat_byte(0x22), U256::MAX), "allowance on what actually arrived");
         assert_eq!((call.minProfit, call.deadlineBlock), (U256::from(5u8), U256::from(42u8)));
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(IFlashLiquidator::liquidateCall::abi_decode(&patched).unwrap().minProfit, U256::from(777u64));
         assert!(!LiquidationVenue::<Toy>::packed_routes(&v));
         let morpho = venue(Box::new(MorphoBlue { address: Address::repeat_byte(5) }));
-        let p = morpho.encode(&m, user(7), U256::from(90u64), U256::from(10_000u64), &ExitRoute::Packed(Bytes::new()), U256::ZERO, 42);
+        let p = morpho.encode(&m, user(7), TOY_PAIR, U256::from(90u64), U256::from(10_000u64), &ExitRoute::Packed(Bytes::new()), U256::ZERO, 42);
         let call = IFlashLiquidator::liquidateCall::abi_decode(&p.calldata).unwrap();
         assert_eq!((call.funding, call.swaps.len()), (1, 0), "Morpho flash loan; a packed route carries no swap");
     }

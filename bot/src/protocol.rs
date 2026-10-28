@@ -8,6 +8,14 @@
 //! Every method keeps the optimised shape of the original Morpho loop: batched reads (one call per
 //! block for all snapshots, one for all touched positions), and an optional previous snapshot so a
 //! protocol can do a one-round-trip refresh.
+//!
+//! Isolated and account-level protocols fit the same shape:
+//! - isolated markets (Morpho Blue): a market is one collateral / one loan token, a position is one
+//!   account in one market, and each liquidatable position has one `LiquidationOption`;
+//! - account-level protocols (Aave-style pools, Compound-style comptrollers): a "market" is the
+//!   pool, a position is the whole account across its reserves (health is computed over all of
+//!   them), and `evaluate` returns one option per (collateral, debt) pair it could be liquidated
+//!   on, best first. Every planning hook takes the `Pair` being liquidated.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -55,6 +63,27 @@ impl<L> Default for Touched<L> {
     }
 }
 
+/// What a liquidation seizes and what it repays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct Pair {
+    pub collateral: Address,
+    pub debt: Address,
+}
+
+/// One way to liquidate an account: a pair, how much of the collateral may be seized now, and
+/// what that would repay.
+#[derive(Debug, Clone)]
+pub struct LiquidationOption<Q> {
+    pub pair: Pair,
+    /// Largest collateral amount a liquidation of this pair may seize now.
+    pub max_seize: U256,
+    /// What liquidating `max_seize` would repay/seize.
+    pub quote: Option<Q>,
+    /// Seized value at the oracle price minus repaid debt, in debt-token units (before swap costs
+    /// and gas).
+    pub bonus: f64,
+}
+
 /// One position evaluated against a market snapshot.
 #[derive(Debug, Clone)]
 pub struct Evaluation<H, Q> {
@@ -62,15 +91,13 @@ pub struct Evaluation<H, Q> {
     pub health: H,
     /// Health factor; < 1 means liquidatable.
     pub hf: f64,
-    /// Debt in loan-token units.
+    /// Debt in units of the account's main debt token (dust filter, logs).
     pub debt: f64,
-    /// Largest collateral amount a liquidation may seize now (0 when not liquidatable).
-    pub max_seize: U256,
-    /// What liquidating `max_seize` would repay/seize, when liquidatable.
-    pub quote: Option<Q>,
-    /// Seized value at the oracle price minus repaid debt, in loan-token units (before swap costs
-    /// and gas).
-    pub bonus: f64,
+    /// The pair reported when the account is not liquidatable (logs, watchlist): its main
+    /// collateral and debt.
+    pub main: Pair,
+    /// Liquidation options, best (largest bonus) first; empty while healthy.
+    pub options: Vec<LiquidationOption<Q>>,
 }
 
 /// A lending protocol the engine can track positions on.
@@ -121,24 +148,27 @@ pub trait LendingProtocol: Send + Sync + 'static {
     /// protocol-wide parameters (close factor, global bonus, e-mode tables, ...).
     fn evaluate(&self, market: &Self::Market, snap: &Self::Snapshot, position: &Self::Position) -> Evaluation<Self::Health, Self::Quote>;
 
-    // ---- what the generic planner needs to size and price a liquidation
+    // ---- what the generic planner needs to size and price a liquidation of `pair` (the exit
+    // sells `pair.collateral` for `pair.debt`; profits are counted in the debt token)
 
-    /// Tokens a liquidation's exit sells and receives: (collateral, loan).
-    fn exit_tokens(&self, market: &Self::Market) -> (Address, Address);
+    /// Decimals of a token of this market (profits and gross margins are in debt-token units).
+    fn token_decimals(&self, market: &Self::Market, token: Address) -> u8;
 
-    /// Decimals of the loan token: profits and gross margins are in loan-token units.
-    fn loan_decimals(&self, market: &Self::Market) -> u8;
+    /// Debt a liquidation of `pair` repays when it seizes `seize` collateral at this snapshot,
+    /// with the protocol's own rounding.
+    fn repay_for_seize(&self, market: &Self::Market, snap: &Self::Snapshot, pair: Pair, seize: U256) -> U256;
 
-    /// Debt a liquidation repays when it seizes `seize` collateral at this snapshot, with the
-    /// protocol's own rounding.
-    fn repay_for_seize(&self, market: &Self::Market, snap: &Self::Snapshot, seize: U256) -> U256;
+    /// Value of `amount` of `pair.collateral` in `pair.debt` base units at the protocol's oracle
+    /// price.
+    fn collateral_value(&self, market: &Self::Market, snap: &Self::Snapshot, pair: Pair, amount: U256) -> U256;
 
-    /// Value of `amount` collateral in loan-token base units at the protocol's oracle price.
-    fn collateral_value(&self, market: &Self::Market, snap: &Self::Snapshot, amount: U256) -> U256;
+    /// USD per whole `debt_token` (profits, gas trade-offs and bids are compared in USD). None =
+    /// no price model for it: a liquidation repaying it is refused rather than mispriced.
+    fn loan_usd(&self, market: &Self::Market, snap: &Self::Snapshot, debt_token: Address, eth_usd: f64) -> Option<f64>;
 
-    /// USD per whole loan token (profits, gas trade-offs and bids are compared in USD). None = no
-    /// price model for this loan token: such a market is refused rather than mispriced.
-    fn loan_usd(&self, market: &Self::Market, snap: &Self::Snapshot, eth_usd: f64) -> Option<f64>;
+    /// Every (collateral, debt) pair a position in this market may be liquidated on: the tokens
+    /// the exit routes need. An isolated market has one.
+    fn pairs(&self, market: &Self::Market) -> Vec<Pair>;
 
     /// ETH/USD derived from tracked markets, for gas accounting; `None` = use the configured
     /// fallback.
@@ -163,6 +193,7 @@ pub struct LiquidationTx {
 /// `liquidationCall`; Morpho's `liquidate` without callback data works the same way). This is what
 /// `flash_venue::FlashLiquidatorVenue` needs to flash-fund a liquidation.
 pub trait DirectLiquidation: LendingProtocol {
-    /// The call that seizes `seize` collateral of `user` in `market` while repaying `repay` of debt.
-    fn liquidation_call(&self, market: &Self::Market, user: Address, seize: U256, repay: U256) -> LiquidationTx;
+    /// The call that seizes `seize` of `pair.collateral` from `user` in `market` while repaying
+    /// `repay` of `pair.debt`.
+    fn liquidation_call(&self, market: &Self::Market, user: Address, pair: Pair, seize: U256, repay: U256) -> LiquidationTx;
 }

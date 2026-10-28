@@ -24,6 +24,7 @@ use crate::{
     dex::ExitRoute,
     executor::{MinProfitSlot, Payload},
     morpho::{Morpho, onchain::MarketMeta},
+    protocol::Pair,
     sim::{self, LiquidatorCode, Simulator},
     venue::{LiquidationVenue, SimAt, SimFee, SimResult},
 };
@@ -135,9 +136,9 @@ impl LiquidationVenue<Morpho> for AtlasBid<'_> {
         self.solver.liquidator.liquidator
     }
 
-    fn encode(&self, m: &MarketMeta, user: Address, seize: U256, repay: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload {
-        let inner = self.solver.liquidator.encode(m, user, seize, repay, route, U256::ZERO, deadline_block);
-        Payload { to: self.solver.solver, calldata: self.solver.calldata(m.params.loanToken, &inner.calldata, self.bid_wei, min_profit), min_profit: SOLVER_MIN_PROFIT }
+    fn encode(&self, m: &MarketMeta, user: Address, pair: Pair, seize: U256, repay: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload {
+        let inner = self.solver.liquidator.encode(m, user, pair, seize, repay, route, U256::ZERO, deadline_block);
+        Payload { to: self.solver.solver, calldata: self.solver.calldata(pair.debt, &inner.calldata, self.bid_wei, min_profit), min_profit: SOLVER_MIN_PROFIT }
     }
 
     async fn simulate<P: Provider>(&self, p: &P, calldata: Bytes, block: BlockId, overrides: &StateOverride, at: Option<SimAt>, fee: Option<SimFee>, _probe: Option<Address>) -> Result<SimResult> {
@@ -148,6 +149,32 @@ impl LiquidationVenue<Morpho> for AtlasBid<'_> {
         sim::probe_gas_call(p, self.solver.atlas, self.solver.solver, calldata, block, &self.solver.overrides(overrides), limits).await
     }
 }
+
+// ---- bundle sizing: an Atlas solver op liquidates every liquidatable position of a market at once
+
+/// Bundle valuation: gas per liquidated borrower inside one solver op. Calibrated on an observed
+/// Base SVR metacall: 32 liquidations + Aave supply/borrow + oracle update = 3.73M gas.
+pub const BUNDLE_GAS_PER_POSITION: u64 = 110_000;
+/// Bundle valuation: gas of a solver op besides liquidations and the swap (oracle update inside
+/// the metacall, Atlas bookkeeping, paying the bid).
+pub const BUNDLE_OVERHEAD_GAS: u64 = 600_000;
+/// Least gas worth leaving a bundle's swap (a 1-2 path exit of a big bundle: ~0.5-1M).
+const MIN_BUNDLE_SWAP_GAS: u64 = 1_000_000;
+
+/// How many positions one solver op of `solver_gas_limit` can liquidate while leaving
+/// MIN_BUNDLE_SWAP_GAS for the swap (6M -> 40).
+pub fn bundle_capacity(solver_gas_limit: u64) -> usize {
+    (solver_gas_limit.saturating_sub(BUNDLE_OVERHEAD_GAS + MIN_BUNDLE_SWAP_GAS) / BUNDLE_GAS_PER_POSITION) as usize
+}
+
+/// Gas a bundle of `n` positions leaves its swap inside one solver op.
+pub fn bundle_swap_budget(solver_gas_limit: u64, n: usize) -> u64 {
+    solver_gas_limit.saturating_sub(BUNDLE_OVERHEAD_GAS + BUNDLE_GAS_PER_POSITION * n as u64)
+}
+
+
+/// What `Planner::quote_bundle` charges a solver op besides its swap.
+pub const ATLAS_BUNDLE_GAS: crate::planner::BundleGas = crate::planner::BundleGas { per_position: BUNDLE_GAS_PER_POSITION, overhead: BUNDLE_OVERHEAD_GAS };
 
 #[cfg(test)]
 mod tests {
@@ -172,12 +199,22 @@ mod tests {
     }
 
     #[test]
+    fn solver_op_capacity() {
+        // 6M solverGasLimit: 600k overhead + 1M swap floor leave room for 40 liquidations.
+        assert_eq!(bundle_capacity(6_000_000), 40);
+        assert_eq!(bundle_swap_budget(6_000_000, 40), 1_000_000);
+        // A 31-position auction leaves 1.99M for the swap.
+        assert_eq!(bundle_swap_budget(6_000_000, 31), 1_990_000);
+        assert_eq!(bundle_capacity(1_000_000), 0);
+    }
+
+    #[test]
     fn wraps_the_liquidation_in_a_solver_call_that_buys_and_pays_the_bid() {
         let s = solver();
         let usdc = Address::repeat_byte(0x10);
         let venue = AtlasBid { solver: &s, bid_wei: U256::from(5u8) };
         assert_eq!((venue.target(), venue.swap_recipient()), (SIM_SOLVER, Address::repeat_byte(0x11)), "aggregator routes deliver to the inner liquidator");
-        let p = venue.encode(&meta(usdc), Address::repeat_byte(7), U256::from(90u64), U256::from(80u64), &ExitRoute::Packed(Bytes::from_static(&[1, 2])), U256::from(3u8), 9);
+        let p = venue.encode(&meta(usdc), Address::repeat_byte(7), crate::morpho::pair_of(&meta(usdc)), U256::from(90u64), U256::from(80u64), &ExitRoute::Packed(Bytes::from_static(&[1, 2])), U256::from(3u8), 9);
         assert_eq!(p.to, SIM_SOLVER);
         let call = IAtlasSolver::atlasSolverCallCall::abi_decode(&p.calldata).unwrap();
         assert_eq!((call.solverOpFrom, call.executionEnvironment, call.bidToken, call.bidAmount), (Address::repeat_byte(0x5e), SIM_EXECUTION_ENVIRONMENT, Address::ZERO, U256::from(5u8)));
