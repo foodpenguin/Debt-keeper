@@ -17,8 +17,8 @@ use crate::{
     config::Config,
     dex::{Dex, ExitRoute, SwapCall},
     executor::{MinProfitSlot, Payload},
-    protocol::{BorrowerInfo, Evaluation, LendingProtocol, MarketInfo, Touched},
-    venue::{LiquidationVenue, SimAt, SimResult},
+    protocol::{BorrowerInfo, DirectLiquidation, Evaluation, LendingProtocol, LiquidationTx, MarketInfo, Touched},
+    venue::{LiquidationVenue, SimAt, SimFee, SimResult},
 };
 
 #[derive(Clone, Debug)]
@@ -101,6 +101,18 @@ impl LendingProtocol for Toy {
     fn collateral_value(&self, _m: &Mk, _snap: &f64, amount: U256) -> U256 {
         amount
     }
+    fn loan_usd(&self, _m: &Mk, _snap: &f64, _eth_usd: f64) -> Option<f64> {
+        Some(1.0)
+    }
+}
+
+/// Toy liquidation call: `liquidate(user, repay)` on a fixed protocol address (0x70..).
+impl DirectLiquidation for Toy {
+    fn liquidation_call(&self, _m: &Mk, user: Address, _seize: U256, repay: U256) -> LiquidationTx {
+        let mut d = user.to_vec();
+        d.extend_from_slice(&repay.to_be_bytes::<32>());
+        LiquidationTx { target: Address::repeat_byte(0x70), calldata: Bytes::from(d), debt_token: Address::repeat_byte(0x10), collateral_token: Address::repeat_byte(0xc0) }
+    }
 }
 
 /// A liquidation contract that encodes but never simulates.
@@ -110,7 +122,7 @@ impl LiquidationVenue<Toy> for MockVenue {
     fn target(&self) -> Address {
         Address::repeat_byte(0x11)
     }
-    fn encode(&self, _m: &Mk, user: Address, seize: U256, route: &ExitRoute, min_profit: U256, _deadline: u64) -> Payload {
+    fn encode(&self, _m: &Mk, user: Address, seize: U256, _repay: U256, route: &ExitRoute, min_profit: U256, _deadline: u64) -> Payload {
         let tag = match route {
             ExitRoute::Packed(_) => 1u8,
             ExitRoute::Call { .. } => 2u8,
@@ -121,7 +133,7 @@ impl LiquidationVenue<Toy> for MockVenue {
         d.extend_from_slice(&min_profit.to_be_bytes::<32>());
         Payload { to: self.target(), calldata: Bytes::from(d), min_profit: MinProfitSlot { offset: 53, width: 32 } }
     }
-    async fn simulate<P: Provider>(&self, _p: &P, _calldata: Bytes, _block: BlockId, _overrides: &StateOverride, _at: Option<SimAt>, _probe: Option<Address>) -> Result<SimResult> {
+    async fn simulate<P: Provider>(&self, _p: &P, _calldata: Bytes, _block: BlockId, _overrides: &StateOverride, _at: Option<SimAt>, _fee: Option<SimFee>, _probe: Option<Address>) -> Result<SimResult> {
         anyhow::bail!("mock venue: no simulation")
     }
     async fn probe_gas<P: Provider>(&self, _p: &P, _calldata: Bytes, _block: BlockId, _overrides: &StateOverride, _limits: &[u64]) -> Vec<(u64, bool)> {

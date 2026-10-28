@@ -5,11 +5,15 @@ A framework for building on-chain **liquidation bots** in Rust (alloy) + Foundry
 first implementation. Read `docs/architecture.md` before changing core code.
 
 ## Layout
-- `bot/` — Rust crate. Seams: `protocol.rs` (`LendingProtocol`), `venue.rs` (`LiquidationVenue`),
-  `dex.rs` (`Dex`). Generic core: `engine.rs`, `planner.rs`, `executor.rs`, `rpc.rs`, `heads.rs`,
-  `flashblocks.rs`. First implementations: `morpho/`, `sim.rs` (MorphoLiquidator), `router.rs`
-  (KyberSwap), `v3router.rs` (self-built direct router). Test doubles: `testkit.rs`.
-- `contracts/` — Foundry. `MorphoLiquidator.sol` and the simulation-only `sim/GridQuoter.sol`.
+- `bot/` — Rust crate. Seams: `protocol.rs` (`LendingProtocol`, `DirectLiquidation`), `venue.rs`
+  (`LiquidationVenue`), `dex.rs` (`Dex`), `funding.rs` (`FlashLoan`, `FlashAccounting`). Generic
+  core: `engine.rs`, `planner.rs`, `executor.rs`, `rpc.rs`, `heads.rs`, `flashblocks.rs`, and the
+  shared simulation / contract injection in `sim.rs`. First implementations: `morpho/`, `sim.rs`
+  (MorphoLiquidator), `flash_venue.rs` (FlashLiquidator), `atlas_venue.rs` (AtlasLiquidationSolver,
+  simulation only), `router.rs` (KyberSwap), `v3router.rs` (self-built direct router). Test
+  doubles: `testkit.rs`.
+- `contracts/` — Foundry. `MorphoLiquidator.sol`, `FlashLiquidator.sol`,
+  `AtlasLiquidationSolver.sol`, and the simulation-only `sim/GridQuoter.sol` and `sim/AtlasStub.sol`.
 - `docs/` — architecture and setup, in English and Traditional Chinese (`*.zh-TW.md`).
 
 ## Commands

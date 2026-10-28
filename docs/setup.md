@@ -23,7 +23,8 @@ rustls and SQLite is bundled, so no OpenSSL or system SQLite is needed.
 git clone --recurse-submodules <repo-url> liquidation-framework
 cd liquidation-framework
 git submodule update --init --recursive    # if you cloned without --recurse-submodules (forge-std)
-cd contracts && forge build && cd ..        # also produces the artifact the bot simulates with
+cd contracts && forge build && cd ..        # also produces the artifacts the bot simulates with
+                                            # (MorphoLiquidator, FlashLiquidator, AtlasLiquidationSolver, AtlasStub, GridQuoter)
 ```
 
 ## 3. RPC endpoints (`.env`)
@@ -50,7 +51,32 @@ cp config.example.toml config.local.toml   # config.local.toml is gitignored
 Review at least: `[[rpc]]`, `[morpho]` (address, indexer API, the `[[morpho.markets]]` you want to
 track), `[exec]` (keep `mode = "shadow"` for now), `[router]` (`mode` and your DEX factories).
 Pick markets deliberately: an allowlist that excludes markets with unknown or fake tokens is a
-safety control, not just a filter.
+safety control, not just a filter. The bot only accepts markets whose loan token it can price in
+USD (USD stablecoins `USDC`, `USDbC`, `USDT`, `DAI`, `USDS`, and `WETH`); it refuses to start with
+any other.
+
+Other keys worth knowing:
+
+- `exec.max_inflight` (default 3): liquidation txs in flight at once, with consecutive nonces; 1 =
+  one at a time.
+- `exec.kill_switch_file`: a relative path is resolved from the config file's directory, not from
+  the directory you start the bot in.
+- `accrual_lookahead_secs`: leave it unset to follow the measured block time (rounded up, 1 to 2 s).
+- The config is checked at start: `exec.venue = "flash"` together with `router.mode = "direct"`, or
+  with `[flashblocks] enabled = true` and `flashblocks.router = "direct"`, is refused (that venue
+  takes aggregator exits only).
+
+Liquidation contract (`[exec] venue`):
+
+- `"callback"` (default): MorphoLiquidator, funded by Morpho's liquidate callback.
+- `"flash"`: FlashLiquidator, which flash-borrows the repayment first (the path for protocols
+  without a callback). `flash_funding = "morpho"` (Morpho flash loan) or `"v4"` (Uniswap V4 flash
+  accounting, needs `pool_manager`); `flash_headroom_bps` is borrowed on top of the planned
+  repayment; `flash_liquidator` = the deployed contract (unset: simulated with injected bytecode).
+  Only aggregator exits are used with this venue (it has no packed-route entry).
+
+`[atlas.solver] simulate = true` additionally simulates each valued SVR auction's top position as
+an Atlas solver operation (journal only, nothing is signed or sent); see `docs/architecture.md`.
 
 ## 5. Build and run in shadow mode
 
@@ -61,21 +87,28 @@ cargo build --release
 ```
 
 Shadow mode writes `data/journal.jsonl`. Run it for a while and read it (`report`, `dashboard`)
-before considering live mode. `bot dashboard` (or `scripts/dashboard_loop.sh`, every minute) renders
+before considering live mode. RPC budget: the block path reads the touched logs and one snapshot
+per market every block. Deadlines and the interest lookahead adapt to the measured block time, but
+with 200 ms blocks (Base's planned "Denim" upgrade) that work happens ~10x as often, so RPC usage
+grows ~10x: check your plan's quota. `bot dashboard` (or `scripts/dashboard_loop.sh`, every minute) renders
 `data/dashboard.html`; its times are UTC unless `BOT_DASH_TZ_HOURS` is set (e.g. `8` or `-5.5`).
 
 ## 6. Tests
 
 ```bash
 cargo test                                      # unit tests (no network)
-cargo test e2e -- --ignored --nocapture         # live path on a LOCAL anvil fork (needs anvil; BASE_FORK_URL optional)
+cargo test e2e -- --ignored --nocapture         # LOCAL anvil fork (needs anvil; BASE_FORK_URL optional): live send path,
+                                                # several txs in flight, stuck-tx cancel, flash-funded
+                                                # venue, Atlas solver op
 cd ../contracts
 forge test --no-match-contract Fork -vv         # tests that need no RPC
 BASE_RPC_URL=<your url> forge test -j 1 -vv     # fork tests; -j 1 keeps free RPC plans under their rate limit
 ```
 
-Fork tests default to a public endpoint when `BASE_RPC_URL` is unset. Pass a keyed URL through the
-environment only; never write it into a file that is committed.
+Fork tests default to a public endpoint when `BASE_RPC_URL` is unset. They are pinned to a fixed
+block so results do not drift with the chain, so the endpoint must serve archive state
+(`FORK_BLOCK=<n>` moves the pin, `FORK_BLOCK=0` = latest). Pass a keyed URL through the environment
+only; never write it into a file that is committed.
 
 ## 7. Keys
 
@@ -99,7 +132,12 @@ wallet.
    `exec.daily_gas_budget_usd`, the market allowlist, `exec.kill_switch_file`, `exec.allowed_targets`
    (must match the contract allowlist), `exec.liquidator`, `exec.keystore`.
 3. Set `exec.mode = "live"` and start `watch --live` yourself. The pre-flight check refuses to start
-   if the contract, executor, allowances or balance are off.
+   if the contract, executor, allowances or balance are off. With `exec.venue = "flash"` it checks
+   `exec.flash_liquidator` instead, that Morpho is one of its `allowedProtocol`s, and that its
+   `MORPHO()` / `POOL_MANAGER()` match the configured `flash_funding`. There is no deploy script for
+   FlashLiquidator: deploy it yourself with constructor
+   `(morpho, poolManager, owner, executor, profitReceiver)`, then `setAllowedProtocol` the
+   protocol's liquidation target and `setAllowedTarget` your aggregator router(s).
 4. Emergency stop: create the kill-switch file (every decision becomes "skip"), or call `pause()` on
    the contract from the owner or executor.
 

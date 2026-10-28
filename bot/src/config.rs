@@ -36,9 +36,10 @@ pub struct Config {
     #[serde(default = "default_dust")]
     pub dust_debt: f64,
     /// Accrue interest this many seconds past the current block (~ the next block's timestamp),
-    /// so positions that cross HF 1 purely through interest are flagged one block early.
-    #[serde(default = "default_lookahead")]
-    pub accrual_lookahead_secs: u64,
+    /// so positions that cross HF 1 purely through interest are flagged one block early. Unset =
+    /// the observed block time, rounded up to whole seconds (2 s blocks: 2; 200 ms blocks: 1).
+    #[serde(default)]
+    pub accrual_lookahead_secs: Option<u64>,
     /// Max block range for one getLogs call; a bigger gap triggers a full borrower reload instead.
     #[serde(default = "default_log_range")]
     pub max_log_range: u64,
@@ -170,12 +171,84 @@ pub struct AtlasConfig {
     pub paper_margins: Vec<f64>,
     #[serde(default = "default_paper_deadline")]
     pub paper_deadline_ms: u64,
+    /// Atlas charges a solver its op's gas at the metacall's gas price plus a surcharge. Read from
+    /// the Atlas escrow at start (`getAtlasSurchargeRate`, scale 1e4); this is the fallback.
+    #[serde(default = "default_atlas_surcharge")]
+    pub gas_surcharge: f64,
+    #[serde(default)]
+    pub solver: SolverConfig,
 }
 
 impl Default for AtlasConfig {
     fn default() -> Self {
-        Self { observe: false, ws: default_atlas_ws(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline() }
+        Self { observe: false, ws: default_atlas_ws(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
     }
+}
+
+/// `[atlas.solver]`: the AtlasLiquidationSolver venue (atlas_venue.rs), SIMULATION ONLY. With
+/// `simulate`, the top position of each valued auction (direct-router plan) is also wrapped into a
+/// solver operation with the journaled bid and simulated against an Atlas stand-in; the net after
+/// the bid is journaled. Nothing is signed or submitted.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SolverConfig {
+    #[serde(default)]
+    pub simulate: bool,
+    /// Deployed AtlasLiquidationSolver. Unset = injected bytecode.
+    #[serde(default)]
+    pub address: Option<Address>,
+    /// Deployed MorphoLiquidator owned by the solver (executor = profit receiver = solver).
+    #[serde(default)]
+    pub liquidator: Option<Address>,
+    /// The solver operation signer (Atlas `solverOpFrom`). Default: exec.executor.
+    #[serde(default)]
+    pub signer: Option<Address>,
+    #[serde(default = "default_weth")]
+    pub weth: Address,
+    /// Uniswap V3-style router (exactOutputSingle) that buys the ETH bid with the loan token.
+    #[serde(default = "default_bid_router")]
+    pub bid_router: Address,
+    /// Fee tier of the bid swap pool (loan token / WETH).
+    #[serde(default = "default_bid_fee")]
+    pub bid_fee: u32,
+    #[serde(default = "default_solver_artifact")]
+    pub artifact: String,
+    #[serde(default = "default_atlas_stub_artifact")]
+    pub stub_artifact: String,
+}
+
+impl Default for SolverConfig {
+    fn default() -> Self {
+        Self {
+            simulate: false,
+            address: None,
+            liquidator: None,
+            signer: None,
+            weth: default_weth(),
+            bid_router: default_bid_router(),
+            bid_fee: default_bid_fee(),
+            artifact: default_solver_artifact(),
+            stub_artifact: default_atlas_stub_artifact(),
+        }
+    }
+}
+
+fn default_atlas_surcharge() -> f64 {
+    0.1
+}
+fn default_weth() -> Address {
+    "0x4200000000000000000000000000000000000006".parse().unwrap()
+}
+fn default_bid_router() -> Address {
+    "0x2626664c2603336E57B271c5C0b26F421741e481".parse().unwrap()
+}
+fn default_bid_fee() -> u32 {
+    500
+}
+fn default_solver_artifact() -> String {
+    "../contracts/out/AtlasLiquidationSolver.sol/AtlasLiquidationSolver.json".into()
+}
+fn default_atlas_stub_artifact() -> String {
+    "../contracts/out/AtlasStub.sol/AtlasStub.json".into()
 }
 
 fn default_atlas_ws() -> String {
@@ -370,6 +443,14 @@ mod tests {
     }
 
     #[test]
+    fn relative_kill_switch_paths_follow_the_config_file() {
+        assert_eq!(anchored("/srv/bot/config.local.toml", "data/KILL"), "/srv/bot/data/KILL");
+        assert_eq!(anchored("config.toml", "data/KILL"), "./data/KILL");
+        assert_eq!(anchored("/srv/bot/config.toml", "/var/KILL"), "/var/KILL", "absolute stays");
+        assert_eq!(anchored("/srv/bot/config.toml", ""), "", "unset stays unset");
+    }
+
+    #[test]
     fn default_nonce_path_is_per_wallet_and_cwd_independent() {
         let exec: ExecConfig = toml::from_str(
             r#"
@@ -415,12 +496,63 @@ mod tests {
         let err = parse("[flashblocks]\nrouter = \"drect\"").validate().unwrap_err().to_string();
         assert!(err.contains("flashblocks.router"), "{err}");
     }
+
+    #[test]
+    fn venue_settings_are_checked() {
+        let base = r#"
+            chain_id = 8453
+            journal_path = "x"
+            morpho = { address = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb", api = "x", markets = [] }
+            [exec]
+            executor = "0x000000000000000000000000000000000000dEaD"
+            liquidator_artifact = "x"
+            kyber_api = "x"
+            kyber_client_id = "x"
+            slippage_bps = 50
+            priority_fee_wei = 1
+            replan_blocks = 1
+            max_plans_per_block = 1
+            eth_usd_fallback = 1.0
+        "#;
+        let parse = |extra: &str| toml::from_str::<Config>(&format!("{base}\n{extra}")).unwrap();
+        let d = parse("");
+        assert_eq!((d.exec.venue.as_str(), d.exec.flash_funding.as_str(), d.exec.flash_headroom_bps), ("callback", "morpho", 10));
+        assert!(d.validate().is_ok());
+        assert!(parse("venue = \"flash\"").validate().is_ok(), "Morpho flash loan needs nothing else");
+        let direct = "venue = \"flash\"\n[router]\nmode = \"direct\"";
+        assert!(parse(direct).validate().unwrap_err().to_string().contains("aggregator exits only"));
+        let fb_direct = "venue = \"flash\"\n[flashblocks]\nenabled = true";
+        assert!(parse(fb_direct).validate().unwrap_err().to_string().contains("flashblocks.router"), "same-block router defaults to direct");
+        assert!(parse("venue = \"flsh\"").validate().unwrap_err().to_string().contains("exec.venue"));
+        assert!(parse("venue = \"flash\"\nflash_funding = \"v4\"").validate().unwrap_err().to_string().contains("pool_manager"));
+        assert!(parse("venue = \"flash\"\nflash_funding = \"v4\"\npool_manager = \"0x498581fF718922c3f8e6A244956aF099B2652b2b\"").validate().is_ok());
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ExecConfig {
     /// Deployed MorphoLiquidator. Unset = simulate with the bytecode injected via state override.
     pub liquidator: Option<Address>,
+    /// Liquidation contract (see funding.rs): "callback" = MorphoLiquidator (the protocol funds the
+    /// repayment inside its liquidate callback; no borrowing) or "flash" = FlashLiquidator (the
+    /// repayment is flash-borrowed first: the path for protocols without a callback).
+    #[serde(default = "default_venue")]
+    pub venue: String,
+    /// Deployed FlashLiquidator (venue = "flash"). Unset = simulate with injected bytecode.
+    #[serde(default)]
+    pub flash_liquidator: Option<Address>,
+    #[serde(default = "default_flash_artifact")]
+    pub flash_liquidator_artifact: String,
+    /// Flash source of the "flash" venue: "morpho" (Morpho Blue flash loan) or "v4" (Uniswap V4
+    /// flash accounting; needs pool_manager).
+    #[serde(default = "default_flash_funding")]
+    pub flash_funding: String,
+    /// Uniswap V4 PoolManager (FlashLiquidator constructor; flash_funding = "v4").
+    #[serde(default)]
+    pub pool_manager: Option<Address>,
+    /// Flash-borrowed on top of the planned repayment, in bps (interest accrued before inclusion).
+    #[serde(default = "default_flash_headroom")]
+    pub flash_headroom_bps: u32,
     /// Hot wallet address (only the address; the key never goes in config).
     pub executor: Address,
     pub liquidator_artifact: String,
@@ -455,6 +587,10 @@ pub struct ExecConfig {
     /// normal on the busy days that pay).
     #[serde(default = "default_max_fail")]
     pub max_failures_in_window: u32,
+    /// Liquidation txs in flight at once (consecutive nonces): a crash makes many positions
+    /// liquidatable within a few blocks. 1 = one at a time.
+    #[serde(default = "default_max_inflight")]
+    pub max_inflight: usize,
     #[serde(default = "default_fail_window")]
     pub failure_window_secs: u64,
     #[serde(default = "default_fail_cooldown")]
@@ -581,8 +717,20 @@ fn default_watch_hf() -> f64 {
 fn default_log_chunk() -> u64 {
     100
 }
-fn default_lookahead() -> u64 {
-    2
+fn default_max_inflight() -> usize {
+    3
+}
+fn default_venue() -> String {
+    "callback".into()
+}
+fn default_flash_artifact() -> String {
+    "../contracts/out/FlashLiquidator.sol/FlashLiquidator.json".into()
+}
+fn default_flash_funding() -> String {
+    "morpho".into()
+}
+fn default_flash_headroom() -> u32 {
+    10
 }
 fn default_allowed_targets() -> Vec<Address> {
     // KyberSwap MetaAggregationRouterV2 on Base
@@ -634,6 +782,17 @@ fn default_min_balance() -> f64 {
 fn default_planning_prio() -> u128 {
     50_000_000 // 0.05 gwei
 }
+/// A relative path from the config, anchored at the config file's directory: the same file whatever
+/// directory the bot is started from (a kill switch that silently points elsewhere does not stop it).
+fn anchored(config_path: &str, p: &str) -> String {
+    let path = std::path::Path::new(p);
+    if p.is_empty() || path.is_absolute() {
+        return p.to_string();
+    }
+    let dir = std::path::Path::new(config_path).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    dir.join(path).to_string_lossy().into_owned()
+}
+
 fn default_kill_file() -> String {
     "data/KILL".into()
 }
@@ -662,7 +821,8 @@ impl Config {
         if let Ok(t) = text.parse::<toml::Table>() {
             Self::reject_legacy_layout_of(&t).with_context(|| format!("parsing {path}"))?;
         }
-        let cfg: Self = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
+        let mut cfg: Self = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
+        cfg.exec.kill_switch_file = anchored(path, &cfg.exec.kill_switch_file);
         cfg.validate().with_context(|| format!("checking {path}"))?;
         Ok(cfg)
     }
@@ -688,7 +848,21 @@ impl Config {
         for (key, v) in [("router.mode", &self.router.mode), ("flashblocks.router", &self.flashblocks.router)] {
             anyhow::ensure!(ROUTERS.contains(&v.as_str()), "{key} = {v:?}: must be one of {ROUTERS:?}");
         }
+        let e = &self.exec;
+        anyhow::ensure!(["callback", "flash"].contains(&e.venue.as_str()), "exec.venue = {:?}: must be \"callback\" or \"flash\"", e.venue);
+        anyhow::ensure!(["morpho", "v4"].contains(&e.flash_funding.as_str()), "exec.flash_funding = {:?}: must be \"morpho\" or \"v4\"", e.flash_funding);
+        anyhow::ensure!(e.venue != "flash" || e.flash_funding != "v4" || e.pool_manager.is_some(), "exec.flash_funding = \"v4\" needs exec.pool_manager");
+        // The flash venue has no packed-route entry: a "direct" exit could never be planned for it.
+        if e.venue == "flash" {
+            anyhow::ensure!(self.router.mode != "direct", "exec.venue = \"flash\" takes aggregator exits only: router.mode must be \"best\" or \"aggregator\"");
+            anyhow::ensure!(!self.flashblocks.enabled || self.flashblocks.router != "direct", "exec.venue = \"flash\" takes aggregator exits only: flashblocks.router must be \"best\" or \"aggregator\"");
+        }
         Ok(())
+    }
+
+    /// Seconds to accrue interest ahead of the current block at this block time.
+    pub fn lookahead_secs(&self, block_time_secs: f64) -> u64 {
+        self.accrual_lookahead_secs.unwrap_or_else(|| (block_time_secs.ceil() as u64).clamp(1, 2))
     }
 
     pub fn resolve_rpc(&self) -> Result<ResolvedRpc> {

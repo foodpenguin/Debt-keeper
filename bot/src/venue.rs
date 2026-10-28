@@ -15,6 +15,14 @@ use anyhow::Result;
 
 use crate::{dex::ExitRoute, executor::Payload, protocol::LendingProtocol};
 
+/// The fee fields a simulated call carries: what the real tx would bid. Venues read tx.gasprice
+/// (priority-fee taxes, dynamic fees), so a simulation at gas price 0 can overstate the profit.
+#[derive(Debug, Clone, Copy)]
+pub struct SimFee {
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
 /// Execute a simulation as block `number` with timestamp `time`.
 #[derive(Debug, Clone, Copy)]
 pub struct SimAt {
@@ -51,15 +59,33 @@ impl std::fmt::Display for SimReverted {
 impl std::error::Error for SimReverted {}
 
 pub trait LiquidationVenue<L: LendingProtocol>: Send + Sync {
-    /// The contract the liquidation tx is sent to (also the sender/recipient of exit swaps).
+    /// The contract the liquidation tx (or operation) is sent to.
     fn target(&self) -> Address;
 
-    /// The liquidation of `seize` collateral of `user` in `market`, selling it along `route`, as a
-    /// sendable payload (calldata + where minProfit sits so it can be patched at send time).
-    fn encode(&self, market: &L::Market, user: Address, seize: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload;
+    /// The contract that runs the exit swaps: an aggregator route is built for it as sender and
+    /// recipient. The target itself unless the venue nests the liquidation in another contract (an
+    /// Atlas solver liquidates through a liquidator it owns).
+    fn swap_recipient(&self) -> Address {
+        self.target()
+    }
+
+    /// Whether `encode` takes an `ExitRoute::Packed` (the self-built direct router's compact route).
+    /// A venue without a packed entry only gets aggregator (`ExitRoute::Call`) exits.
+    fn packed_routes(&self) -> bool {
+        true
+    }
+
+    /// The liquidation of `seize` collateral of `user` in `market`, repaying `repay` of debt
+    /// (`LendingProtocol::repay_for_seize`), selling the collateral along `route`, as a sendable
+    /// payload (calldata + where minProfit sits so it can be patched at send time). A venue that
+    /// funds the repayment itself (flash loan) borrows `repay`; a callback venue may ignore it.
+    #[allow(clippy::too_many_arguments)]
+    fn encode(&self, market: &L::Market, user: Address, seize: U256, repay: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload;
 
     /// Simulates `calldata` against `target()` at `block` (plus `overrides`), as the next block at
-    /// `at` when given; `probe` = an oracle whose price to read in the simulated state.
+    /// `at` when given, priced at `fee`; `probe` = an oracle whose price to read in the simulated
+    /// state.
+    #[allow(clippy::too_many_arguments)]
     fn simulate<P: Provider>(
         &self,
         p: &P,
@@ -67,6 +93,7 @@ pub trait LiquidationVenue<L: LendingProtocol>: Send + Sync {
         block: BlockId,
         overrides: &StateOverride,
         at: Option<SimAt>,
+        fee: Option<SimFee>,
         probe: Option<Address>,
     ) -> impl Future<Output = Result<SimResult>> + Send;
 

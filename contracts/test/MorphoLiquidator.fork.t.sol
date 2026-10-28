@@ -46,7 +46,8 @@ contract MorphoLiquidatorForkTest is Test {
 
     function setUp() public {
         string memory rpc = vm.envOr("BASE_RPC_URL", string("https://base.gateway.tenderly.co"));
-        uint256 forkBlock = vm.envOr("FORK_BLOCK", uint256(0));
+        // Pinned, so results do not drift with the chain (FORK_BLOCK overrides it; FORK_BLOCK=0 = latest).
+        uint256 forkBlock = vm.envOr("FORK_BLOCK", uint256(53206447));
         if (forkBlock == 0) vm.createSelectFork(rpc);
         else vm.createSelectFork(rpc, forkBlock);
 

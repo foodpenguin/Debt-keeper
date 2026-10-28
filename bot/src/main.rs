@@ -1,11 +1,15 @@
 mod atlas;
+mod atlas_venue;
 mod chain;
 mod config;
+mod contracts;
 mod dash;
 mod dex;
 mod engine;
 mod protocol;
 mod executor;
+mod flash_venue;
+mod funding;
 mod flashblocks;
 #[cfg(test)]
 mod e2e;
@@ -57,7 +61,7 @@ use crate::{
 };
 
 #[derive(Parser)]
-#[command(about = "Base Morpho Blue liquidation bot (shadow mode: nothing is ever sent)")]
+#[command(about = "Liquidation bot (Morpho Blue on Base): shadow mode by default; `watch --live` sends")]
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
     config: String,
@@ -203,6 +207,10 @@ async fn run(cli: Cli, cfg: Config, live_signer: Option<alloy::signers::local::P
     };
     let morpho = Morpho::from_config(&cfg);
     let mut engine = MorphoEngine::new(provider, cfg, morpho).await?;
+    // Profits, gas trade-offs and bids are in USD: a market whose loan token has no price model
+    // would be silently mispriced, so it is refused here.
+    let unpriced: Vec<String> = engine.metas.iter().filter(|m| morpho::loan_usd_model(engine.cfg.chain_id, m.params.loanToken, 1.0).is_none()).map(|m| format!("{} (loan {})", m.name, m.loan_symbol)).collect();
+    anyhow::ensure!(unpriced.is_empty(), "markets with a loan token the bot cannot price in USD (Base USD stablecoins and WETH, by address): {}", unpriced.join(", "));
     match cli.cmd {
         Cmd::Scan { top } => scan(&mut engine, top).await,
         Cmd::Watch { from_block, .. } => watch(&mut engine, from_block, pool, resolved.ws, live_signer.map(|s| (s, broadcast)), fb_provider).await,
@@ -248,35 +256,174 @@ async fn build_v3<P: Provider>(engine: &MorphoEngine<P>) -> Result<v3router::V3R
     Ok(v3)
 }
 
-/// Exit router clients + simulator. Without a deployed liquidator, the contract is simulated by
-/// running its constructor in an eth_call and injecting the result, including the standing Morpho
-/// allowance on every loan token (discovered storage slot).
-async fn build_planner_parts<P: Provider>(engine: &MorphoEngine<P>) -> Result<(Kyber, Simulator)> {
+/// Block time assumed until enough blocks were seen to measure it (one-off CLI paths use it too).
+const DEFAULT_BLOCK_TIME: f64 = 2.0;
+
+/// The liquidation contract the planner encodes for and simulates (`exec.venue`).
+enum Venue {
+    /// MorphoLiquidator: Morpho funds the repayment inside its liquidate callback.
+    Callback(Simulator),
+    /// FlashLiquidator: the repayment is flash-borrowed first (Morpho flash loan or V4).
+    Flash(flash_venue::FlashLiquidatorVenue<Morpho>),
+}
+
+impl venue::LiquidationVenue<Morpho> for Venue {
+    fn target(&self) -> Address {
+        match self {
+            Venue::Callback(v) => venue::LiquidationVenue::<Morpho>::target(v),
+            Venue::Flash(v) => v.target(),
+        }
+    }
+    fn packed_routes(&self) -> bool {
+        match self {
+            Venue::Callback(v) => venue::LiquidationVenue::<Morpho>::packed_routes(v),
+            Venue::Flash(v) => v.packed_routes(),
+        }
+    }
+    fn swap_recipient(&self) -> Address {
+        match self {
+            Venue::Callback(v) => venue::LiquidationVenue::<Morpho>::swap_recipient(v),
+            Venue::Flash(v) => v.swap_recipient(),
+        }
+    }
+    fn encode(&self, m: &MarketMeta, user: Address, seize: U256, repay: U256, route: &dex::ExitRoute, min_profit: U256, deadline_block: u64) -> executor::Payload {
+        match self {
+            Venue::Callback(v) => v.encode(m, user, seize, repay, route, min_profit, deadline_block),
+            Venue::Flash(v) => v.encode(m, user, seize, repay, route, min_profit, deadline_block),
+        }
+    }
+    async fn simulate<P: Provider>(&self, p: &P, calldata: alloy::primitives::Bytes, block: alloy::eips::BlockId, overrides: &StateOverride, at: Option<venue::SimAt>, fee: Option<venue::SimFee>, probe: Option<Address>) -> Result<venue::SimResult> {
+        match self {
+            Venue::Callback(v) => venue::LiquidationVenue::<Morpho>::simulate(v, p, calldata, block, overrides, at, fee, probe).await,
+            Venue::Flash(v) => v.simulate(p, calldata, block, overrides, at, fee, probe).await,
+        }
+    }
+    async fn probe_gas<P: Provider>(&self, p: &P, calldata: alloy::primitives::Bytes, block: alloy::eips::BlockId, overrides: &StateOverride, limits: &[u64]) -> Vec<(u64, bool)> {
+        match self {
+            Venue::Callback(v) => venue::LiquidationVenue::<Morpho>::probe_gas(v, p, calldata, block, overrides, limits).await,
+            Venue::Flash(v) => v.probe_gas(p, calldata, block, overrides, limits).await,
+        }
+    }
+}
+
+/// Exit router clients + the liquidation venue. Without a deployed contract, it is simulated by
+/// running its constructor in an eth_call and injecting the result (for MorphoLiquidator, with the
+/// standing Morpho allowance on every loan token, from the discovered storage slot).
+async fn build_planner_parts<P: Provider>(engine: &MorphoEngine<P>) -> Result<(Kyber, Venue)> {
     let cfg = &engine.cfg;
     let kyber = Kyber::new(engine.http.clone(), &cfg.exec.kyber_api, &cfg.exec.kyber_client_id);
+    if cfg.exec.venue == "flash" {
+        return Ok((kyber, Venue::Flash(build_flash_venue(engine).await?)));
+    }
     let code = match cfg.exec.liquidator {
-        None => Some(LiquidatorCode::build(&engine.provider, &cfg.exec.liquidator_artifact, engine.protocol.address, cfg.exec.executor, cfg.exec.executor, cfg.exec.executor).await?),
+        None => Some(LiquidatorCode::build(&engine.provider, &cfg.exec.liquidator_artifact, &[engine.protocol.address, cfg.exec.executor, cfg.exec.executor, cfg.exec.executor], cfg.exec.executor).await?),
         Some(_) => None,
     };
     let mut sim = Simulator::new(cfg.exec.liquidator, cfg.exec.executor, code, cfg.exec.allowed_targets.clone());
-    let mut loans: Vec<Address> = engine.metas.iter().map(|m| m.params.loanToken).collect();
-    loans.sort();
-    loans.dedup();
-    for token in loans {
-        match cfg.exec.liquidator {
-            None => {
-                let key = sim::discover_allowance_key(&engine.provider, token, sim.liquidator, engine.protocol.address).await?;
-                sim.add_approval(token, key);
-            }
-            // Deployed: the owner must have called approveMorpho(token, true).
-            Some(liq) => {
+    match cfg.exec.liquidator {
+        None => inject_morpho_approvals(engine, &mut sim).await?,
+        // Deployed: the owner must have called approveMorpho(token, true).
+        Some(liq) => {
+            for token in loan_tokens(engine) {
                 if !sim::has_standing_allowance(&engine.provider, token, liq, engine.protocol.address).await? {
                     warn!(%token, "liquidator has no standing Morpho allowance: call approveMorpho(token, true) as owner");
                 }
             }
         }
     }
-    Ok((kyber, sim))
+    Ok((kyber, Venue::Callback(sim)))
+}
+
+/// Every distinct loan token of the tracked markets.
+fn loan_tokens<P: Provider>(engine: &MorphoEngine<P>) -> Vec<Address> {
+    let mut loans: Vec<Address> = engine.metas.iter().map(|m| m.params.loanToken).collect();
+    loans.sort();
+    loans.dedup();
+    loans
+}
+
+/// An injected MorphoLiquidator also needs the standing Morpho allowance the owner sets on the real
+/// one (`approveMorpho`): found per loan token by probing its allowance storage slot.
+async fn inject_morpho_approvals<P: Provider>(engine: &MorphoEngine<P>, sim: &mut Simulator) -> Result<()> {
+    for token in loan_tokens(engine) {
+        let key = sim::discover_allowance_key(&engine.provider, token, sim.liquidator, engine.protocol.address).await?;
+        sim.add_approval(token, key);
+    }
+    Ok(())
+}
+
+/// Atlas's gas surcharge on solver ops, read from the escrow (`getAtlasSurchargeRate`, scale 1e4);
+/// the configured `atlas.gas_surcharge` when Atlas is off or the read fails.
+async fn atlas_surcharge<P: Provider>(engine: &MorphoEngine<P>) -> f64 {
+    let fallback = engine.cfg.atlas.gas_surcharge;
+    if !engine.cfg.atlas.observe {
+        return fallback;
+    }
+    use alloy::sol_types::SolCall;
+    let tx = alloy::rpc::types::TransactionRequest::default().to(engine.cfg.flashblocks.atlas).input(IAtlasRates::getAtlasSurchargeRateCall {}.abi_encode().into());
+    match engine.provider.call(tx).await.ok().and_then(|out| IAtlasRates::getAtlasSurchargeRateCall::abi_decode_returns(&out).ok()) {
+        Some(rate) => {
+            let s = math::u256_f64(rate) / 1e4;
+            info!(surcharge = s, "atlas: gas surcharge read from the escrow");
+            s
+        }
+        None => {
+            warn!(fallback, "atlas: could not read the gas surcharge; using atlas.gas_surcharge");
+            fallback
+        }
+    }
+}
+
+/// The Atlas solver venue (`[atlas.solver] simulate`): the solver and its MorphoLiquidator are
+/// injected unless deployed, and Atlas is replaced by its stand-in in every simulation.
+async fn build_atlas_solver<P: Provider>(engine: &MorphoEngine<P>) -> Result<Option<atlas_venue::AtlasSolver>> {
+    let c = &engine.cfg.atlas.solver;
+    if !c.simulate {
+        return Ok(None);
+    }
+    let (e, p, morpho) = (&engine.cfg.exec, &engine.provider, engine.protocol.address);
+    let atlas = engine.cfg.flashblocks.atlas;
+    let signer = c.signer.unwrap_or(e.executor);
+    let solver = c.address.unwrap_or(atlas_venue::SIM_SOLVER);
+    let solver_code = match c.address {
+        None => Some(LiquidatorCode::build(p, &c.artifact, &[atlas, c.weth, signer, signer, signer], signer).await?),
+        Some(_) => None,
+    };
+    let liq_code = match c.liquidator {
+        None => Some(LiquidatorCode::build(p, &e.liquidator_artifact, &[morpho, solver, solver, solver], solver).await?),
+        Some(_) => None,
+    };
+    let mut liq = Simulator::new(c.liquidator, solver, liq_code, e.allowed_targets.clone());
+    if c.liquidator.is_none() {
+        inject_morpho_approvals(engine, &mut liq).await?;
+    }
+    let art: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&c.stub_artifact).with_context(|| format!("reading {} (run `forge build` in contracts/)", c.stub_artifact))?)?;
+    let stub: alloy::primitives::Bytes = art["deployedBytecode"]["object"].as_str().context("atlas stub: no deployedBytecode")?.parse()?;
+    info!(%solver, %signer, "atlas: solver operations are simulated (never signed or sent)");
+    Ok(Some(atlas_venue::AtlasSolver::new(atlas, c.address, signer, c.weth, c.bid_router, c.bid_fee, liq, solver_code, stub)))
+}
+
+/// FlashLiquidator over Morpho: the repayment is flash-borrowed (exec.flash_funding) and Morpho's
+/// `liquidate` is called without callback data. Morpho itself must be an allowed protocol.
+async fn build_flash_venue<P: Provider>(engine: &MorphoEngine<P>) -> Result<flash_venue::FlashLiquidatorVenue<Morpho>> {
+    let e = &engine.cfg.exec;
+    let morpho = engine.protocol.address;
+    let pool_manager = e.pool_manager.unwrap_or(funding::BASE_POOL_MANAGER);
+    let source: Box<dyn funding::FlashSource> = match e.flash_funding.as_str() {
+        "v4" => Box::new(funding::UniswapV4 { pool_manager }),
+        _ => Box::new(funding::MorphoBlue { address: morpho }),
+    };
+    // The contract repays exactly what it borrowed, so a source with a fee would revert every time.
+    anyhow::ensure!(source.fee(U256::from(1_000_000_000_000_000_000u128)).is_zero(), "flash source {} charges a fee: FlashLiquidator only supports 0-fee sources", source.name());
+    let code = match e.flash_liquidator {
+        None => Some(LiquidatorCode::build(&engine.provider, &e.flash_liquidator_artifact, &[morpho, pool_manager, e.executor, e.executor, e.executor], e.executor).await?),
+        Some(_) => None,
+    };
+    if let Some(c) = &code {
+        anyhow::ensure!(c.has_slot("allowedProtocol"), "{}: no allowedProtocol in storageLayout (rebuild contracts/)", e.flash_liquidator_artifact);
+    }
+    info!(funding = source.name(), source = %source.holder(), headroom_bps = e.flash_headroom_bps, "venue: FlashLiquidator");
+    Ok(flash_venue::FlashLiquidatorVenue::new(engine.protocol.clone(), e.flash_liquidator, e.executor, source, e.flash_headroom_bps, code, vec![morpho], e.allowed_targets.clone()))
 }
 
 async fn plan_one<P: Provider>(engine: &mut MorphoEngine<P>, market: &str, user: Address, drop_bps: u64, at_block: Option<u64>, pending: bool) -> Result<()> {
@@ -289,7 +436,7 @@ async fn plan_one<P: Provider>(engine: &mut MorphoEngine<P>, market: &str, user:
     let h = heads::http_head(&engine.provider, tag).await?;
     engine.reload(&[(mi, user)], h.number.into()).await?;
     let Some(&(shares, collateral)) = engine.positions.get(&(mi, user)) else { bail!("{user} has no debt in {market}") };
-    let snaps = engine.snapshots(h.number.into(), h.timestamp + engine.cfg.accrual_lookahead_secs).await?;
+    let snaps = engine.snapshots(h.number.into(), h.timestamp + engine.cfg.lookahead_secs(DEFAULT_BLOCK_TIME)).await?;
     let eth_usd = engine.eth_usd(&snaps);
     let mut snap = snaps[mi].clone().context("snapshot failed")?;
     let meta = &engine.metas[mi];
@@ -326,8 +473,8 @@ async fn plan_one<P: Provider>(engine: &mut MorphoEngine<P>, market: &str, user:
     let v3 = build_v3(engine).await?;
     let meta = &engine.metas[mi];
     let planner = Planner { protocol: &engine.protocol, aggregator: &kyber, venue: &simulator, cfg: &engine.cfg.exec, v3: Some(&v3), mode: &engine.cfg.router.mode };
-    let deadline_block = h.number + executor::deadline_blocks(engine.cfg.exec.deadline_secs, 2.0);
-    let sim_time = h.timestamp + engine.cfg.accrual_lookahead_secs;
+    let deadline_block = h.number + executor::deadline_blocks(engine.cfg.exec.deadline_secs, DEFAULT_BLOCK_TIME);
+    let sim_time = h.timestamp + engine.cfg.lookahead_secs(DEFAULT_BLOCK_TIME);
     let ctx = PlanCtx { meta, snap: &snap, view: &view, block: h.number, base_fee_wei: h.base_fee, eth_usd, overrides, deadline_block, sim_time, pending, price_probe: None };
     let plan = planner.plan(&engine.provider, &ctx).await?;
     println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -479,6 +626,13 @@ sol! {
         function executor() external view returns (address);
         function paused() external view returns (bool);
         function PROFIT_RECEIVER() external view returns (address);
+        function allowedTarget(address) external view returns (bool);
+        function allowedProtocol(address) external view returns (bool);
+        function MORPHO() external view returns (address);
+        function POOL_MANAGER() external view returns (address);
+    }
+    interface IAtlasRates {
+        function getAtlasSurchargeRate() external view returns (uint256);
     }
 }
 
@@ -487,7 +641,12 @@ sol! {
 async fn preflight_live<P: Provider>(engine: &MorphoEngine<P>, signer_addr: Address) -> Result<()> {
     let cfg = &engine.cfg.exec;
     anyhow::ensure!(cfg.mode == "live", "exec.mode is {:?}, not \"live\"", cfg.mode);
-    let liq = cfg.liquidator.context("live mode needs exec.liquidator (deployed contract address)")?;
+    let flash = cfg.venue == "flash";
+    let liq = if flash {
+        cfg.flash_liquidator.context("live mode with venue = \"flash\" needs exec.flash_liquidator (deployed contract address)")?
+    } else {
+        cfg.liquidator.context("live mode needs exec.liquidator (deployed contract address)")?
+    };
     let code = engine.provider.get_code_at(liq).await?;
     anyhow::ensure!(!code.is_empty(), "no contract at exec.liquidator {liq}");
     let call = |data: Vec<u8>| alloy::rpc::types::TransactionRequest::default().to(liq).input(data.into());
@@ -500,12 +659,27 @@ async fn preflight_live<P: Provider>(engine: &MorphoEngine<P>, signer_addr: Addr
     anyhow::ensure!(!paused, "liquidator is paused (owner must unpause)");
     let receiver = ILiquidatorView::PROFIT_RECEIVERCall::abi_decode_returns(&engine.provider.call(call(ILiquidatorView::PROFIT_RECEIVERCall {}.abi_encode())).await?)?;
     anyhow::ensure!(receiver != signer_addr, "PROFIT_RECEIVER must be a cold wallet, not the hot executor");
-    for m in &engine.metas {
-        anyhow::ensure!(
-            sim::has_standing_allowance(&engine.provider, m.params.loanToken, liq, engine.protocol.address).await?,
-            "no standing Morpho allowance for loan token {} (owner: approveMorpho(token, true))",
-            m.params.loanToken
-        );
+    if flash {
+        // FlashLiquidator calls Morpho's liquidate itself: Morpho must be an allowed protocol, and
+        // the funding source the config picks must be the one the contract was deployed with.
+        let morpho = engine.protocol.address;
+        let read = |data: Vec<u8>| engine.provider.call(call(data));
+        let ok = ILiquidatorView::allowedProtocolCall::abi_decode_returns(&read(ILiquidatorView::allowedProtocolCall(morpho).abi_encode()).await?)?;
+        anyhow::ensure!(ok, "Morpho {morpho} is not an allowed protocol of the flash liquidator (owner: setAllowedProtocol)");
+        let source = if cfg.flash_funding == "v4" {
+            (ILiquidatorView::POOL_MANAGERCall::abi_decode_returns(&read(ILiquidatorView::POOL_MANAGERCall {}.abi_encode()).await?)?, cfg.pool_manager.unwrap_or(funding::BASE_POOL_MANAGER))
+        } else {
+            (ILiquidatorView::MORPHOCall::abi_decode_returns(&read(ILiquidatorView::MORPHOCall {}.abi_encode()).await?)?, morpho)
+        };
+        anyhow::ensure!(source.0 == source.1 && source.0 != Address::ZERO, "flash liquidator's {} funding source is {}, config expects {}", cfg.flash_funding, source.0, source.1);
+    } else {
+        for m in &engine.metas {
+            anyhow::ensure!(
+                sim::has_standing_allowance(&engine.provider, m.params.loanToken, liq, engine.protocol.address).await?,
+                "no standing Morpho allowance for loan token {} (owner: approveMorpho(token, true))",
+                m.params.loanToken
+            );
+        }
     }
     let bal = engine.provider.get_balance(signer_addr).await?;
     anyhow::ensure!(math::units(bal, 18) >= cfg.min_wallet_eth, "hot wallet balance {} ETH < min {}", math::units(bal, 18), cfg.min_wallet_eth);
@@ -517,14 +691,18 @@ async fn preflight_live<P: Provider>(engine: &MorphoEngine<P>, signer_addr: Addr
 struct PlannerParts {
     protocol: Morpho,
     kyber: Kyber,
-    simulator: Simulator,
+    venue: Venue,
+    /// The Atlas solver venue, when `[atlas.solver] simulate`.
+    solver: Option<atlas_venue::AtlasSolver>,
+    /// Atlas's gas surcharge on solver ops (share, e.g. 0.1).
+    atlas_surcharge: f64,
     v3: v3router::V3Router,
     exec: config::ExecConfig,
 }
 
 impl PlannerParts {
-    fn planner<'a>(&'a self, mode: &'a str) -> Planner<'a, Morpho, Simulator, Kyber> {
-        Planner { protocol: &self.protocol, aggregator: &self.kyber, venue: &self.simulator, cfg: &self.exec, v3: Some(&self.v3), mode }
+    fn planner<'a>(&'a self, mode: &'a str) -> Planner<'a, Morpho, Venue, Kyber> {
+        Planner { protocol: &self.protocol, aggregator: &self.kyber, venue: &self.venue, cfg: &self.exec, v3: Some(&self.v3), mode }
     }
 }
 
@@ -626,7 +804,7 @@ fn on_auction<P: Provider + Clone + 'static>(
         .into_iter()
         .filter_map(|(mi, price)| snaps.get(mi).and_then(|s| s.as_ref()).map(|base| auction_market(engine, mi, base, price)))
         .collect();
-    let sim_time = head.timestamp + engine.cfg.accrual_lookahead_secs;
+    let sim_time = head.timestamp + engine.cfg.lookahead_secs(DEFAULT_BLOCK_TIME);
     let atlas = engine.cfg.atlas.clone();
     let (provider, parts, journal, permits, head) = (fb.provider.clone(), parts.clone(), fb.journal_tx.clone(), fb.valuations.clone(), *head);
     // The sibling auction of the same report shares the first one's valuation.
@@ -669,14 +847,14 @@ async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngi
     } else {
         engine.reload(&users.iter().map(|u| (mi, *u)).collect::<Vec<_>>(), h.number.into()).await?;
     }
-    let sim_time = h.timestamp + engine.cfg.accrual_lookahead_secs;
+    let sim_time = h.timestamp + engine.cfg.lookahead_secs(DEFAULT_BLOCK_TIME);
     let snaps = engine.snapshots(h.number.into(), sim_time).await?;
     let eth_usd = engine.eth_usd(&snaps);
     let base = snaps[mi].clone().context("snapshot failed")?;
     let price = base.price * U256::from(10_000 - drop_bps) / U256::from(10_000u64);
     let m = auction_market(engine, mi, &base, price);
     let (kyber, simulator) = build_planner_parts(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, simulator, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone() });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone() });
     let a = atlas::Auction {
         id: format!("replay-{market}-{at_block}"),
         aggregator: Address::ZERO,
@@ -754,7 +932,10 @@ async fn value_auction<P: Provider>(
     // The journaled bid: bundle net x (1 - atlas.margin); the dashboard's paper table tries the
     // atlas.paper_margins ladder around it.
     let bid_usd = bundle_net * (1.0 - atlas.margin);
-    let value_ms = a.seen.elapsed().as_millis() as u64;
+    // From this auction's arrival to the end of the valuation proper (before any solver-op
+    // simulation, see valuation()).
+    let since_valued = v["valued_unix_ms"].as_u64().map_or(0, |t| unix_ms().saturating_sub(t));
+    let value_ms = (a.seen.elapsed().as_millis() as u64).saturating_sub(since_valued);
     info!(auction = %a.id, aggregator = %a.aggregator, deadline = a.deadline, liquidatable = %v["liquidatable"], bonus_usd = %v["bonus_usd"], bundle_net_usd = bundle_net, net_usd = %v["net_usd"], bid_usd, bundle_ms = %v["bundle_ms"], value_ms, shared = %v["shared"], "ATLAS auction valued (observe only)");
     let mut row = json!({ "kind": "atlas_auction", "auction_id": a.id, "user_op_hash": a.user_op_hash, "aggregator": a.aggregator, "median": a.median.to_string(),
                           "deadline": a.deadline, "head": head.number, "max_fee_gwei": a.max_fee_per_gas as f64 / 1e9, "bid_usd": bid_usd, "bid_eth": bid_usd / eth_usd.max(1.0),
@@ -768,6 +949,43 @@ async fn value_auction<P: Provider>(
 /// The valuation proper (see value_auction): per-market rows, positions and totals, timed from
 /// when `a` (the first auction of its report) arrived.
 #[allow(clippy::too_many_arguments)]
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The auction's top position as a solver operation (`[atlas.solver] simulate`): its direct-router
+/// plan, wrapped into `atlasSolverCall` with a bid of the plan's net x (1 - margin), simulated against
+/// the Atlas stand-in. Journaled only; nothing is signed or sent. None: solver venue off, or no
+/// direct-router plan to wrap (an aggregator route is built for the direct liquidator's address).
+#[allow(clippy::too_many_arguments)]
+async fn solver_op<P: Provider>(
+    provider: &P,
+    parts: &PlannerParts,
+    m: &AuctionMarket,
+    top: Option<&Result<planner::Plan>>,
+    overrides: &StateOverride,
+    block: u64,
+    sim_time: u64,
+    atlas_gas_usd: f64,
+    eth_usd: f64,
+    margin: f64,
+) -> Option<serde_json::Value> {
+    let (Some(solver), Venue::Callback(_), Some(Ok(plan))) = (&parts.solver, &parts.venue, top) else { return None };
+    let payload = plan.payload.as_ref().filter(|_| plan.router == "direct")?;
+    // Net of the op's gas as Atlas charges it (see valuation()).
+    let net = plan.profit_usd.unwrap_or(0.0) - plan.gas_used.unwrap_or(0) as f64 * atlas_gas_usd;
+    let bid_usd = net.max(0.0) * (1.0 - margin);
+    let bid_wei = U256::from((bid_usd / eth_usd.max(1.0) * 1e18) as u128);
+    let venue = atlas_venue::AtlasBid { solver, bid_wei };
+    let calldata = solver.calldata(m.meta.params.loanToken, &payload.calldata, bid_wei, U256::ZERO);
+    let at = Some(venue::SimAt { number: block + 1, time: sim_time });
+    let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
+    Some(match r {
+        Ok(s) => json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": math::units(s.profit, m.meta.loan_decimals), "gas_used": s.gas_used }),
+        Err(e) => json!({ "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() }),
+    })
+}
+
 async fn valuation<P: Provider>(
     provider: &P,
     parts: &PlannerParts,
@@ -802,21 +1020,32 @@ async fn valuation<P: Provider>(
             .map(|v| PlanCtx { meta: &m.meta, snap: &m.snap, view: v, block: head.number, base_fee_wei: head.base_fee, eth_usd, overrides: overrides.clone(), deadline_block: a.deadline, sim_time, pending: false, price_probe: None })
             .collect();
         let plans = futures::future::join_all(ctxs.iter().enumerate().map(|(i, c)| if i == 0 { planner_top.plan(provider, c) } else { planner.plan(provider, c) })).await;
-        (bundle, bundle_ms, ctxs.iter().map(|c| c.view).zip(plans).map(|(v, p)| (v.clone(), p)).collect::<Vec<_>>())
+        (bundle, bundle_ms, overrides, ctxs.iter().map(|c| c.view).zip(plans).map(|(v, p)| (v.clone(), p)).collect::<Vec<_>>())
     }))
     .await;
+    // The valuation (what paper trading times against the auction deadline) is complete here; the
+    // optional solver-op simulations below are diagnostics and must not count towards it. Wall-clock,
+    // because a shared valuation is timed against each sibling auction's own arrival.
+    let valued_unix_ms = unix_ms();
+    // What Atlas charges a solver op for its gas: the metacall's gas price (the auction's
+    // maxFeePerGas) plus the escrow's surcharge, per gas unit, in USD.
+    let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
+    let solvers = futures::future::join_all(markets.iter().zip(&valued).map(|(m, (_, _, ov, plans))| solver_op(provider, parts, m, plans.first().map(|(_, p)| p), ov, head.number, sim_time, atlas_gas_usd, eth_usd, atlas.margin))).await;
 
     let (mut rows, mut positions) = (vec![], vec![]);
     let (mut n_liq, mut bonus_sum, mut net_sum, mut bundle_net, mut bundle_ms_max) = (0usize, 0.0f64, 0.0f64, 0.0f64, 0u64);
-    for (m, (bundle, bundle_ms, plans)) in markets.iter().zip(valued) {
+    for ((m, (bundle, bundle_ms, _, plans)), solver) in markets.iter().zip(valued).zip(solvers) {
         let bonus: f64 = m.liq.iter().map(|v| v.bonus).sum();
         n_liq += m.liq.len();
         bonus_sum += bonus;
-        bundle_net += bundle.as_ref().and_then(|b| b.net_usd).unwrap_or(0.0).max(0.0);
+        // The bid basis: the bundle's exit gain minus its whole gas as Atlas charges it (not the
+        // planner's own gas price), so a bid never spends what the solver owes Atlas.
+        let atlas_net = bundle.as_ref().and_then(|b| b.net_usd.map(|_| b.gross_usd - b.gas_units as f64 * atlas_gas_usd));
+        bundle_net += atlas_net.unwrap_or(0.0).max(0.0);
         if bundle.is_some() {
             bundle_ms_max = bundle_ms_max.max(bundle_ms);
         }
-        rows.push(json!({ "market": m.meta.name, "price_old": m.old_price.to_string(), "price_new": m.snap.price.to_string(), "liquidatable": m.liq.len(), "bonus_usd": bonus, "bundle": bundle, "bundle_ms": bundle_ms }));
+        rows.push(json!({ "market": m.meta.name, "price_old": m.old_price.to_string(), "price_new": m.snap.price.to_string(), "liquidatable": m.liq.len(), "bonus_usd": bonus, "bundle": bundle, "atlas_net_usd": atlas_net, "bundle_ms": bundle_ms, "solver": solver }));
         for (v, r) in plans {
             let (router, net, err, quote_ms, sim_ms) = match r {
                 Ok(p) => (p.router, p.net_usd, p.error, p.quote_ms, p.sim_ms),
@@ -826,7 +1055,7 @@ async fn valuation<P: Provider>(
             positions.push(json!({ "market": m.meta.name, "user": v.user, "hf": v.hf, "bonus_usd": v.bonus, "router": router, "net_usd": net, "error": err, "quote_ms": quote_ms, "sim_ms": sim_ms }));
         }
     }
-    json!({ "markets": rows, "positions": positions, "liquidatable": n_liq, "bonus_usd": bonus_sum, "bundle_net_usd": bundle_net, "net_usd": net_sum, "bundle_ms": bundle_ms_max, "first_auction": a.id })
+    json!({ "markets": rows, "positions": positions, "liquidatable": n_liq, "bonus_usd": bonus_sum, "bundle_net_usd": bundle_net, "net_usd": net_sum, "bundle_ms": bundle_ms_max, "valued_unix_ms": valued_unix_ms, "first_auction": a.id })
 }
 
 /// A Chainlink update seen in a flashblock: new price -> re-evaluate that market in memory ->
@@ -883,7 +1112,6 @@ async fn on_oracle_update<P: Provider + Clone>(
     // reads the oracle in that same state (PriceProbe): until the node has applied the metacall
     // (it trails the stream by ~50-100 ms) the plan counts as stale and is retried briefly. Only a
     // fresh, probed pending plan may send (see below).
-    let secondary = u.path == flashblocks::Path::Secondary;
     let planner = parts.planner(&engine.cfg.flashblocks.router);
     let deadline_block = u.block + executor::deadline_blocks(engine.cfg.exec.deadline_secs, block_time);
     for (mi, price) in moved {
@@ -910,142 +1138,183 @@ async fn on_oracle_update<P: Provider + Clone>(
             "{}",
             json!({ "kind": "fb_oracle", "path": u.path, "block": u.block, "flashblock": u.index, "market": meta.name, "tx": u.tx, "price_old": old.to_string(), "price_new": price.to_string(), "change_bps": change_bps, "candidates": cands.len(), "queue_ms": queue_ms, "eval_us": eval_us })
         )?;
-        // Each candidate is planned twice, in parallel, with the new price pinned by a state
-        // override:
+        // Each candidate is planned twice, in parallel:
         //  - on "pending", the block being built: it includes what is already in it (the
         //    metacall's own swaps on our pools, earlier liquidations), but nodes often serve it
-        //    1-5 blocks stale (measured 2026-10-19), and on a stale base Morpho accrues less
-        //    interest than our model (every full-debt seize panicked 0x11 on 10/18);
-        //  - on the block our snapshot came from (`head`), as the next block at the accrual time:
-        //    exactly the state the candidate was computed from, minus the in-block changes.
-        // The pending plan wins when its sim provably ran on the in-progress block (is_fresh),
-        // whatever it says (a revert there is real in-block information); else the snapshot plan.
-        // On an SVR secondary the pending plan carries no price override (see above), and only a
-        // fresh pending plan may send (may_send): the snapshot cannot know what the metacall did.
+        //    1-5 blocks stale, and on a stale base Morpho accrues less interest than our model.
+        //    No price override: the state must hold the update itself, and the oracle is read in
+        //    that same state (PriceProbe) to prove it does (a transmit that reverted, or an SVR
+        //    cutoff one block away, shows up as the old price instead of being papered over);
+        //  - on the block our snapshot came from (`head`), as the next block at the accrual time,
+        //    with the new price pinned by a state override: exactly the state the candidate was
+        //    computed from, minus the in-block changes.
+        // The pending plan wins when its sim provably ran on the in-progress block with the update
+        // in effect, whatever it says (a revert there is real in-block information); else the
+        // snapshot plan, which may only send for a public transmit (may_send).
         let mut overrides = StateOverride::default();
         overrides.insert(meta.params.oracle, AccountOverride { code: Some(sim::constant_price_oracle(price)), ..Default::default() });
-        let sim_time = head.timestamp + engine.cfg.accrual_lookahead_secs;
+        let sim_time = head.timestamp + engine.cfg.lookahead_secs(block_time);
         let ctxs: Vec<(PlanCtx<Morpho>, PlanCtx<Morpho>)> = cands
             .into_iter()
             .take(engine.cfg.flashblocks.max_plans)
             .map(|v| {
                 let at_head = PlanCtx { meta, snap: &snap, view: v, block: head.number, base_fee_wei: head.base_fee, eth_usd, overrides: overrides.clone(), deadline_block, sim_time, pending: false, price_probe: None };
-                let (pending_ov, price_probe) = if secondary {
-                    (StateOverride::default(), Some(PriceProbe { oracle: meta.params.oracle, old, new: price }))
-                } else {
-                    (overrides.clone(), None)
-                };
-                let on_pending = PlanCtx { block: u.block - 1, pending: true, overrides: pending_ov, price_probe, ..at_head };
+                let probe = Some(PriceProbe { oracle: meta.params.oracle, old, new: price });
+                let on_pending = PlanCtx { block: u.block - 1, pending: true, overrides: StateOverride::default(), price_probe: probe, ..at_head };
                 (at_head, on_pending)
             })
             .collect();
-        // Plan all candidates at once: the main loop waits on this, so it costs one plan, not N.
-        // Both run at once; a fresh pending plan is used the moment it is ready (the snapshot plan
-        // is dropped), so the send path never waits for the slower of the two.
-        let results = futures::future::join_all(ctxs.iter().map(|(h, p)| async {
-            let at_head = planner.plan(&fb.provider, h);
-            // The pending RPCs trail the flashblock stream by ~50-100 ms: on a secondary, while the
-            // probe says the node has not applied the metacall yet, ask again (briefly).
-            let on_pending = async {
-                let mut tries = 1;
-                loop {
-                    let r = planner.plan(&fb.provider, p).await;
-                    let behind = matches!(&r, Ok(plan) if plan.stale_price || !p.is_fresh(plan));
-                    if !(secondary && behind && tries < SECONDARY_PENDING_TRIES && u.seen.elapsed() < SECONDARY_PENDING_WINDOW) {
-                        break r;
-                    }
-                    tries += 1;
-                    tokio::time::sleep(SECONDARY_PENDING_RETRY).await;
+        // All candidates are planned at once and each is handled (journaled, sent) the moment its
+        // plan is ready: the best one never waits for the slowest. Both plans of a candidate run at
+        // once; a fresh pending plan is used as soon as it is ready (the snapshot plan is dropped).
+        let provider = fb.provider.clone();
+        let ready: futures::stream::FuturesUnordered<_> = ctxs
+            .iter()
+            .enumerate()
+            .map(|(i, (h, p))| {
+                let (planner, provider) = (&planner, &provider);
+                async move {
+                    let at_head = planner.plan(provider, h);
+                    // The pending RPCs trail the flashblock stream by ~50-100 ms: while the probe
+                    // says the node has not applied the update yet, ask again (briefly).
+                    let on_pending = async {
+                        let mut tries = 1;
+                        loop {
+                            let r = planner.plan(provider, p).await;
+                            let behind = matches!(&r, Ok(plan) if plan.stale_price || !p.is_fresh(plan));
+                            if !(behind && tries < SECONDARY_PENDING_TRIES && u.seen.elapsed() < SECONDARY_PENDING_WINDOW) {
+                                break r;
+                            }
+                            tries += 1;
+                            tokio::time::sleep(SECONDARY_PENDING_RETRY).await;
+                        }
+                    };
+                    tokio::pin!(at_head, on_pending);
+                    let mut head_done = None;
+                    let rp = loop {
+                        tokio::select! {
+                            r = &mut on_pending => break r,
+                            r = &mut at_head, if head_done.is_none() => head_done = Some(r),
+                        }
+                    };
+                    let chosen = match rp {
+                        Ok(plan) if p.is_fresh(&plan) && !plan.stale_price => (Ok(plan), "pending"),
+                        _ => (match head_done {
+                            Some(r) => r,
+                            None => at_head.await,
+                        }, "snapshot"),
+                    };
+                    (i, chosen, u.seen.elapsed().as_millis() as u64)
                 }
-            };
-            tokio::pin!(at_head, on_pending);
-            let mut head_done = None;
-            let rp = loop {
-                tokio::select! {
-                    r = &mut on_pending => break r,
-                    r = &mut at_head, if head_done.is_none() => head_done = Some(r),
-                }
-            };
-            let chosen = match rp {
-                Ok(plan) if p.is_fresh(&plan) => (Ok(plan), "pending"),
-                _ => (match head_done {
-                    Some(r) => r,
-                    None => at_head.await,
-                }, "snapshot"),
-            };
-            (chosen, u.seen.elapsed().as_millis() as u64)
-        }))
-        .await;
-        for ((ctx, _), ((res, state), ready_ms)) in ctxs.iter().zip(results) {
-            let v = ctx.view;
+            })
+            .collect();
+        let planned = &mut fb.planned;
+        let on_plan = |(i, (res, state), ready_ms): (usize, (Result<planner::Plan>, &'static str), u64), journal: &mut std::fs::File| -> Result<_> {
+            let v = ctxs[i].0.view;
             match res {
                 Ok(plan) => {
-                    fb.planned.insert((mi, v.user), (u.block, ready_ms, plan.net_usd));
+                    planned.insert((mi, v.user), (u.block, ready_ms, plan.net_usd));
                     let kill = std::path::Path::new(&engine.cfg.exec.kill_switch_file).exists();
                     let decision = risk::decide(&engine.cfg.exec, budget, &plan, eth_usd, head.base_fee, head.timestamp, kill);
-                    let send_ok = may_send(secondary, state);
+                    let send_ok = may_send(u.path, state);
                     info!(market = %meta.name, user = %v.user, hf = v.hf, block = u.block, flashblock = u.index, state, ready_ms, net_usd = ?plan.net_usd, error = ?plan.error, decision = ?decision, "FLASHBLOCK PLAN");
                     writeln!(
                         journal,
                         "{}",
                         json!({ "kind": "fb_plan", "block": u.block, "flashblock": u.index, "market": meta.name, "user": v.user, "hf": v.hf, "state": state, "send_ok": send_ok, "ready_ms": ready_ms, "plan": plan, "decision": decision })
                     )?;
-                    if let (true, Some(e), risk::Decision::Send { priority_fee_wei, .. }) = (engine.cfg.flashblocks.send && send_ok, exec.as_mut(), &decision) {
-                        send_plan(e, &engine.cfg.exec, &plan, meta, v, head.base_fee, *priority_fee_wei, u.block, deadline_block, "flashblock", journal).await?;
+                    if let (true, risk::Decision::Send { priority_fee_wei, .. }) = (engine.cfg.flashblocks.send && send_ok, &decision) {
+                        return Ok(Some((i, state, plan, *priority_fee_wei)));
                     }
                 }
                 Err(e) => warn!(error = %e, market = %meta.name, user = %v.user, "flashblock planning failed"),
             }
-        }
+            Ok(None)
+        };
+        let ctx_of = |i: usize, state: &'static str| if state == "pending" { &ctxs[i].1 } else { &ctxs[i].0 };
+        plan_and_send(ready, exec, parts, &provider, "flashblock", journal, on_plan, ctx_of).await?;
     }
     Ok(())
 }
 
-/// Secondary pending plans whose state is behind (stale block or old oracle price) are retried
-/// up to this many times in total, SECONDARY_PENDING_RETRY apart, while the update is younger than
+/// Pending plans whose state is behind (stale block or old oracle price) are retried up to this
+/// many times in total, SECONDARY_PENDING_RETRY apart, while the update is younger than
 /// SECONDARY_PENDING_WINDOW (later the leftovers are usually gone anyway).
 const SECONDARY_PENDING_TRIES: u32 = 4;
 const SECONDARY_PENDING_RETRY: Duration = Duration::from_millis(80);
 const SECONDARY_PENDING_WINDOW: Duration = Duration::from_millis(600);
 
-/// May a same-block plan be sent? On an SVR secondary only when it came from the fresh pending
-/// state: whether the metacall succeeded, and which borrowers it liquidated, is visible only
-/// there (the snapshot plan assumes the new price and stale positions, so it is journaled only).
-fn may_send(secondary: bool, state: &str) -> bool {
-    !secondary || state == "pending"
+/// May a same-block plan be sent? A public transmit (Primary) is in effect once included, so its
+/// snapshot plan (new price pinned) may send too. An SVR secondary or an expired SVR primary only
+/// from the fresh pending state with the price proved there: whether the metacall succeeded (and
+/// which borrowers it liquidated), or whether the cutoff has passed, is visible only there.
+fn may_send(path: flashblocks::Path, state: &str) -> bool {
+    path == flashblocks::Path::Primary || state == "pending"
 }
 
-/// Live send of an approved plan (one tx in flight at a time; skips when the wallet cannot cover
-/// the worst-case gas). `path` = "block" or "flashblock", for the journal.
-#[allow(clippy::too_many_arguments)]
-async fn send_plan<P: Provider>(
-    e: &mut executor::Executor<P>,
-    cfg: &config::ExecConfig,
-    plan: &planner::Plan,
-    meta: &MarketMeta,
-    v: &PositionView,
-    base_fee_wei: u128,
-    priority_fee_wei: u128,
-    block: u64,
-    deadline_block: u64,
-    path: &str,
-    journal: &mut std::fs::File,
-) -> Result<()> {
-    if e.halted() || e.inflight.is_some() {
-        return Ok(());
+/// The risk gate's bid, checked at its own priority. The plan was simulated at the base priority;
+/// pools that read tx.gasprice (priority-fee taxes, dynamic fees) pay out less at a higher bid, so
+/// the plan is simulated again at the bid and the bid is kept only if it still clears min_net_usd
+/// there; else the base priority goes. Returns (priority, simulated profit in loan units); None =
+/// the plan carries no simulated profit, so nothing may be sent (minProfit would be 0).
+async fn checked_priority<P: Provider>(parts: &PlannerParts, provider: &P, c: &PlanCtx<'_, Morpho>, plan: &planner::Plan, bid: u128) -> Option<(u128, f64)> {
+    let base = parts.exec.priority_fee_wei;
+    let (Some(payload), Some(profit), Some(gas)) = (&plan.payload, plan.sim_profit.filter(|p| *p > 0.0), plan.gas_used) else { return None };
+    if bid <= base {
+        return Some((base, profit));
     }
-    let (Some(payload), Some(profit), Some(gas)) = (plan.payload.clone(), plan.sim_profit, plan.gas_used) else { return Ok(()) };
+    let fee = venue::SimFee { max_fee_per_gas: c.base_fee_wei * 2 + bid, max_priority_fee_per_gas: bid };
+    let r = venue::LiquidationVenue::<Morpho>::simulate(&parts.venue, provider, payload.calldata.clone(), c.block_id(), &c.overrides, c.sim_at(), Some(fee), None).await;
+    // The same USD price the plan was scored with.
+    let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, c.meta, c.snap, c.eth_usd).unwrap_or(0.0);
+    let at_bid = r.as_ref().ok().map(|s| {
+        let p = math::units(s.profit, c.meta.loan_decimals);
+        let cost = gas as f64 * (c.base_fee_wei + bid) as f64 / 1e18 * c.eth_usd + plan.l1_fee_usd.unwrap_or(0.0);
+        (p, p * loan_usd - cost)
+    });
+    Some(match at_bid {
+        Some((p, net)) if net >= parts.exec.min_net_usd && p > 0.0 => (bid, p.min(profit)),
+        other => {
+            info!(bid_gwei = bid as f64 / 1e9, net_at_bid = ?other.map(|x| x.1), error = ?r.err().map(|e| e.to_string()), "the bid does not pay at its own priority; base bid");
+            (base, profit)
+        }
+    })
+}
+
+/// Live send of an approved plan (skips at max_inflight, when this position or another one in the
+/// same market is in flight, or when the wallet cannot cover the worst-case gas). `bid` = the risk
+/// gate's priority, checked at its own priority first. `path` = "block" or "flashblock".
+async fn send_approved<P: Provider>(e: &mut executor::Executor<P>, parts: &PlannerParts, provider: &P, c: &PlanCtx<'_, Morpho>, plan: &planner::Plan, bid: u128, path: &str) -> Option<executor::Inflight> {
+    let (meta, v, cfg) = (c.meta, c.view, &parts.exec);
+    if !e.can_send() || e.is_inflight(v.market, v.user) {
+        return None;
+    }
+    // Plans are simulated on a state without the txs in flight: one in the same market sells the
+    // same collateral through the same pools first, so this plan's price would no longer hold.
+    if e.is_market_inflight(v.market) {
+        info!(market = %meta.name, user = %v.user, path, "a liquidation in this market is in flight; not sending another on a stale price");
+        return None;
+    }
+    let (Some(payload), Some(gas)) = (plan.payload.clone(), plan.gas_used) else { return None };
+    let (priority_fee_wei, profit) = checked_priority(parts, provider, c, plan, bid).await?;
+    let (base_fee_wei, block, deadline_block) = (c.base_fee_wei, c.block, c.deadline_block);
     let min_profit = U256::from((profit * cfg.min_profit_keep * 10f64.powi(meta.loan_decimals as i32)) as u128);
     let gas_limit = (gas as f64 * cfg.gas_limit_buffer) as u64;
     let worst_wei = gas_limit as u128 * (base_fee_wei * 2 + priority_fee_wei);
-    match e.balance().await {
+    // The background reading minus what the txs in flight may still burn; a live read only before
+    // the first reading.
+    let spendable = match e.spendable() {
+        Some(b) => Ok(b),
+        None => e.balance().await,
+    };
+    match spendable {
         Ok(b) if b < U256::from(worst_wei) => {
             warn!(balance_wei = %b, worst_wei, "hot wallet cannot cover worst-case gas; not sending");
-            return Ok(());
+            return None;
         }
         Err(err) => {
             warn!(error = %err, "balance check failed; not sending");
-            return Ok(());
+            return None;
         }
         _ => {}
     }
@@ -1053,10 +1322,75 @@ async fn send_plan<P: Provider>(
     match e.send(req).await {
         Ok(inf) => {
             info!(hash = %inf.hash, block, deadline_block, market = %meta.name, user = %v.user, path, "LIVE tx SENT");
-            writeln!(journal, "{}", json!({ "kind": "sent", "block": block, "path": path, "tx": inf }))?;
+            Some(inf)
         }
-        Err(err) => warn!(error = %err, "LIVE send failed"),
+        Err(err) => {
+            warn!(error = %err, "LIVE send failed");
+            None
+        }
     }
+}
+
+/// Plans the candidates in `ready` (each yields its index and plan result) and sends the approved
+/// ones, one send at a time, WITHOUT pausing the planning of the others: the executor is moved into
+/// the send future and back. `on_plan` journals a plan and returns the bid to send it at (None =
+/// not sent); `ctx_of(i, plan_state)` gives the context it was planned on.
+#[allow(clippy::too_many_arguments)]
+async fn plan_and_send<'c, P, S, R, F, C>(
+    mut ready: S,
+    exec: &mut Option<executor::Executor<P>>,
+    parts: &PlannerParts,
+    provider: &P,
+    path: &str,
+    journal: &mut std::fs::File,
+    mut on_plan: F,
+    ctx_of: C,
+) -> Result<()>
+where
+    P: Provider,
+    S: futures::Stream<Item = R> + Unpin,
+    F: FnMut(R, &mut std::fs::File) -> Result<Option<(usize, &'static str, planner::Plan, u128)>>,
+    C: Fn(usize, &'static str) -> &'c PlanCtx<'c, Morpho>,
+{
+    use futures::{FutureExt, StreamExt};
+    let mut queue: std::collections::VecDeque<(usize, &'static str, planner::Plan, u128)> = Default::default();
+    let mut idle = exec.take();
+    let mut sending: Option<futures::future::BoxFuture<'_, (executor::Executor<P>, Option<executor::Inflight>)>> = None;
+    let mut planning = true;
+    loop {
+        if sending.is_none()
+            && let Some((i, state, plan, bid)) = queue.pop_front()
+            && let Some(mut e) = idle.take()
+        {
+            let c = ctx_of(i, state);
+            sending = Some(async move {
+                let inf = send_approved(&mut e, parts, provider, c, &plan, bid, path).await;
+                (e, inf)
+            }
+            .boxed());
+        }
+        if !planning && sending.is_none() && (queue.is_empty() || idle.is_none()) {
+            break;
+        }
+        tokio::select! {
+            next = ready.next(), if planning => match next {
+                Some(r) => {
+                    if let Some(job) = on_plan(r, journal)? {
+                        queue.push_back(job);
+                    }
+                }
+                None => planning = false,
+            },
+            (e, inf) = async { sending.as_mut().expect("guarded").await }, if sending.is_some() => {
+                sending = None;
+                idle = Some(e);
+                if let Some(inf) = inf {
+                    writeln!(journal, "{}", json!({ "kind": "sent", "block": inf.sent_block, "path": path, "tx": inf }))?;
+                }
+            }
+        }
+    }
+    *exec = idle;
     Ok(())
 }
 
@@ -1078,7 +1412,7 @@ async fn watch<P: Provider + Clone + 'static>(
         .with_context(|| format!("opening journal {}", engine.cfg.journal_path))?;
     let (kyber, simulator) = build_planner_parts(engine).await?;
     let v3 = build_v3(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, simulator, v3, exec: engine.cfg.exec.clone() });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone() });
 
     // Watchlist rows are journaled only when a position enters it or its HF moves > 0.2%.
     let mut last_logged_hf: HashMap<(usize, Address), f64> = HashMap::new();
@@ -1097,7 +1431,7 @@ async fn watch<P: Provider + Clone + 'static>(
             let policy = executor::FailurePolicy { max_in_window: c.max_failures_in_window, window: Duration::from_secs(c.failure_window_secs), cooldown: Duration::from_secs(c.failure_cooldown_secs) };
             let nonce_file = engine.cfg.exec.nonce_path(signer.address());
             info!(nonce_file = %nonce_file.display(), "shared hot-wallet nonce file");
-            let mut e = executor::Executor::new(engine.provider.clone(), signer, engine.cfg.chain_id, b, policy).with_shared_nonce(nonce_file);
+            let mut e = executor::Executor::new(engine.provider.clone(), signer, engine.cfg.chain_id, b, policy).with_shared_nonce(nonce_file).with_max_inflight(engine.cfg.exec.max_inflight);
             e.sync_nonce().await?;
             e.spawn_nonce_watch(executor::NONCE_WATCH_EVERY);
             warn!(address = %e.address, "LIVE MODE: approved plans WILL be sent");
@@ -1118,7 +1452,12 @@ async fn watch<P: Provider + Clone + 'static>(
     let mut head_wins: HashMap<usize, u64> = HashMap::new();
     let mut prev_snaps: Option<Vec<Option<morpho::onchain::MarketSnapshot>>> = None;
     let market_ids = engine.market_ids();
-    info!(from_block = last_block + 1, ws = ws.is_some(), liquidator = %parts.simulator.liquidator, "shadow mode: watching blocks, nothing will be sent");
+    let liquidator = venue::LiquidationVenue::<Morpho>::target(&parts.venue);
+    if exec.is_some() {
+        warn!(from_block = last_block + 1, ws = ws.is_some(), %liquidator, max_inflight = engine.cfg.exec.max_inflight, "LIVE mode: watching blocks, approved liquidations WILL be sent");
+    } else {
+        info!(from_block = last_block + 1, ws = ws.is_some(), %liquidator, "shadow mode: watching blocks, nothing will be sent");
+    }
 
     // Rows finished by background tasks (auction valuations), written by this loop.
     let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1189,7 +1528,7 @@ async fn watch<P: Provider + Clone + 'static>(
         }
         let block_time = match bt_anchor {
             Some((n0, t0)) if number >= n0 + 10 && h.timestamp > t0 => (h.timestamp - t0) as f64 / (number - n0) as f64,
-            _ => 2.0,
+            _ => DEFAULT_BLOCK_TIME,
         };
         let deadline_block = number + executor::deadline_blocks(engine.cfg.exec.deadline_secs, block_time);
         let t0 = Instant::now();
@@ -1207,7 +1546,7 @@ async fn watch<P: Provider + Clone + 'static>(
 
         // 1. Events since the last block and fresh market snapshots, fetched in parallel.
         //    Interest is accrued to ~the next block so interest-only crossings show up early.
-        let accrue_to = h.timestamp + engine.cfg.accrual_lookahead_secs;
+        let accrue_to = h.timestamp + engine.cfg.lookahead_secs(block_time);
         let from_block_logs = last_block + 1;
         // The fetch is most of a block's processing time (~270 ms without alchemy): oracle updates
         // seen meanwhile are handled right away instead of queueing behind the block path (seen:
@@ -1262,22 +1601,23 @@ async fn watch<P: Provider + Clone + 'static>(
         last_block = number;
         let eth_usd = engine.eth_usd(&snaps);
 
-        // Live: settle the in-flight tx first (one at a time).
+        // Live: settle the txs in flight first.
         if let Some(e) = exec.as_mut() {
             match e.poll(number).await {
-                Ok(Some((inf, outcome))) => {
-                    // Only reverts eat into the daily gas budget (a success paid for itself).
-                    if let executor::Outcome::Included { success: false, gas_used, effective_gas_price, l1_fee_wei, .. } = &outcome {
-                        let cost = (*gas_used as f64 * *effective_gas_price as f64 + *l1_fee_wei as f64) / 1e18 * eth_usd;
-                        budget.charge(h.timestamp, cost);
+                Ok(outcomes) => {
+                    for (inf, outcome) in outcomes {
+                        // Only reverts eat into the daily gas budget (a success paid for itself).
+                        if let executor::Outcome::Included { success: false, gas_used, effective_gas_price, l1_fee_wei, .. } = &outcome {
+                            let cost = (*gas_used as f64 * *effective_gas_price as f64 + *l1_fee_wei as f64) / 1e18 * eth_usd;
+                            budget.charge(h.timestamp, cost);
+                        }
+                        info!(hash = %inf.hash, ?outcome, failures = e.consecutive_failures, "LIVE tx outcome");
+                        writeln!(journal, "{}", json!({ "kind": "outcome", "block": number, "tx": inf, "outcome": outcome }))?;
                     }
-                    info!(hash = %inf.hash, ?outcome, failures = e.consecutive_failures, "LIVE tx outcome");
-                    writeln!(journal, "{}", json!({ "kind": "outcome", "block": number, "tx": inf, "outcome": outcome }))?;
                     if e.halted() {
                         warn!(failures = e.consecutive_failures, cooldown_s = engine.cfg.exec.failure_cooldown_secs, "LIVE sending paused after a burst of failed txs; resumes by itself");
                     }
                 }
-                Ok(None) => {}
                 Err(err) => warn!(error = %err, "receipt poll failed"),
             }
         }
@@ -1340,16 +1680,34 @@ async fn watch<P: Provider + Clone + 'static>(
             writeln!(journal, "{}", serde_json::to_string(&row)?)?;
         }
 
-        // 6. Plan + simulate the most valuable candidates (shadow: result is only journaled).
+        // 6. Plan + simulate the most valuable candidates (shadow: result is only journaled), all
+        //    at once; each is handled (journaled, sent) as soon as its plan is ready, so the best
+        //    one never waits for a slow aggregator quote of another.
         to_plan.sort_by(|a, b| b.bonus.total_cmp(&a.bonus));
         let planner = parts.planner(&engine.cfg.router.mode);
         let planned = to_plan.len().min(engine.cfg.exec.max_plans_per_block);
-        for v in to_plan.into_iter().take(planned) {
-            let meta = &engine.metas[v.market];
-            let snap = snaps[v.market].as_ref().expect("evaluated markets have snapshots");
-            let ctx = PlanCtx { meta, snap, view: v, block: number, base_fee_wei: h.base_fee, eth_usd, overrides: StateOverride::default(), deadline_block, sim_time: accrue_to, pending: false, price_probe: None };
-            last_planned.insert((v.market, v.user), number);
-            match planner.plan(&engine.provider, &ctx).await {
+        let ctxs: Vec<PlanCtx<Morpho>> = to_plan
+            .into_iter()
+            .take(planned)
+            .map(|v| {
+                let meta = &engine.metas[v.market];
+                let snap = snaps[v.market].as_ref().expect("evaluated markets have snapshots");
+                last_planned.insert((v.market, v.user), number);
+                PlanCtx { meta, snap, view: v, block: number, base_fee_wei: h.base_fee, eth_usd, overrides: StateOverride::default(), deadline_block, sim_time: accrue_to, pending: false, price_probe: None }
+            })
+            .collect();
+        let ready: futures::stream::FuturesUnordered<_> = ctxs
+            .iter()
+            .enumerate()
+            .map(|(i, ctx)| {
+                let (planner, provider) = (&planner, &engine.provider);
+                async move { (i, planner.plan(provider, ctx).await) }
+            })
+            .collect();
+        let on_plan = |(i, res): (usize, Result<planner::Plan>), journal: &mut std::fs::File| -> Result<_> {
+            let ctx = &ctxs[i];
+            let (meta, v) = (ctx.meta, ctx.view);
+            match res {
                 Ok(plan) => {
                     tracker.on_plan((v.market, v.user), number, plan.net_usd, plan.error.clone());
                     let kill = std::path::Path::new(&engine.cfg.exec.kill_switch_file).exists();
@@ -1361,14 +1719,18 @@ async fn watch<P: Provider + Clone + 'static>(
                     );
                     let row = json!({ "kind": "plan", "block": number, "timestamp": h.timestamp, "market": meta.name, "user": v.user, "hf": v.hf, "plan": plan, "decision": decision });
                     writeln!(journal, "{row}")?;
-                    // Live: send what the risk gate approved, if nothing else is in flight.
-                    if let (Some(e), risk::Decision::Send { priority_fee_wei, .. }) = (exec.as_mut(), &decision) {
-                        send_plan(e, &engine.cfg.exec, &plan, meta, v, h.base_fee, *priority_fee_wei, number, deadline_block, "block", &mut journal).await?;
+                    // Live: send what the risk gate approved (up to exec.max_inflight at once).
+                    if let risk::Decision::Send { priority_fee_wei, .. } = &decision {
+                        return Ok(Some((i, "block", plan, *priority_fee_wei)));
                     }
                 }
                 Err(e) => warn!(error = %e, "planning failed"),
             }
-        }
+            Ok(None)
+        };
+        plan_and_send(ready, &mut exec, &parts, &engine.provider, "block", &mut journal, on_plan, |i, _| &ctxs[i]).await?;
+        // The plans borrow this block's snapshots and the engine: release them before both move on.
+        drop(ctxs);
         last_ctx = Some((h, eth_usd, block_time));
         if let Some(f) = fb.as_mut() {
             // The model runs ahead of sealed blocks; once they have caught up it must equal the
@@ -1516,10 +1878,14 @@ mod tests {
     #[test]
     fn secondary_sends_only_from_fresh_pending_state() {
         // SVR secondary: only the pending state knows whether the metacall worked and whom it took.
-        assert!(may_send(true, "pending"));
-        assert!(!may_send(true, "snapshot"));
-        // Primary (non-SVR feed) and expired SVR updates: the price is in effect either way.
-        assert!(may_send(false, "pending"));
-        assert!(may_send(false, "snapshot"));
+        use crate::flashblocks::Path;
+        assert!(may_send(Path::Secondary, "pending"));
+        assert!(!may_send(Path::Secondary, "snapshot"));
+        // An expired SVR primary takes effect only past the cutoff: proven in the pending state only.
+        assert!(may_send(Path::Expired, "pending"));
+        assert!(!may_send(Path::Expired, "snapshot"));
+        // A public transmit is in effect once included.
+        assert!(may_send(Path::Primary, "pending"));
+        assert!(may_send(Path::Primary, "snapshot"));
     }
 }

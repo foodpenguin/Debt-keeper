@@ -23,7 +23,7 @@ use crate::{
     num,
     protocol::LendingProtocol,
     v3router::{self, V3Router},
-    venue::{LiquidationVenue, SimAt, SimResult, SimReverted},
+    venue::{LiquidationVenue, SimAt, SimFee, SimResult, SimReverted},
 };
 
 /// Fractions of the max seizable collateral the aggregator path tries.
@@ -63,9 +63,11 @@ pub struct BundleQuote {
     pub router: String,
     /// Share of the bundle's total seizable collateral the best exit sells.
     pub fraction_bps: u64,
-    /// Exit output minus repaid debt (loan-token units ~= USD), before gas.
+    /// Exit output minus repaid debt, in USD (`LendingProtocol::loan_usd`), before gas.
     pub gross_usd: f64,
     pub gas_usd: f64,
+    /// Gas of the whole solver op as estimated (liquidations + swap + overhead).
+    pub gas_units: u64,
     pub net_usd: Option<f64>,
     /// Gas the swap may use inside the solver op, and what the winning exit is estimated at.
     pub swap_gas_budget: u64,
@@ -100,8 +102,13 @@ pub struct Plan {
     pub quoted_gross: f64,
     /// Profit the simulated contract call returned (loan-token units).
     pub sim_profit: Option<f64>,
+    /// The same in USD (`LendingProtocol::loan_usd`).
+    pub profit_usd: Option<f64>,
     pub gas_used: Option<u64>,
+    /// L2 gas at the planning priority plus the L1 data fee, in USD.
     pub gas_cost_usd: Option<f64>,
+    /// The L1 data fee part of gas_cost_usd (paid whatever the priority fee).
+    pub l1_fee_usd: Option<f64>,
     pub net_usd: Option<f64>,
     pub error: Option<String>,
     pub quote_ms: u64,
@@ -179,11 +186,11 @@ impl PriceProbe {
 }
 
 impl<L: LendingProtocol> PlanCtx<'_, L> {
-    fn block_id(&self) -> BlockId {
+    pub fn block_id(&self) -> BlockId {
         if self.pending { BlockId::pending() } else { BlockId::number(self.block) }
     }
 
-    fn sim_at(&self) -> Option<SimAt> {
+    pub fn sim_at(&self) -> Option<SimAt> {
         (!self.pending).then_some(SimAt { number: self.block + 1, time: self.sim_time })
     }
 
@@ -211,11 +218,16 @@ fn pending_staleness(sim_block: Option<u64>, sim_ok: bool, floor: u64) -> Option
 
 impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
     pub async fn plan<P: Provider>(&self, p: &P, c: &PlanCtx<'_, L>) -> Result<Plan> {
-        let direct_ok = self.v3.is_some_and(|v| v.routes.get(&c.view.market).is_some_and(|r| !r.is_empty()));
+        let pools = self.v3.is_some_and(|v| v.routes.get(&c.view.market).is_some_and(|r| !r.is_empty()));
+        // The direct router's route is packed: only a venue with a packed entry can take it.
+        let direct_ok = pools && self.venue.packed_routes();
         match self.mode {
             "aggregator" | "kyber" => self.plan_aggregator(p, c).await,
             "direct" if direct_ok => self.plan_direct(p, c).await,
-            "direct" => Ok(Plan { router: "direct".into(), error: Some("no direct pools for this market".into()), ..Default::default() }),
+            "direct" => {
+                let why = if pools { "this venue has no packed-route entry" } else { "no direct pools for this market" };
+                Ok(Plan { router: "direct".into(), error: Some(why.into()), ..Default::default() })
+            }
             _ => {
                 if !direct_ok {
                     return self.plan_aggregator(p, c).await;
@@ -227,6 +239,18 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
                 Ok(win)
             }
         }
+    }
+
+    /// The fee fields every plan's simulation carries: what a non-bidding send would pay (max fee
+    /// = 2 x base fee + the base priority fee). A bid is checked again at its own priority before
+    /// it is sent (see the send path).
+    pub fn sim_fee(&self, c: &PlanCtx<'_, L>) -> SimFee {
+        SimFee { max_fee_per_gas: c.base_fee_wei * 2 + self.cfg.priority_fee_wei, max_priority_fee_per_gas: self.cfg.priority_fee_wei }
+    }
+
+    /// USD per loan token for this plan, or the error that refuses the market.
+    fn loan_usd(&self, meta: &L::Market, snap: &L::Snapshot, eth_usd: f64) -> Result<f64, String> {
+        self.protocol.loan_usd(meta, snap, eth_usd).filter(|u| *u > 0.0).ok_or_else(|| "loan token has no USD price model (market refused)".to_string())
     }
 
     /// Fills sim-derived fields and applies the sanity checks shared by both routers.
@@ -254,14 +278,22 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         }
         match res {
             Ok(r) => {
+                let loan_usd = match self.loan_usd(c.meta, c.snap, c.eth_usd) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        plan.error = Some(e);
+                        return;
+                    }
+                };
                 let profit = num::units(r.profit, self.protocol.loan_decimals(c.meta));
                 let gas_wei = U256::from(r.gas_used) * U256::from(c.base_fee_wei + self.cfg.priority_fee_wei) + r.l1_fee_wei;
                 let gas_usd = num::units(gas_wei, 18) * c.eth_usd;
                 plan.sim_profit = Some(profit);
+                plan.profit_usd = Some(profit * loan_usd);
                 plan.gas_used = Some(r.gas_used);
                 plan.gas_cost_usd = Some(gas_usd);
-                // Loan tokens in the whitelist are USD stablecoins, so loan units ~= USD.
-                plan.net_usd = Some(profit - gas_usd);
+                plan.l1_fee_usd = Some(num::units(r.l1_fee_wei, 18) * c.eth_usd);
+                plan.net_usd = Some(profit * loan_usd - gas_usd);
                 let gap = (profit - plan.quoted_gross).abs() / plan.quoted_gross.max(1e-9);
                 if gap > self.cfg.max_sim_quote_gap {
                     // Quote and execution disagree: fee-on-transfer, manipulated pool or stale quote.
@@ -308,10 +340,14 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         // decimals) at the oracle price, with 25% headroom for price differences.
         let seize_value = num::units(self.protocol.collateral_value(meta, snap, max_seize), loan_dec);
         let max_conn = U256::from((seize_value / eth_usd.max(1.0) * 1.25 * 1e18) as u128);
-        let grid = v3.grid(p, market, max_seize, max_conn, block, overrides).await.map_err(|e| format!("grid quote failed: {e}"))?;
+        let loan_usd = self.loan_usd(meta, snap, eth_usd)?;
+        // Quotes priced like the send: pools that read tx.gasprice answer what the tx would get.
+        let fee = SimFee { max_fee_per_gas: base_fee_wei * 2 + self.cfg.priority_fee_wei, max_priority_fee_per_gas: self.cfg.priority_fee_wei };
+        let grid = v3.grid(p, market, max_seize, max_conn, block, overrides, Some(fee)).await.map_err(|e| format!("grid quote failed: {e}"))?;
         let gas_price = self.route_gas_price(base_fee_wei);
         let n_direct = v3.routes[&market].direct.len();
-        match v3router::allocate_within(&grid, n_direct, repay, GAS_PER_EXTRA_PATH, gas_price / 1e18 * eth_usd, |x| num::units(x, loan_dec), gas_budget) {
+        // The extra-path gas cost is weighed against output in loan-token units.
+        match v3router::allocate_within(&grid, n_direct, repay, GAS_PER_EXTRA_PATH, gas_price / 1e18 * eth_usd / loan_usd, |x| num::units(x, loan_dec), gas_budget) {
             Ok(a) => Ok(a.map(|a| (grid, a))),
             Err(g) => Err(format!("direct route {g} gas > budget {}", gas_budget.unwrap_or(0))),
         }
@@ -344,13 +380,20 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let (collateral, loan) = self.protocol.exit_tokens(meta);
         let loan_dec = self.protocol.loan_decimals(meta);
         let mut q = BundleQuote { positions: views.len(), swap_gas_budget, ..Default::default() };
+        let loan_usd = match self.loan_usd(meta, snap, eth_usd) {
+            Ok(u) => u,
+            Err(e) => {
+                q.error = Some(e);
+                return q;
+            }
+        };
         let (total_seize, total_repaid) = bundle_totals(self.protocol, meta, snap, views);
         if total_seize.is_zero() {
             q.error = Some("nothing to seize".into());
             return q;
         }
         let repay = |s: U256| bundle_repay(s, total_seize, total_repaid);
-        let gross = |out: U256, s: U256| num::units(out, loan_dec) - num::units(repay(s), loan_dec);
+        let gross = |out: U256, s: U256| (num::units(out, loan_dec) - num::units(repay(s), loan_dec)) * loan_usd;
         let direct = async {
             let market = views[0].market;
             if !self.v3.is_some_and(|v| v.routes.get(&market).is_some_and(|r| !r.is_empty())) {
@@ -386,13 +429,14 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let (direct, kyber) = tokio::join!(direct, kyber);
         q.quote_ms = t0.elapsed().as_millis() as u64;
         let gas_price = self.route_gas_price(base_fee_wei);
-        let net = |e: &BundleExit| e.2 - (e.3 + BUNDLE_GAS_PER_POSITION * views.len() as u64 + BUNDLE_OVERHEAD_GAS) as f64 * gas_price / 1e18 * eth_usd;
+        let gas_units = |e: &BundleExit| e.3 + BUNDLE_GAS_PER_POSITION * views.len() as u64 + BUNDLE_OVERHEAD_GAS;
+        let net = |e: &BundleExit| e.2 - gas_units(e) as f64 * gas_price / 1e18 * eth_usd;
         q.direct_net_usd = direct.as_ref().ok().map(net);
         q.kyber_net_usd = kyber.as_ref().ok().map(net);
         let best = [&direct, &kyber].into_iter().filter_map(|r| r.as_ref().ok()).max_by(|a, b| net(a).total_cmp(&net(b)));
         match best {
             Some(e) => {
-                (q.router, q.fraction_bps, q.gross_usd, q.swap_gas) = (e.0.to_string(), e.1, e.2, e.3);
+                (q.router, q.fraction_bps, q.gross_usd, q.swap_gas, q.gas_units) = (e.0.to_string(), e.1, e.2, e.3, gas_units(e));
                 q.net_usd = Some(net(e));
                 q.gas_usd = q.gross_usd - net(e);
             }
@@ -433,10 +477,10 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let route: Bytes = v3.encode(c.view.market, &grid, &alloc);
         let t1 = Instant::now();
         // Simulate exactly what would be sent: the venue's encoding of the packed route.
-        let payload = self.venue.encode(c.meta, c.view.user, alloc.seize, &ExitRoute::Packed(route), U256::ZERO, c.deadline_block);
+        let payload = self.venue.encode(c.meta, c.view.user, alloc.seize, repaid, &ExitRoute::Packed(route), U256::ZERO, c.deadline_block);
         let calldata = payload.calldata.clone();
         plan.payload = Some(payload);
-        let res = self.venue.simulate(p, calldata, c.block_id(), &c.overrides, c.sim_at(), c.price_probe.map(|q| q.oracle)).await;
+        let res = self.venue.simulate(p, calldata, c.block_id(), &c.overrides, c.sim_at(), Some(self.sim_fee(c)), c.price_probe.map(|q| q.oracle)).await;
         plan.sim_ms = t1.elapsed().as_millis() as u64;
         self.score_sim(&mut plan, res, c);
         Ok(plan)
@@ -497,8 +541,8 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
 
         // 2. Build the swap for the chosen size and simulate the whole liquidation.
         let t1 = Instant::now();
-        let venue = self.venue.target();
-        let built = match self.aggregator.build(&quote, venue, venue, self.cfg.slippage_bps).await {
+        let holder = self.venue.swap_recipient();
+        let built = match self.aggregator.build(&quote, holder, holder, self.cfg.slippage_bps).await {
             Ok(b) => b,
             Err(e) => {
                 plan.error = Some(e.to_string());
@@ -511,14 +555,14 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             return Ok(plan);
         }
         let route = ExitRoute::Call { target: built.target, calldata: built.calldata };
-        let payload = self.venue.encode(c.meta, c.view.user, seize, &route, U256::ZERO, c.deadline_block);
+        let payload = self.venue.encode(c.meta, c.view.user, seize, repaid, &route, U256::ZERO, c.deadline_block);
         let calldata = payload.calldata.clone();
         plan.payload = Some(payload);
         if std::env::var_os("BOT_GAS_PROBE").is_some() {
             let probe = self.venue.probe_gas(p, calldata.clone(), c.block_id(), &c.overrides, &[500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000, 12_000_000]).await;
             tracing::info!(?probe, fraction_bps, "gas probe (limit, ok)");
         }
-        let res = self.venue.simulate(p, calldata, c.block_id(), &c.overrides, c.sim_at(), c.price_probe.map(|q| q.oracle)).await;
+        let res = self.venue.simulate(p, calldata, c.block_id(), &c.overrides, c.sim_at(), Some(self.sim_fee(c)), c.price_probe.map(|q| q.oracle)).await;
         plan.sim_ms = t1.elapsed().as_millis() as u64;
         self.score_sim(&mut plan, res, c);
         Ok(plan)
@@ -658,8 +702,8 @@ mod generic_tests {
         assert_eq!((plan.router.as_str(), plan.error.as_deref()), ("direct", Some("no direct pools for this market")));
 
         // The venue decides the encoding: a packed route and an external call differ.
-        let packed = venue.encode(&m, user(1), U256::from(90u64), &ExitRoute::Packed(Bytes::new()), U256::ZERO, 3);
-        let call = venue.encode(&m, user(1), U256::from(90u64), &ExitRoute::Call { target: Address::ZERO, calldata: Bytes::new() }, U256::ZERO, 3);
+        let packed = venue.encode(&m, user(1), U256::from(90u64), U256::from(90u64), &ExitRoute::Packed(Bytes::new()), U256::ZERO, 3);
+        let call = venue.encode(&m, user(1), U256::from(90u64), U256::from(90u64), &ExitRoute::Call { target: Address::ZERO, calldata: Bytes::new() }, U256::ZERO, 3);
         assert_eq!((packed.to, packed.calldata[0], call.calldata[0]), (venue.target(), 1, 2));
     }
 
@@ -684,5 +728,27 @@ mod generic_tests {
         let payload = plan.payload.as_ref().expect("encoded");
         assert_eq!((payload.to, payload.calldata[0]), (venue.target(), 2));
         assert!(plan.error.as_deref().is_some_and(|e| e.contains("mock venue: no simulation")), "{:?}", plan.error);
+    }
+
+    #[tokio::test]
+    async fn a_flash_funded_venue_borrows_the_planned_repayment_and_takes_only_aggregator_exits() {
+        use crate::{
+            flash_venue::{FlashLiquidatorVenue, IFlashLiquidator},
+            funding::UniswapV4,
+        };
+        use alloy::sol_types::SolCall;
+        let provider = ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap());
+        let (toy, mut cfg) = (Toy::default(), cfg());
+        cfg.exec.allowed_targets.push(Address::repeat_byte(0x22));
+        let venue = FlashLiquidatorVenue::new(Toy::default(), Some(Address::repeat_byte(0xf1)), Address::repeat_byte(0xee), Box::new(UniswapV4 { pool_manager: Address::repeat_byte(4) }), 0, None, vec![], vec![]);
+        let m = Mk { key: key(1), name: "alpha".into() };
+        let v = view(&toy, 0, user(1), &m, &1.0, &(100, 90));
+        let ctx = PlanCtx { meta: &m, snap: &1.0, view: &v, block: 1, base_fee_wei: 0, eth_usd: 2000.0, overrides: StateOverride::default(), deadline_block: 3, sim_time: 0, pending: false, price_probe: None };
+        let planner = Planner { protocol: &toy, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "aggregator" };
+        let plan = planner.plan(&provider, &ctx).await.unwrap();
+        let call = IFlashLiquidator::liquidateCall::abi_decode(&plan.payload.as_ref().expect("encoded").calldata).unwrap();
+        // Toy repays 1 per collateral unit: seize 90 -> borrow 90 + 1 wei (no headroom here).
+        assert_eq!((call.funding, call.debtAmount, call.swaps[0].target), (2, U256::from(91u64), Address::repeat_byte(0x22)));
+        assert!(plan.error.as_deref().is_some_and(|e| e.contains("simulation unavailable")), "simulated against the venue: {:?}", plan.error);
     }
 }

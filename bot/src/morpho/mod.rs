@@ -11,8 +11,9 @@ pub mod onchain;
 
 use alloy::{
     eips::BlockId,
-    primitives::{Address, B256, U256},
+    primitives::{Address, B256, U256, address},
     providers::Provider,
+    sol_types::SolCall,
 };
 use anyhow::Result;
 use futures::future::BoxFuture;
@@ -24,7 +25,7 @@ use self::{
 };
 use crate::{
     config::Config,
-    protocol::{BorrowerInfo, Evaluation, LendingProtocol, MarketInfo, Touched},
+    protocol::{BorrowerInfo, DirectLiquidation, Evaluation, LendingProtocol, LiquidationTx, MarketInfo, Touched},
 };
 
 /// Morpho Blue on one chain: the singleton address, its indexer API and the configured markets.
@@ -55,7 +56,12 @@ impl Morpho {
 impl Morpho {
     /// An instance for unit tests (its address/API are never contacted by the pure methods).
     pub fn for_tests() -> Self {
-        Self { address: Address::ZERO, api_url: String::new(), chain_id: 8453, markets: vec![], log_chunk: 100 }
+        Self::for_tests_at(Address::ZERO)
+    }
+
+    /// The same, at a real Morpho address (for venues that build calls to it).
+    pub fn for_tests_at(address: Address) -> Self {
+        Self { address, api_url: String::new(), chain_id: 8453, markets: vec![], log_chunk: 100 }
     }
 }
 
@@ -159,13 +165,50 @@ impl LendingProtocol for Morpho {
         math::mul_div_down(amount, snap.price, ORACLE_PRICE_SCALE)
     }
 
+    /// USD stablecoins at 1, WETH at the ETH price; anything else has no model (refused at start).
+    fn loan_usd(&self, m: &MarketMeta, _snap: &MarketSnapshot, eth_usd: f64) -> Option<f64> {
+        loan_usd_model(self.chain_id, m.params.loanToken, eth_usd)
+    }
+
     /// ETH price in USD from a tracked WETH/USD* market.
     fn eth_usd(&self, markets: &[MarketMeta], snaps: &[Option<MarketSnapshot>]) -> Option<f64> {
         markets
             .iter()
             .zip(snaps)
-            .find(|(m, _)| m.collateral_symbol == "WETH" && m.loan_symbol.starts_with("USD"))
+            .find(|(m, _)| m.params.collateralToken == WETH && loan_usd_model(self.chain_id, m.params.loanToken, 0.0) == Some(1.0))
             .and_then(|(m, s)| s.as_ref().map(|s| math::u256_f64(s.price) / 1e36 * 10f64.powi(m.collateral_decimals as i32 - m.loan_decimals as i32)))
+    }
+}
+
+/// Morpho's `liquidate` with empty callback data pulls the repayment from the caller after sending
+/// the collateral, so a caller that already holds the repayment (a flash-funded liquidator) can use
+/// it like any callback-free protocol.
+impl DirectLiquidation for Morpho {
+    fn liquidation_call(&self, m: &MarketMeta, user: Address, seize: U256, _repay: U256) -> LiquidationTx {
+        let calldata = onchain::IMorpho::liquidateCall { marketParams: m.params.clone(), borrower: user, seizedAssets: seize, repaidShares: U256::ZERO, data: Default::default() }.abi_encode().into();
+        LiquidationTx { target: self.address, calldata, debt_token: m.params.loanToken, collateral_token: m.params.collateralToken }
+    }
+}
+
+/// USD stablecoins on Base the bot prices at 1, by ADDRESS (a token's symbol is whatever its deployer
+/// chose; a fake "USDC" must not be priced at a dollar). Checked on-chain 2026-10-28.
+const BASE_USD_STABLES: [Address; 5] = [
+    address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), // USDC
+    address!("d9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"), // USDbC
+    address!("fde4C96c8593536E31F229EA8f37b2ADa2699bb2"), // USDT
+    address!("50c5725949A6F0c72E6C4a641F24049A917DB0Cb"), // DAI
+    address!("820C137fa70C8691f0e44Dc420a5e53c168921Dc"), // USDS
+];
+/// WETH on Base (and every OP-stack chain).
+const WETH: Address = address!("4200000000000000000000000000000000000006");
+
+/// USD per loan token by address: Base USD stablecoins at 1, WETH at `eth_usd`, else None (other
+/// chains have no model yet: their markets are refused rather than mispriced).
+pub fn loan_usd_model(chain_id: u64, token: Address, eth_usd: f64) -> Option<f64> {
+    match chain_id {
+        8453 if BASE_USD_STABLES.contains(&token) => Some(1.0),
+        8453 if token == WETH => Some(eth_usd),
+        _ => None,
     }
 }
 
@@ -177,4 +220,19 @@ pub type PositionView = crate::engine::PositionView<Morpho>;
 /// Evaluates one Morpho position (borrow shares, collateral) outside the engine's tracked set.
 pub fn evaluate_position(morpho: &Morpho, meta: &MarketMeta, snap: &MarketSnapshot, market: usize, user: Address, borrow_shares: U256, collateral: U256) -> PositionView {
     crate::engine::view(morpho, market, user, meta, snap, &(borrow_shares, collateral))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loan_tokens_are_priced_by_address_not_symbol() {
+        let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        assert_eq!(loan_usd_model(8453, usdc, 2400.0), Some(1.0));
+        assert_eq!(loan_usd_model(8453, WETH, 2400.0), Some(2400.0));
+        // A token calling itself "USDC" at another address, or the same address on another chain.
+        assert_eq!(loan_usd_model(8453, Address::repeat_byte(0x11), 2400.0), None);
+        assert_eq!(loan_usd_model(1, usdc, 2400.0), None);
+    }
 }

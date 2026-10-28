@@ -3,8 +3,10 @@
 //! Safety rails (all enforced here or by the caller before `send`):
 //! - the key only ever comes from an encrypted keystore; the password from an env var (removed
 //!   from the process environment right after reading) or an interactive no-echo prompt;
-//! - one transaction in flight at a time (simple, gap-free nonces);
-//! - nonce kept locally, resynced from the chain after drops or nonce errors;
+//! - up to `max_inflight` txs in flight (consecutive nonces), never two for the same position;
+//!   one given up on while still pending is replaced by a 0-value self-transfer (cancel);
+//! - nonce kept locally, resynced from the chain after drops or nonce errors; with a shared nonce
+//!   file (several bots on one wallet) nothing is sent unless its lock is held;
 //! - the raw tx goes to every endpoint at once (RPC pool + sequencer); endpoint URLs carry API
 //!   keys, so only endpoint names are logged;
 //! - failed (reverted) or dropped txs are counted in a window (`FailurePolicy`): a burst pauses
@@ -49,7 +51,6 @@ pub struct Payload {
     pub min_profit: MinProfitSlot,
 }
 
-/// Writes `value` big-endian into the minProfit field.
 /// A broadcast error that means our nonce was taken: already mined ("nonce too low: next nonce 40,
 /// tx nonce 39"; infura: "nonce=39 minNonce=40 ..."), or held by another pending tx that pays more
 /// ("replacement transaction underpriced").
@@ -108,6 +109,7 @@ fn unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// Writes `value` big-endian into the minProfit field.
 pub fn patch_min_profit(calldata: &Bytes, slot: MinProfitSlot, value: U256) -> Result<Bytes> {
     let mut d = calldata.to_vec();
     if d.len() < slot.offset + slot.width {
@@ -358,28 +360,42 @@ pub struct Executor<P> {
     chain_nonce: Arc<AtomicU64>,
     /// Nonce coordination with the other process (None: this process signs alone).
     shared: Option<SharedNonce>,
-    pub inflight: Option<Inflight>,
+    /// Sent, not yet settled, in nonce order. Several may be in flight at once (consecutive
+    /// nonces): a crash makes many positions liquidatable in the same few blocks.
+    pub inflight: Vec<Inflight>,
+    /// At most this many in flight (1 = one at a time).
+    max_inflight: usize,
+    /// The hot wallet's balance as last read by spawn_nonce_watch (None = not read yet).
+    balance: Arc<std::sync::Mutex<Option<U256>>>,
     pub consecutive_failures: u32,
     failures: FailureWindow,
 }
+
+/// A tx with no receipt this many blocks past its deadline is taken as dropped (it can only revert
+/// with Expired if it still lands, and the nonce is resynced from the chain).
+pub const DROP_GRACE_BLOCKS: u64 = 2;
 
 /// How often spawn_nonce_watch reads the pending nonce.
 pub const NONCE_WATCH_EVERY: Duration = Duration::from_secs(10);
 
 impl<P: Provider + Clone + Send + Sync + 'static> Executor<P> {
-    /// Reads the hot wallet's pending nonce every `every` in the background, so that `send` never
-    /// starts from a nonce another process (a manual transfer, another sender) already used, and pays
-    /// no RPC call for it on the race path.
+    /// Reads the hot wallet's pending nonce and balance every `every` in the background, so that
+    /// `send` never starts from a nonce another process (a manual transfer, another sender) already
+    /// used, and the race path pays no RPC call for either.
     pub fn spawn_nonce_watch(&self, every: Duration) {
-        let (p, address, slot) = (self.provider.clone(), self.address, self.chain_nonce.clone());
+        let (p, address, slot, bal) = (self.provider.clone(), self.address, self.chain_nonce.clone(), self.balance.clone());
         tokio::spawn(async move {
             let mut t = tokio::time::interval(every);
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 t.tick().await;
-                if let Ok(n) = p.get_transaction_count(address).pending().await {
+                let (n, b) = tokio::join!(p.get_transaction_count(address).pending(), p.get_balance(address));
+                if let Ok(n) = n {
                     // The latest reading, not a running max: a dropped tx lowers the pending nonce again.
                     slot.store(n, Ordering::Relaxed);
+                }
+                if let Ok(b) = b {
+                    *bal.lock().unwrap() = Some(b);
                 }
             }
         });
@@ -398,7 +414,9 @@ impl<P: Provider> Executor<P> {
             nonce: None,
             chain_nonce: Arc::default(),
             shared: None,
-            inflight: None,
+            inflight: Vec::new(),
+            max_inflight: 1,
+            balance: Arc::default(),
             consecutive_failures: 0,
             failures: FailureWindow::new(policy),
         }
@@ -407,6 +425,35 @@ impl<P: Provider> Executor<P> {
     /// Paused by a burst of failures (see FailurePolicy); resumes by itself after the cooldown.
     pub fn halted(&self) -> bool {
         self.failures.cooling(Instant::now())
+    }
+
+    /// Up to `n` txs in flight at once (consecutive nonces).
+    pub fn with_max_inflight(mut self, n: usize) -> Self {
+        self.max_inflight = n.max(1);
+        self
+    }
+
+    /// Not halted and below max_inflight.
+    pub fn can_send(&self) -> bool {
+        !self.halted() && self.inflight.len() < self.max_inflight
+    }
+
+    /// A tx for this position is already in flight.
+    pub fn is_inflight(&self, market: usize, user: Address) -> bool {
+        self.inflight.iter().any(|i| i.market == market && i.user == user)
+    }
+
+    /// A tx in this market is in flight.
+    pub fn is_market_inflight(&self, market: usize) -> bool {
+        self.inflight.iter().any(|i| i.market == market)
+    }
+
+    /// The last background balance reading minus what the txs in flight may still burn at most
+    /// (None = no reading yet: call `balance`).
+    pub fn spendable(&self) -> Option<U256> {
+        let b = (*self.balance.lock().unwrap())?;
+        let reserved: u128 = self.inflight.iter().map(|i| i.gas_limit as u128 * i.max_fee_wei).sum();
+        Some(b.saturating_sub(U256::from(reserved)))
     }
 
     /// Records a failed / dropped tx (may start a cooldown).
@@ -442,22 +489,25 @@ impl<P: Provider> Executor<P> {
         Ok(self.provider.get_balance(self.address).await?)
     }
 
-    /// Signs and broadcasts one liquidation. Refuses while another tx is in flight or when halted.
+    /// Signs and broadcasts one liquidation. Refuses when halted, at max_inflight, or when a tx for
+    /// the same position is already in flight.
     pub async fn send(&mut self, r: SendRequest) -> Result<Inflight> {
         if self.halted() {
             bail!("executor halted after {} consecutive failures", self.consecutive_failures);
         }
-        if self.inflight.is_some() {
-            bail!("a transaction is already in flight");
+        if self.inflight.len() >= self.max_inflight {
+            bail!("{} transaction(s) already in flight (max_inflight)", self.inflight.len());
+        }
+        if self.is_inflight(r.market, r.user) {
+            bail!("a transaction for this position is already in flight");
         }
         // Held from here until the broadcast is done: the other process waits for it.
         let mut lock = match &self.shared {
             Some(s) => match s.lock().await {
                 Ok(f) => Some(f),
-                Err(e) => {
-                    warn!(error = %e, "shared nonce file unavailable; sending without it");
-                    None
-                }
+                // Fail closed: without the lock another bot on this wallet may sign with the same
+                // nonce, and one of the two txs is lost.
+                Err(e) => bail!("shared nonce file unavailable, not sending: {e}"),
             },
             None => None,
         };
@@ -508,7 +558,7 @@ impl<P: Provider> Executor<P> {
                     max_fee_wei: max_fee,
                     priority_fee_wei: r.priority_fee_wei,
                 };
-                self.inflight = Some(inflight.clone());
+                self.inflight.push(inflight.clone());
                 Ok(inflight)
             }
             Err(e) => {
@@ -534,36 +584,114 @@ impl<P: Provider> Executor<P> {
         self.bcast.send_raw(&envelope.encoded_2718(), hash).await
     }
 
-    /// Checks the in-flight tx. Returns its outcome once known (and clears it).
-    pub async fn poll(&mut self, current_block: u64) -> Result<Option<(Inflight, Outcome)>> {
-        let Some(inf) = self.inflight.clone() else { return Ok(None) };
-        let receipt: Value = self.provider.raw_request("eth_getTransactionReceipt".into(), (inf.hash,)).await?;
-        if !receipt.is_null() {
-            let hex = |v: &Value| v.as_str().and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
-            let success = receipt["status"].as_str() == Some("0x1");
-            let outcome = Outcome::Included {
-                block: hex(&receipt["blockNumber"]) as u64,
-                success,
-                gas_used: hex(&receipt["gasUsed"]) as u64,
-                effective_gas_price: hex(&receipt["effectiveGasPrice"]),
-                l1_fee_wei: hex(&receipt["l1Fee"]),
-            };
-            if success {
-                self.consecutive_failures = 0;
-            } else {
-                self.record_failure();
+    /// Checks every tx in flight (receipts fetched in parallel). Returns the outcomes now known and
+    /// clears those txs. A tx with no receipt DROP_GRACE_BLOCKS past its deadline is dropped, and so
+    /// is every later-nonce tx still without a receipt: none of them can land before it.
+    pub async fn poll(&mut self, current_block: u64) -> Result<Vec<(Inflight, Outcome)>> {
+        if self.inflight.is_empty() {
+            return Ok(vec![]);
+        }
+        let receipts = futures::future::join_all(self.inflight.iter().map(|i| self.provider.raw_request::<_, Value>("eth_getTransactionReceipt".into(), (i.hash,)))).await;
+        let hex = |v: &Value| v.as_str().and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+        let mut out = vec![];
+        let mut keep = vec![];
+        let mut dropped_from: Option<u64> = None;
+        let mut first_err = None;
+        for (inf, r) in std::mem::take(&mut self.inflight).into_iter().zip(receipts) {
+            match r {
+                Ok(receipt) if !receipt.is_null() => {
+                    let success = receipt["status"].as_str() == Some("0x1");
+                    let outcome = Outcome::Included {
+                        block: hex(&receipt["blockNumber"]) as u64,
+                        success,
+                        gas_used: hex(&receipt["gasUsed"]) as u64,
+                        effective_gas_price: hex(&receipt["effectiveGasPrice"]),
+                        l1_fee_wei: hex(&receipt["l1Fee"]),
+                    };
+                    if success {
+                        self.consecutive_failures = 0;
+                    } else {
+                        self.record_failure();
+                    }
+                    out.push((inf, outcome));
+                }
+                Ok(_) if dropped_from.is_some_and(|n| inf.nonce > n) || current_block > inf.deadline_block + DROP_GRACE_BLOCKS => {
+                    dropped_from = Some(dropped_from.map_or(inf.nonce, |n| n.min(inf.nonce)));
+                    self.record_failure();
+                    out.push((inf, Outcome::Dropped));
+                }
+                Ok(_) => keep.push(inf),
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                    keep.push(inf);
+                }
             }
-            self.inflight = None;
-            return Ok(Some((inf, outcome)));
         }
-        // Past the deadline the tx can only revert (Expired) if it lands; well past it, assume dropped.
-        if current_block > inf.deadline_block + 10 {
-            self.inflight = None;
-            self.record_failure();
+        // Later nonces kept only while nothing before them was dropped.
+        if let Some(n) = dropped_from {
+            for inf in std::mem::take(&mut keep) {
+                if inf.nonce > n {
+                    self.record_failure();
+                    out.push((inf, Outcome::Dropped));
+                } else {
+                    keep.push(inf);
+                }
+            }
+        }
+        self.inflight = keep;
+        if dropped_from.is_some() {
+            let dropped: Vec<Inflight> = out.iter().filter(|(_, o)| matches!(o, Outcome::Dropped)).map(|(i, _)| i.clone()).collect();
+            self.cancel_stuck(&dropped).await;
             self.sync_nonce().await?;
-            return Ok(Some((inf, Outcome::Dropped)));
         }
-        Ok(None)
+        // A settled tx is no longer reserved by `spendable`: read the balance it left now, not at
+        // the next background reading.
+        if !out.is_empty()
+            && let Ok(b) = self.provider.get_balance(self.address).await
+        {
+            *self.balance.lock().unwrap() = Some(b);
+        }
+        if let (Some(e), true) = (first_err, out.is_empty()) {
+            return Err(e.into());
+        }
+        Ok(out)
+    }
+}
+
+impl<P: Provider> Executor<P> {
+    /// Txs given up on (no receipt past their deadline) may still sit in the mempool, e.g. a max fee
+    /// the base fee rose above, and then every later nonce waits behind them. Each one still
+    /// pending is replaced by a 0-value self-transfer with the same nonce at a fee that can land
+    /// (replacement needs both fees >= 12.5% higher); it would only revert (Expired) anyway.
+    async fn cancel_stuck(&self, dropped: &[Inflight]) {
+        let (latest, pending) = tokio::join!(self.provider.get_transaction_count(self.address), self.provider.get_transaction_count(self.address).pending());
+        let (Ok(latest), Ok(pending)) = (latest, pending) else { return };
+        let base_fee = match self.provider.get_block_by_number(alloy::eips::BlockNumberOrTag::Latest).await {
+            Ok(Some(b)) => b.header.base_fee_per_gas.unwrap_or(0) as u128,
+            _ => return,
+        };
+        let bump = |x: u128| x + x / 8 + 1;
+        for inf in dropped.iter().filter(|i| i.nonce >= latest && i.nonce < pending) {
+            let priority = bump(inf.priority_fee_wei);
+            let max_fee = bump(inf.max_fee_wei).max(base_fee * 2 + priority);
+            let tx = TransactionRequest::default()
+                .with_from(self.address)
+                .with_to(self.address)
+                .with_value(U256::ZERO)
+                .with_nonce(inf.nonce)
+                .with_chain_id(self.chain_id)
+                .with_gas_limit(21_000)
+                .with_max_fee_per_gas(max_fee)
+                .with_max_priority_fee_per_gas(priority);
+            let sent = async {
+                let envelope = <TransactionRequest as NetworkTransactionBuilder<Ethereum>>::build(tx, &self.wallet).await.context("signing")?;
+                self.bcast.send_raw(&envelope.encoded_2718(), *envelope.tx_hash()).await
+            };
+            match sent.await {
+                Ok(hash) => warn!(stuck = %inf.hash, nonce = inf.nonce, cancel = %hash, max_fee_gwei = max_fee as f64 / 1e9, "stuck tx replaced by a 0-value self-transfer"),
+                Err(e) => warn!(stuck = %inf.hash, nonce = inf.nonce, error = %e, "could not replace a stuck tx"),
+            }
+        }
     }
 }
 

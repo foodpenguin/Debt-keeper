@@ -88,7 +88,7 @@ impl<P: Provider, L: LendingProtocol> Engine<P, L> {
         let metas = protocol.load_markets(&provider).await?;
         let market_index = metas.iter().enumerate().map(|(i, m)| (m.key(), i)).collect();
         // Public APIs (Kyber, protocol indexers) sit behind Cloudflare, which rejects clients without a User-Agent.
-        let http = reqwest::Client::builder().user_agent(concat!("base-liq-bot/", env!("CARGO_PKG_VERSION"))).build()?;
+        let http = reqwest::Client::builder().user_agent(concat!("liquidation-framework/", env!("CARGO_PKG_VERSION"))).build()?;
         Ok(Self { provider, cfg, http, protocol, metas, market_index, positions: HashMap::new(), api_hf: HashMap::new(), ever_tracked: HashSet::new() })
     }
 

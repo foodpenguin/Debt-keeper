@@ -182,6 +182,25 @@ contract MorphoLiquidatorRouteForkTest is Test {
         emit log_named_uint("gas liquidateRoute (2 sources + 2 pooled sinks)", used);
     }
 
+    /// A sink split that leaves part of the pooled connector unspent (last share 90%): the remainder
+    /// is swept to the profit receiver, never left in the contract.
+    function test_route_pooledConnectorRemainderIsSwept() public {
+        MarketParams memory mp = MORPHO.idToMarketParams(XRP_MARKET);
+        _crash(mp, 500);
+        bytes memory route = bytes.concat(
+            _hop(PANCAKE_XRP_WETH_500, false, false, 1_000e6),
+            _hop(SLIP_XRP_WETH_2000, false, false, 1_000e6),
+            _frac(UNI_WETH_USDC_500, true, 6_000),
+            _frac(0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59, true, 9_000)
+        );
+        uint256 before = IERC20(WETH).balanceOf(receiver);
+        _usdcOut(mp, XRP_BORROWER, 2_000e6, route);
+        assertEq(IERC20(WETH).balanceOf(address(liq)), 0, "WETH left behind");
+        uint256 swept = IERC20(WETH).balanceOf(receiver) - before;
+        assertGt(swept, 0, "the 10% remainder went to the receiver");
+        emit log_named_decimal_uint("connector remainder swept (WETH)", swept, 18);
+    }
+
     /// The packed entry must do exactly what liquidateRoute does (same profit, same state).
     function test_packedEntry_equalsAbiEntry() public {
         MarketParams memory mp = MORPHO.idToMarketParams(XRP_MARKET);

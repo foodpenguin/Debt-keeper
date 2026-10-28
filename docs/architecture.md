@@ -7,6 +7,16 @@ tracking, planning, simulation, sending) is written against three traits; a prot
 contract and a swap aggregator plug into them. **Morpho Blue on Base** is the first, complete
 implementation and the reference for new ones.
 
+## Scope: what is generic today
+
+Generic (written against the traits, no protocol named): the HF engine (`engine.rs`), the planner
+(`planner.rs`), the venue / DEX / funding seams (`venue.rs`, `dex.rs`, `funding.rs`) and their
+venues (`sim.rs`, `flash_venue.rs`, `atlas_venue.rs`), the executor, the RPC pool, heads and the
+flashblocks stream. Still Morpho-bound application code: the `main.rs` watch loop (block path,
+same-block path, send path, pre-flight), the oracle price model (`oracle.rs`, MorphoChainlinkOracleV2),
+the Atlas valuation, the dashboard and the loss analysis. A new protocol reuses the generic core
+as it is, but today it needs its own application loop (start from `main.rs`).
+
 ## One liquidation, end to end
 
 ```
@@ -14,9 +24,12 @@ new block (WS newHeads / HTTP poll / Flashblocks signal)
   -> Engine: read the touched positions + one snapshot per market, recompute health factors
   -> candidates with HF < 1, sized by the protocol (max seizable collateral)
   -> Planner: exit route (self-built V3 router and/or an aggregator), sized under a gas budget
-  -> LiquidationVenue: encode the exact tx, simulate it (eth_simulateV1) at the next block
-  -> risk gate: min net profit, priority fee, daily gas budget, kill switch
-  -> shadow mode: journal only | live mode: sign + broadcast, track the receipt
+  -> LiquidationVenue: encode the exact tx, simulate it (eth_simulateV1) at the next block,
+     priced at the fee a non-bidding send would pay
+  -> risk gate: min net profit (USD), priority fee, daily gas budget, kill switch
+  -> a bid above the base priority is simulated again at its own priority before it is kept
+  -> shadow mode: journal only | live mode: sign + broadcast (several txs may be in flight), track
+     the receipts
 ```
 
 ## The traits
@@ -24,8 +37,11 @@ new block (WS newHeads / HTTP poll / Flashblocks signal)
 | Trait | File | Responsibility | First impl |
 |---|---|---|---|
 | `LendingProtocol` | `bot/src/protocol.rs` | Load markets and positions, turn events into "touched" positions, read per-block snapshots, evaluate health and liquidation size | `morpho::Morpho` |
-| `LiquidationVenue<L>` | `bot/src/venue.rs` | Encode a liquidation (with an exit route) into a sendable payload, simulate it, probe gas | `sim::Simulator` (MorphoLiquidator) |
+| `LiquidationVenue<L>` | `bot/src/venue.rs` | Encode a liquidation (with an exit route) into a sendable payload, simulate it, probe gas | `sim::Simulator` (MorphoLiquidator), `flash_venue::FlashLiquidatorVenue` (FlashLiquidator), `atlas_venue::AtlasBid` (AtlasLiquidationSolver, simulation only) |
 | `Dex` | `bot/src/dex.rs` | External aggregator: quote under a gas budget, build the swap call | `router::Kyber` |
+| `DirectLiquidation` | `bot/src/protocol.rs` | The protocol's own liquidation call for a caller that holds the repayment up front (no callback) | `morpho::Morpho` |
+| `FlashLoan` / `FlashAccounting` | `bot/src/funding.rs` | Where a flash-funded liquidation borrows the repayment | `MorphoBlue` / `UniswapV4` |
+| `FlashSource` | `bot/src/funding.rs` | What FlashLiquidator needs from a flash source: `name`, `holder`, `fee`, `mode` (its `funding` selector) | `MorphoBlue` (1), `UniswapV4` (2) |
 
 ### `LendingProtocol`
 
@@ -40,7 +56,11 @@ Associated types: `Market`, `Position`, `Snapshot`, `Health`, `Quote`, `Liquidat
 - `snapshots(prev)` — one snapshot per market per block; `prev` lets an implementation save a round
   trip (Morpho reuses the previous block's state for the IRM rate).
 - `evaluate` — pure: HF, debt, max seizable collateral, liquidation quote, bonus.
-- Planning hooks: `exit_tokens`, `loan_decimals`, `repay_for_seize`, `collateral_value`.
+- Planning hooks: `exit_tokens`, `loan_decimals`, `repay_for_seize`, `collateral_value`, and
+  `loan_usd(market, snap, eth_usd)`: USD per loan token. Profits, gas trade-offs and bids are
+  compared in USD; `None` means no price model and the market is refused rather than mispriced.
+  Morpho uses `morpho::loan_usd_model`: USD stablecoins (`USDC`, `USDbC`, `USDT`, `DAI`, `USDS`) at
+  1, `WETH` at the ETH price, anything else `None`. The binary also refuses such markets at start.
 - `eth_usd` (optional) — ETH/USD from tracked markets, for gas accounting.
 
 Every method keeps the batched, incremental shape of the hot path: one call for all touched
@@ -63,22 +83,86 @@ Turns one liquidatable position (or a bundle of positions in one market) into a 
   the best gross margin; while the route is too gas-heavy it retries with smaller sizes only. The
   direct path allocates over its grid under the same gas budget (`max_gas` minus a fixed
   liquidation overhead).
+- **Fee-priced simulation.** Every plan is simulated (and every direct-router grid quoted) at the fee
+  a non-bidding send pays: `Planner::sim_fee` = max fee 2 x base fee + `priority_fee_wei`, priority
+  `priority_fee_wei`. Venues that read `tx.gasprice` (priority-fee taxes, dynamic fees) answer what
+  the real tx would get.
+- **USD accounting.** `Plan::sim_profit` is in loan-token units; `profit_usd` = that x `loan_usd`;
+  `gas_cost_usd` = L2 gas at the planning priority + the L1 data fee (`l1_fee_usd` on its own);
+  `net_usd` = `profit_usd - gas_cost_usd`. A market without a loan price is a plan error.
 - **Sanity checks** on the simulation (profit vs quote, block the node really simulated).
 - `quote_bundle` values a whole market's liquidatable positions as one exit (used by the Atlas
-  valuation, where one solver tx liquidates them all).
+  valuation, where one solver tx liquidates them all); `gross_usd` is in USD and `gas_units` is the
+  whole solver op's estimated gas (liquidations + swap + overhead).
 
 ### `LiquidationVenue<L>` (`bot/src/venue.rs`)
 
-`target()` (the contract the tx goes to, also the swap sender/recipient), `encode(market, user,
-seize, route, min_profit, deadline)` -> `Payload { to, calldata, min_profit slot }`, `simulate`,
-`probe_gas`. The `min_profit` slot tells the executor where to patch the final minProfit at send
-time. An `ExitRoute` is either `Packed(bytes)` (the self-built router's compact route) or
-`Call { target, calldata }` (an aggregator swap).
+`target()` (the contract the tx goes to), `swap_recipient()` (the contract that runs the exit swaps:
+an aggregator route is built for it as sender and recipient; default `target()`, but a venue that
+nests the liquidation in another contract differs), `encode(market, user, seize, repay, route,
+min_profit, deadline)` -> `Payload { to, calldata, min_profit slot }`, `simulate(p, calldata, block,
+overrides, at, fee, probe)` (`fee: Option<SimFee>` = the `maxFeePerGas` / `maxPriorityFeePerGas` the
+call carries), `probe_gas`, and `packed_routes()` (default `true`). `repay` is the debt the liquidation
+repays (`LendingProtocol::repay_for_seize`): a venue that funds the repayment itself borrows it, a
+callback venue ignores it. The `min_profit` slot tells the executor where to patch the final
+minProfit at send time. An `ExitRoute` is either `Packed(bytes)` (the self-built router's compact
+route) or `Call { target, calldata }` (an aggregator swap). A venue whose contract has no packed
+entry returns `packed_routes() = false`: the planner then never gives it a packed route (`direct`
+mode reports "this venue has no packed-route entry"; `best` falls back to the aggregator).
 
 `sim::Simulator` implements it for MorphoLiquidator: a packed route goes through the compact
 fallback entry, an external call becomes the single swap step of the ABI `liquidate`. Without a
 deployed address the liquidator's runtime code is injected by state override at a placeholder
 address, so the bot can plan before anything is deployed.
+
+The pieces every venue shares live in `sim.rs`: `LiquidatorCode::build(path, ctor, from)` runs a
+contract's constructor (address arguments in order) in an `eth_call` to get its runtime code with
+the immutables filled in, `LiquidatorCode::account(executor, allowed)` turns it into a state
+override (owner = executor, not paused, `allowedTarget` set; `account_with` sets several allowlists,
+`has_slot` checks a label exists), and `simulate_call` / `probe_gas_call` run any calldata with
+`eth_simulateV1` (profit-agnostic: each venue decodes its own return value). A fee-priced
+`simulate_call` also gives the sender a balance override: Base nodes check that the sender can pay
+gas x `maxFeePerGas` even with validation off. With validation off the simulated block's base fee
+is 0, so `tx.gasprice` equals the priority fee, which is what priority-fee taxes are levied on.
+
+### Funding the repayment (`bot/src/funding.rs`)
+
+There are two ways a liquidation's repayment is paid:
+
+- **The protocol's own callback.** Morpho Blue sends the collateral first and calls back
+  `onMorphoLiquidate`; the collateral is sold inside the callback and Morpho then pulls the
+  repayment. No borrowing at all. This is `sim::Simulator` / MorphoLiquidator.
+- **A flash source**, for protocols whose liquidation pulls the repayment up front (Aave-style
+  `liquidationCall`). The repayment is borrowed first and repaid from the sale of the collateral:
+  `flash_venue::FlashLiquidatorVenue` / FlashLiquidator. Two models, deliberately two traits:
+  - `FlashLoan` (`name`, `lender`, `fee`): a fixed amount, the lender calls back, repay amount + fee
+    before the callback returns. `MorphoBlue` (0 fee).
+  - `FlashAccounting` (`name`, `manager`, `fee`, default 0): take now, settle the net delta before
+    `unlock` returns. `UniswapV4` (the PoolManager; no swap step may go through V4 while the
+    liquidator holds the lock).
+
+  `FlashSource` is the trait the venue uses (`name`, `holder`, `fee`, `mode()`: 1 = Morpho flash
+  loan, 2 = V4 flash accounting), implemented by `MorphoBlue` and `UniswapV4`;
+  `FlashLiquidatorVenue` holds a `Box<dyn FlashSource>`. A new source takes both sides: a
+  `FlashSource` impl and a matching branch in `FlashLiquidator.sol` (its `funding` value, the call
+  that starts the flash and its callback, guarded like the existing two). The contract repays
+  exactly what it borrowed, so a source with a fee is refused until the contract repays amount + fee.
+
+`DirectLiquidation` (in `protocol.rs`) is what a protocol provides for the flash path:
+`liquidation_call(market, user, seize, repay) -> LiquidationTx { target, calldata, debt_token,
+collateral_token }`. Morpho implements it with `liquidate` and empty callback data, which simply
+pulls the repayment from the caller after sending the collateral, so Morpho also works as a
+callback-free protocol (that is how the flash path is tested on real contracts).
+
+`FlashLiquidatorVenue<L: DirectLiquidation>` builds `FlashLiquidator.liquidate(funding, debtToken,
+debtAmount, collateralToken, liquidation, swaps, minProfit, deadlineBlock)`: the debt amount is
+`borrow_for(repay)` = repay + `headroom_bps` + 1 wei (interest accrued before inclusion cannot make
+the protocol pull more than was borrowed; unspent headroom goes back to the funder with the loan),
+the aggregator exit becomes the single swap step with `amountIn = type(uint256).max` (sell all the
+collateral that actually arrived, which the contract resolves to its balance), and minProfit sits at
+`FLASH_MIN_PROFIT`. It has
+no packed entry (`packed_routes() = false`). Without `exec.flash_liquidator` the contract is
+injected at a placeholder address, like MorphoLiquidator.
 
 ### `Dex` (`bot/src/dex.rs`)
 
@@ -95,12 +179,17 @@ estimate by a safety factor.
   tick-spacing factories). Factory addresses live in config, never in code.
 - **Quoting:** `contracts/src/sim/GridQuoter.sol` is never deployed; it is injected by state
   override and quotes a grid of sizes for every leg in one `eth_call` (the Uniswap-quoter revert
-  trick), with a per-hop gas cap so a pathological pool cannot blow the call's gas limit.
+  trick), with a per-hop gas cap so a pathological pool cannot blow the call's gas limit. Quote
+  calls carry the planning fee (`Planner::sim_fee`) from a placeholder caller (`QUOTE_CALLER`) that
+  gets a balance override, so pools that read `tx.gasprice` quote what the tx would get.
 - **Allocation:** greedy on marginal output over a concave combined curve (a shared connector sink
   is not double-counted), compared against single-leg solutions because each extra leg costs gas;
-  `allocate_within` enforces a gas budget. Leg gas is priced at `planning_priority_fee_wei`.
+  `allocate_within` enforces a gas budget. Leg gas is priced at `planning_priority_fee_wei` and
+  converted to loan-token units with `loan_usd`.
 - **Execution:** the packed route calls pools directly; pools are paid inside their own swap
-  callback (only the pool currently swapping, once, at most its input).
+  callback (only the pool currently swapping, once, at most its input). A pooled connector token
+  split by share across sink hops (bit 2) can keep a rounding remainder: it is swept to
+  `PROFIT_RECEIVER` after the liquidation, so nothing stays at rest.
 
 ## On-chain: `contracts/src/MorphoLiquidator.sol`
 
@@ -127,15 +216,17 @@ estimate by a safety factor.
 | Not enough profit | `minProfit` on the loan-token balance delta (fuzzed) | `test_minProfitEnforced`, `testFuzz_profitAtLeastMin` |
 | Fake pool in a direct route | pools are only called for `swap`/`token0`/`token1` and paid inside their own callback, at most the hop input; nothing is held at rest | `test_route_poolAskingMoreThanInputGetsNothing`, `test_route_doubleCallbackRejected`, `test_swapCallbackFromStrangerRejected` |
 | Route not spending all seized collateral | explicit source legs must sum exactly to `seizedAssets` (`RouteSpendMismatch`) | `test_route_mustSpendExactlySeized` |
+| Connector left in the contract | the pooled connector's remainder is swept to `PROFIT_RECEIVER` | `test_route_pooledConnectorRemainderIsSwept` |
 | Pool reporting positive output | every hop's output must be a negative delta (`BadRoute`) | `test_route_positiveOutputRejected` |
 | Malformed packed calldata | strict decoding, no selector collision with the ABI entries | `test_packed_malformedRejected`, `test_packed_noSelectorCollision`, `test_packedEntry_equalsAbiEntry` |
-| Emergency | executor may `pause`, only the owner may resume | `test_pauseKillSwitch` |
+| Emergency | the executor (hot wallet) or the owner may `pause` (an operator stop; the bot itself never calls it, its kill switch is a file), only the owner may resume | `test_pauseKillSwitch` |
 
 Off-chain defences: aggregator targets must be in `allowed_targets`; market ids are re-derived from
 params at start; implausible simulations (profit far from the quote) are rejected; RPC errors are
 rewritten so URLs with API keys never reach logs (`errors_never_contain_urls`); the risk gate
 (`bot/src/risk.rs`) applies the kill-switch file, minimum net profit, a priority fee proportional to
-net profit with a hard cap, and a daily budget for gas burned by failed txs.
+net profit with a hard cap, and a daily budget for gas burned by failed txs. Its cost estimate is
+L2 gas at the bid plus the plan's L1 data fee, compared with `profit_usd`.
 
 ### Gas
 
@@ -156,6 +247,77 @@ can bid more per gas for the same budget.
 2. COLD calls `acceptOwnership()` (`scripts/accept_ownership.sh`).
 3. Set `exec.liquidator` and keep `allowed_targets` in sync with the on-chain allowlist.
 
+## On-chain: `contracts/src/FlashLiquidator.sol`
+
+For protocols without a liquidate callback. `liquidate(funding, debtToken, debtAmount,
+collateralToken, liquidation, swaps, minProfit, deadlineBlock)` (executor only) flash-borrows
+`debtAmount` of the debt token from Morpho (`FUND_MORPHO`, `flashLoan` -> `onMorphoFlashLoan`) or
+from the Uniswap V4 PoolManager (`FUND_V4`, `unlock` -> `unlockCallback` -> `take` ... `sync` /
+transfer / `settle`), then, whatever funded it: approves exactly `debtAmount` to the liquidation
+target, makes the protocol's liquidation call, resets the allowance, requires collateral to have
+arrived, sells it through the swap steps, and repays the funder exactly what was borrowed. The
+debt-token balance left is the profit; it must reach `minProfit` and goes, with any leftover
+collateral, to the immutable `PROFIT_RECEIVER`. The constructor takes `(morpho, poolManager, owner,
+executor, profitReceiver)`; `poolManager = address(0)` disables V4 funding.
+
+The contract repays exactly what it borrowed, so only 0-fee sources work: the bot refuses to build
+the flash venue for a source whose `fee()` is not zero.
+
+| Threat | Defence | Tests (`FlashLiquidator.security.t.sol`) |
+|---|---|---|
+| Someone else starts a liquidation | executor-only entry; deadline; `pause` | `test_onlyExecutorAndNotExpiredOrPaused` |
+| Forged or stray funding callback | sender must be the funder AND a liquidation funded by that very source must be in flight (transient funding tag) | `test_callbacksRejectStrangersAndCallsOutsideAnOwnLiquidation`, `test_crossSourceAndSecondCallbacksAreRejected` |
+| A second callback in the same liquidation | the tag is cleared on entry (one-shot) | `test_crossSourceAndSecondCallbacksAreRejected` |
+| A funder that never calls back | `NotFunded` after the funding call returns | `test_funderThatNeverCallsBackReverts` |
+| Poisoned liquidation call or swap | two owner allowlists: the liquidation call only to an `allowedProtocol`, swaps only to an `allowedTarget` (a router never gets the allowance meant for the protocol); exact allowances reset to zero | `test_liquidationAndSwapTargetsMustBeAllowlisted`, `test_anAllowlistedRouterIsNotAnAllowedProtocol`, `test_allowancesAreResetAfterTheCall` |
+| A liquidation that seizes nothing | `NothingSeized` | `test_aLiquidationThatSeizesNothingReverts` |
+| Not enough profit | `minProfit` on the debt token left after repaying the funder | `test_minProfitEnforced` |
+| Unknown funding / V4 not configured | `FundingDisabled` | `test_unknownFundingAndDisabledV4Revert` |
+
+`test_bothFundingSourcesLiquidateRepayAndPayTheReceiver` checks the happy path for both sources.
+`FlashLiquidator.fork.t.sol` runs it on real Base contracts, with Morpho as the callback-free
+protocol: `test_morphoFlashLoanFundsACallbackFreeLiquidation`,
+`test_v4FlashAccountingFundsACallbackFreeLiquidation` (same profit as the Morpho flash loan),
+`test_unprofitableExitReverts`, `test_protocolTargetMustBeAllowlisted`. The Rust encoding is
+checked against the contract on an anvil fork by `e2e_flash_venue_simulates_a_flash_funded_liquidation`.
+
+Deploying it is like MorphoLiquidator (owner, executor, profit receiver), plus: allowlist the
+protocol's liquidation target (`setAllowedProtocol`) and the aggregator router(s)
+(`setAllowedTarget`), then set `exec.flash_liquidator`.
+
+## On-chain: `contracts/src/AtlasLiquidationSolver.sol` (simulation only)
+
+A solver contract for Chainlink SVR auctions run by Fastlane Atlas, written against the Atlas
+solver interface (`atlasSolverCall`), not derived from Atlas's own code. In the auction winner's
+slot Atlas calls `atlasSolverCall(solverOpFrom, executionEnvironment, bidToken, bidAmount,
+solverOpData, extraReturnData)`; `solverOpData` = `(SolverCall[] calls, SwapStep bidSwap, address
+profitToken, uint256 minProfit)`. The solver runs the calls (liquidations through a
+MorphoLiquidator deployed with the solver as executor and profit receiver), runs the bid swap
+(loan token -> WETH, `target = address(0)` = none), unwraps WETH as needed (keeping aside any ETH
+Atlas lent, so the bid never spends it) and pays the ETH bid to the execution environment, settles
+with Atlas (repays that loan and approves the gas liability read at the end through `reconcile`),
+checks `minProfit` on the profit token left AFTER the bid, sends it and any leftover WETH or ETH to
+`PROFIT_RECEIVER`, and returns the net profit. Constructor: `(atlas, weth, owner, executor,
+profitReceiver)`; `executor` is the solver operation signer.
+
+| Threat | Defence | Tests (`AtlasLiquidationSolver.security.t.sol`) |
+|---|---|---|
+| Someone other than Atlas calls it, or an op signed by someone else | `msg.sender == ATLAS` (`InvalidEntry`) and `solverOpFrom == executor` (`InvalidCaller`) | `test_onlyAtlasForTheSignersOperation` |
+| Non-ETH bids; emergency | ETH bids only (`UnsupportedBidToken`); the executor (signer) or the owner may `pause`, only the owner may `unpause` | `test_ethBidsOnlyAndPauseStopsIt` |
+| ETH that Atlas lent spent on the bid | the borrow liability (up to `msg.value`) is kept aside: WETH is unwrapped for bid + repayment, and the loan goes back through `reconcile` | `test_borrowedEthIsRepaidEvenWhenTheBidNeedsEth` |
+| Poisoned calls or bid swap | every call target and the bid-swap router must be owner-allowlisted; exact allowance reset | `test_callAndBidSwapTargetsMustBeAllowlisted` |
+| Bid larger than what the op earns | the bid must be bought and paid, and `minProfit` holds after it | `test_aBidTheSwapCannotFundReverts`, `test_minProfitIsCheckedAfterTheBid` |
+| Admin by others | owner-only admin | `test_adminIsOwnerOnly` |
+
+`test_runsTheLiquidationPaysTheEthBidSettlesAndKeepsTheRest` covers the happy path;
+`AtlasLiquidationSolver.fork.t.sol` runs a real liquidation inside a solver op on a Base fork
+(`test_solverLiquidatesPaysTheEthBidAndKeepsTheRest`, `test_aBidAboveTheProfitReverts`) with
+`contracts/src/sim/AtlasStub.sol` standing in for the Atlas escrow, and checks the deployed Atlas
+escrow has the settlement calls the solver makes with the semantics it assumes
+(`test_theDeployedAtlasEscrowHasTheSettlementCallsTheSolverMakes`: `shortfall` is 0 outside a
+metacall, `reconcile` reverts `WrongPhase` there, `getAtlasSurchargeRate` is readable). A full
+metacall cannot be replayed (it needs the user's and the DApp's signatures).
+
 ## Off-chain modules (`bot/src/`)
 
 | Module | Responsibility |
@@ -164,7 +326,10 @@ can bid more per gas for the same budget.
 | `protocol`, `engine` | the protocol seam and the generic HF engine |
 | `morpho/` | Morpho Blue: on-chain reads, events, math (shares/assets with virtual shares, LIF, HF, seize <-> repay), indexer API |
 | `planner`, `venue`, `dex` | planning and its two seams |
-| `sim` | MorphoLiquidator encoding + `eth_simulateV1` simulation (profit, gas, L1 fee) at the next block's number and timestamp |
+| `sim` | MorphoLiquidator encoding; shared `simulate_call` / `probe_gas_call` (`eth_simulateV1`: profit, gas, L1 fee, at the next block's number and timestamp) and `LiquidatorCode` (injected contracts) |
+| `funding` | flash sources: `FlashLoan` / `FlashAccounting`, `MorphoBlue` / `UniswapV4`, the `FlashSource` trait |
+| `flash_venue` | `FlashLiquidatorVenue`: FlashLiquidator as a venue for `DirectLiquidation` protocols |
+| `atlas_venue` | `AtlasSolver` / `AtlasBid`: AtlasLiquidationSolver as a venue (simulation only) |
 | `router`, `v3router` | Kyber aggregator client; self-built V3 router |
 | `risk` | send/skip decision and priority fee |
 | `executor` | keystore signing, broadcast, nonce, failure policy (below) |
@@ -179,8 +344,13 @@ can bid more per gas for the same budget.
 ### Simulation
 
 One `eth_simulateV1` call runs the whole liquidation and returns profit and real gas; the L1 fee
-is added (`getL1FeeUpperBound`). Simulations run as the **next** block (block override of number
-and timestamp), because candidates are evaluated with interest accrued to the next block.
+is added (`getL1FeeUpperBound`). Plans are simulated at the planning fee (see `Planner`); once the
+risk gate has picked a bid above the base priority, `checked_priority` (in `main.rs`) simulates the
+plan again at that priority and keeps the bid only if the net still clears `min_net_usd` there,
+else the base priority goes; the send's minProfit uses the lower of the two profits. A
+re-simulation that shows no profit at all means the plan is not sent. Simulations run as the
+**next** block (block override of number and timestamp), because candidates are evaluated with
+interest accrued to the next block.
 `eth_estimateGas` is not used: some node implementations ignore block overrides there. Without a
 real gas figure a plan is an error, never a guess. Plans pinned to a "pending" state check which
 block the node actually simulated, because pending calls can run on a stale block.
@@ -189,22 +359,44 @@ block the node actually simulated, because pending calls can run on a stale bloc
 
 - **Signing:** only from an encrypted keystore; the password comes from an env var that is removed
   from the process environment right after reading, or from a hidden prompt.
-- **One tx in flight.** minProfit is patched to `sim profit x min_profit_keep`, gas limit to
-  `sim gas x gas_limit_buffer`; the wallet must afford worst-case gas.
+- **Several txs in flight.** Up to `exec.max_inflight` (default 3; 1 = one at a time) with
+  consecutive nonces, because a crash makes many positions liquidatable within a few blocks; the
+  same position is never sent twice (`can_send`, `is_inflight`), and no second tx goes to a market
+  that already has one in flight (`is_market_inflight`: plans are simulated without the txs in
+  flight, and one in the same market sells the same collateral through the same pools first, so the
+  second plan's price would not hold). minProfit is patched to
+  `sim profit x min_profit_keep`, gas limit to `sim gas x gas_limit_buffer`. The wallet must afford
+  the worst-case gas: `spendable` = the balance read in the background (with the nonce, by
+  `spawn_nonce_watch`) minus what the txs in flight may still burn, so the send path pays no RPC
+  call for it.
+- **Settling.** `poll` fetches every in-flight receipt in parallel. A tx with no receipt
+  `DROP_GRACE_BLOCKS` (2) past its deadline is dropped, and so is every later-nonce tx still
+  without a receipt (none of them can land before it). A dropped tx still sitting in the mempool
+  (e.g. its max fee fell below a rising base fee) would block every later nonce, so `cancel_stuck`
+  first replaces each one still pending with a 0-value self-transfer at the same nonce and fees
+  bumped past the replacement threshold (it would only revert `Expired` anyway); then the nonce is
+  resynced from the chain.
 - **Broadcast:** the same raw tx goes to every endpoint plus optional `extra_broadcast`; the first
   acceptance returns, the rest finish in the background. A dedicated HTTP client keeps connections
   warm (keep-alive pings), so a send never pays DNS/TLS setup.
 - **Nonce:** tracked locally, re-synced from chain on drops / nonce errors / "replacement
   underpriced" (then retried once). Bots that sign with the same wallet share a lock file per
   wallet (`exec.nonce_file`, default `~/.local/state/onchain-bots/nonce-<wallet>`), held between
-  signing and broadcast.
+  signing and broadcast. The lock fails closed: if the file cannot be locked, nothing is sent
+  (another bot on the wallet could otherwise sign with the same nonce).
 - **Failure policy:** `max_failures_in_window` failed or dropped txs within `failure_window_secs`
   pause sending for `failure_cooldown_secs`, then it resumes.
-- **Deadline:** `deadline_secs` converted to blocks from the measured block time.
-- **Live mode needs all of:** `exec.mode = "live"`, `watch --live`, `exec.liquidator`,
-  `exec.keystore`, and a passing pre-flight (contract exists, its executor is the keystore address,
-  not paused, profit receiver is not the hot wallet, Morpho allowances set, wallet balance at least
-  `min_wallet_eth`).
+- **Deadline and lookahead:** `deadline_secs` converted to blocks from the measured block time;
+  interest is accrued `accrual_lookahead_secs` ahead (unset = the measured block time rounded up,
+  1 to 2 s), so both follow a block-time change (2 s -> 200 ms) without config edits.
+- **Kill switch:** a relative `exec.kill_switch_file` is anchored at the config file's directory,
+  so it is the same file whatever directory the bot is started from.
+- **Live mode needs all of:** `exec.mode = "live"`, `watch --live`, the venue's deployed contract
+  (`exec.liquidator`, or `exec.flash_liquidator` with `exec.venue = "flash"`), `exec.keystore`, and
+  a passing pre-flight: contract exists, its executor is the keystore address, not paused, profit
+  receiver is not the hot wallet, wallet balance at least `min_wallet_eth`, and per venue: the
+  standing Morpho allowances (`approveMorpho`) for the callback venue; for the flash venue, Morpho
+  as an `allowedProtocol` and the contract's `MORPHO()` / `POOL_MANAGER()` matching `flash_funding`.
 
 ### RPC pool (`bot/src/rpc.rs`)
 
@@ -212,26 +404,64 @@ Endpoints are declared in `[[rpc]]` (`http_env` names a variable in `.env`; publ
 use `http`). The pool races or fails over by priority, honours per-endpoint `skip_methods` and log
 range limits, switches endpoint on "method not found", rate limits and capacity errors (with a
 cooldown), and treats "block not found / header not found" from a lagging node as *lag*: try the
-next endpoint without cooling the laggard down, unless it lags repeatedly. Logs only ever show the
-endpoint name.
+next endpoint without cooling the laggard down, unless it lags repeatedly. Capacity errors are
+recognised by phrases (rate, plan, range and availability limits such as "rate limit", "block
+range", "free plan"), never by single words; deterministic errors of the call itself (revert, gas
+limit, insufficient funds, nonce, fee cap...) never fail over or cool an endpoint down. Logs only
+ever show the endpoint name. Requests carry a `liquidation-framework/<version>` User-Agent.
+
+### Block path and send timing
+
+On each head the engine refreshes the touched positions, and the most valuable candidates
+(`max_plans_per_block`) are planned all at once; each one is journaled, gated and sent the moment
+its own plan is ready (a slow aggregator quote of one never delays another). The same holds for the
+same-block path below. Both still run inside the main loop: while a batch is being planned the next
+head or flashblock waits (they are not separate tasks).
 
 ### Same-block path (`bot/src/flashblocks.rs`, `bot/src/oracle.rs`)
 
 Base streams ~200 ms sub-blocks (Flashblocks). The bot decodes Chainlink transmissions straight
 from the raw txs in the stream (OCR report -> median observation), computes the new Morpho oracle
-price locally, re-evaluates only that market and plans on the snapshot block with the new price
-pinned by state override. SVR feeds are handled separately: the public price only takes effect once
-the matching secondary round lands, or after the feed's cutoff. `[flashblocks] send = false` keeps
-this path journal-only. Note: the planned Base "Denim" upgrade removes Flashblocks; the local price
-model and single-market re-evaluation stay useful with faster blocks, so the data layer is not tied
-to the Flashblocks API.
+price locally and re-evaluates only that market. Each candidate is planned twice, in parallel:
+on the snapshot block with the new price pinned by state override, and on the "pending" block
+being built WITHOUT any price override, with the oracle read in that same state (`PriceProbe`) to
+prove the update is in effect (a transmit that reverted, or an SVR cutoff one block away, shows up
+as the old price). Behind (stale block or old price), the pending plan is retried briefly. A fresh,
+proven pending plan wins; else the snapshot plan. SVR feeds are handled separately: the public
+price only takes effect once the matching secondary round lands, or after the feed's cutoff.
+`may_send(path, state)`: a public transmit (`Primary`) may send from either plan; an SVR secondary
+or an expired SVR primary only from the fresh pending plan. `[flashblocks] send = false` keeps this
+path journal-only. Note: the planned Base "Denim" upgrade removes Flashblocks and moves to 200 ms
+blocks; the local price model and single-market re-evaluation stay useful, and deadlines and the
+interest lookahead follow the measured block time, so the data layer is not tied to the Flashblocks
+API.
 
 ### Atlas / Chainlink SVR (`bot/src/atlas.rs`)
 
 On SVR-enabled feeds, the right to liquidate after an oracle update is auctioned through Fastlane
 Atlas. The module listens for auctions, values each one with the same planner (`quote_bundle` for
 the whole market, then per-position plans), and journals what we could have bid. It never
-submits anything. `value-auction` replays a past auction.
+submits anything. `value-auction` replays a past auction. The bid basis is what the solver would
+keep after Atlas charges it for gas: per market `atlas_net_usd` = the bundle's `gross_usd` minus its
+`gas_units` at the auction's `maxFeePerGas` x (1 + surcharge), summed into `bundle_net_usd`; the
+journaled bid is that x (1 - `atlas.margin`). The surcharge is read from the escrow at start
+(`getAtlasSurchargeRate`, scale 1e4); `[atlas] gas_surcharge` (default 0.1) is the fallback.
+
+**Solver venue (`bot/src/atlas_venue.rs`, simulation only).** With `[atlas.solver] simulate = true`,
+each market of a valued auction also gets a `solver` field in the journal (`solver_op` in
+`main.rs`): the top position's direct-router plan is wrapped into `atlasSolverCall` with a bid of
+(`profit_usd` minus the op's gas at the Atlas rate above) x (1 - `atlas.margin`), and simulated as
+Atlas would call it, against `AtlasStub.sol` injected at the Atlas address (no gas liability), with
+the solver and its MorphoLiquidator injected unless deployed; the result includes the L1 fee of the
+call. The journal shows the bid, whether the op succeeds and the net after the bid. `solver_op`
+wraps only direct-router plans (an existing plan's aggregator calldata was built for the direct
+liquidator's address), and nothing when `exec.venue = "flash"`. `AtlasSolver::calldata` builds the
+call (the bid is bought with `exactOutputSingle` on `bid_router` unless the loan token is WETH;
+minProfit at `SOLVER_MIN_PROFIT`); `AtlasBid { solver, bid_wei }` implements
+`LiquidationVenue<Morpho>` with `swap_recipient()` = the solver's MorphoLiquidator, so the planner can
+also plan through it, aggregator routes included (they are built to deliver to that liquidator). `e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation`
+checks it on an anvil fork. **Not implemented:** building and EIP-712-signing the
+`SolverOperation`, and submitting it to the auction endpoint.
 
 ### Dashboard and live page
 
@@ -249,10 +479,16 @@ snapshot `watch` writes every block.
 3. Start from `bot/src/testkit.rs`: `Toy` is a complete non-Morpho protocol (position =
    (debt, collateral), snapshot = price) that the engine and planner tests run on. Copy its shape
    for unit tests of your own impl.
-4. Bind the application layer: today `main.rs` uses `morpho::MorphoEngine`; add the same alias for
-   yours, and a config section like `[morpho]`.
-5. If the protocol has no liquidate callback, the liquidation must be funded by a flash loan inside
-   your contract; see "Adding a venue".
+4. Implement `loan_usd`: every loan token you allow needs a USD price model (or the market is
+   refused).
+5. Bind the application layer: today `main.rs` (the watch loop, oracle model, Atlas valuation,
+   dashboard) is Morpho-bound and uses `morpho::MorphoEngine`; add the same alias for yours, a
+   config section like `[morpho]`, and your own loop (see "Scope" above).
+6. If the protocol has no liquidate callback (its liquidation pulls the repayment up front),
+   implement `DirectLiquidation` (`liquidation_call`) and use `flash_venue::FlashLiquidatorVenue`
+   with a 0-fee `FlashSource` (`MorphoBlue` or `UniswapV4`; a new source also needs a
+   FlashLiquidator.sol branch): the planner, simulation and FlashLiquidator.sol are reused as they
+   are. `testkit::Toy` implements `DirectLiquidation`; see the `flash_venue` and `planner` tests.
 
 ## Adding a DEX (aggregator)
 
@@ -266,13 +502,18 @@ Add the router to `exec.allowed_targets` and to the contract allowlist.
 
 Implement `venue::LiquidationVenue<L>` for your contract: `encode` must return the exact calldata
 you will send and the byte slot of `minProfit`; `simulate` must run that calldata at the next block
-(see `Simulator::simulate`). `testkit::MockVenue` tags packed vs call routes and never simulates.
-Write a Foundry security suite in the spirit of the table above before any deployment.
+with the given `fee` (reuse `sim::simulate_call`, and `LiquidatorCode` to inject the contract
+before it is deployed); return `packed_routes() = false` if the contract has no packed-route entry,
+and override `swap_recipient()` if the swaps run in a contract other than `target()`. `testkit::MockVenue`
+tags packed vs call routes and never simulates; `FlashLiquidatorVenue` and `AtlasBid` are two
+complete examples. Write a Foundry security suite in the spirit of the tables above before any
+deployment.
 
 ## Commands
 
 ```bash
 cd contracts && forge test -vv                      # contract tests (fork tests use BASE_RPC_URL)
+cd contracts && forge test --no-match-contract Fork # security suites only, no RPC needed
 cd bot && cp config.example.toml config.local.toml
 cargo run --release -- -c config.local.toml scan --top 5     # one-shot scan + HF validation
 cargo run --release -- -c config.local.toml watch            # shadow mode, journal only

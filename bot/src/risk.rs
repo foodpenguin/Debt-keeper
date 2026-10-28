@@ -46,7 +46,7 @@ pub fn decide(cfg: &ExecConfig, budget: &mut DailyBudget, plan: &Plan, eth_usd: 
     if let Some(e) = &plan.error {
         return skip(&format!("plan error: {e}"));
     }
-    let (Some(net), Some(gas), Some(profit)) = (plan.net_usd, plan.gas_used, plan.sim_profit) else {
+    let (Some(net), Some(gas), Some(profit)) = (plan.net_usd, plan.gas_used, plan.profit_usd) else {
         return skip("not simulated");
     };
     if net < cfg.min_net_usd {
@@ -56,7 +56,8 @@ pub fn decide(cfg: &ExecConfig, budget: &mut DailyBudget, plan: &Plan, eth_usd: 
     let wei_per_usd = 1e18 / eth_usd.max(1.0);
     let share_wei = (net * cfg.priority_fee_share * wei_per_usd / gas as f64) as u128;
     let priority_fee_wei = share_wei.clamp(cfg.priority_fee_wei, cfg.max_priority_fee_wei.max(cfg.priority_fee_wei));
-    let est_cost_usd = gas as f64 * (base_fee_wei + priority_fee_wei) as f64 / wei_per_usd;
+    // L2 gas at the bid plus the L1 data fee (paid whatever the priority).
+    let est_cost_usd = gas as f64 * (base_fee_wei + priority_fee_wei) as f64 / wei_per_usd + plan.l1_fee_usd.unwrap_or(0.0);
     if est_cost_usd >= profit {
         return skip(&format!("cost {est_cost_usd:.4} >= profit {profit:.4}"));
     }
@@ -94,7 +95,19 @@ mod tests {
     }
 
     fn plan(net: f64, gas: u64) -> Plan {
-        Plan { sim_profit: Some(net + 0.01), net_usd: Some(net), gas_used: Some(gas), ..Default::default() }
+        Plan { sim_profit: Some(net + 0.01), profit_usd: Some(net + 0.01), net_usd: Some(net), gas_used: Some(gas), ..Default::default() }
+    }
+
+    #[test]
+    fn the_l1_fee_counts_towards_the_cost() {
+        // Gas alone fits under the profit; with the L1 fee it does not.
+        let mut c = cfg();
+        c.min_net_usd = 0.0;
+        let mut p = plan(0.01, 1_000);
+        p.profit_usd = Some(0.02);
+        assert!(matches!(decide(&c, &mut DailyBudget::default(), &p, 2400.0, 1, 0, false), Decision::Send { .. }), "tiny gas: sendable");
+        p.l1_fee_usd = Some(0.05);
+        assert!(matches!(decide(&c, &mut DailyBudget::default(), &p, 2400.0, 1, 0, false), Decision::Skip { .. }), "the L1 fee makes it cost more than it earns");
     }
 
     #[test]

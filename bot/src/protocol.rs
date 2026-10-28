@@ -136,9 +136,33 @@ pub trait LendingProtocol: Send + Sync + 'static {
     /// Value of `amount` collateral in loan-token base units at the protocol's oracle price.
     fn collateral_value(&self, market: &Self::Market, snap: &Self::Snapshot, amount: U256) -> U256;
 
+    /// USD per whole loan token (profits, gas trade-offs and bids are compared in USD). None = no
+    /// price model for this loan token: such a market is refused rather than mispriced.
+    fn loan_usd(&self, market: &Self::Market, snap: &Self::Snapshot, eth_usd: f64) -> Option<f64>;
+
     /// ETH/USD derived from tracked markets, for gas accounting; `None` = use the configured
     /// fallback.
     fn eth_usd(&self, _markets: &[Self::Market], _snaps: &[Option<Self::Snapshot>]) -> Option<f64> {
         None
     }
+}
+
+/// The protocol's own liquidation call, as a contract that already holds the repayment makes it
+/// (no callback): `target` pulls the debt token from the caller and sends it the collateral.
+#[derive(Debug, Clone)]
+pub struct LiquidationTx {
+    pub target: Address,
+    pub calldata: alloy::primitives::Bytes,
+    /// What the call pulls (and what the profit is counted in).
+    pub debt_token: Address,
+    /// What the call sends.
+    pub collateral_token: Address,
+}
+
+/// A protocol that can be liquidated by a caller holding the repayment up front (Aave-style
+/// `liquidationCall`; Morpho's `liquidate` without callback data works the same way). This is what
+/// `flash_venue::FlashLiquidatorVenue` needs to flash-fund a liquidation.
+pub trait DirectLiquidation: LendingProtocol {
+    /// The call that seizes `seize` collateral of `user` in `market` while repaying `repay` of debt.
+    fn liquidation_call(&self, market: &Self::Market, user: Address, seize: U256, repay: U256) -> LiquidationTx;
 }

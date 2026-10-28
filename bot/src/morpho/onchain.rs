@@ -26,6 +26,7 @@ sol! {
         function idToMarketParams(bytes32 id) external view returns (MarketParams memory);
         function market(bytes32 id) external view returns (MarketState memory);
         function position(bytes32 id, address user) external view returns (PositionState memory);
+        function liquidate(MarketParams marketParams, address borrower, uint256 seizedAssets, uint256 repaidShares, bytes data) external returns (uint256, uint256);
     }
     interface IOracle { function price() external view returns (uint256); }
     interface IIrm { function borrowRateView(MarketParams memory marketParams, MarketState memory market) external view returns (uint256); }

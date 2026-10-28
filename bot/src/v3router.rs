@@ -33,10 +33,12 @@ use anyhow::{Context, Result};
 use futures::future::join_all;
 use serde::Deserialize;
 
-use crate::morpho::onchain::multicall;
+use crate::{morpho::onchain::multicall, venue::SimFee};
 
 /// Placeholder address the quoter is injected at (never deployed).
 pub const SIM_QUOTER: Address = address!("00000000000000000000000000000000000b0772");
+/// Caller of fee-priced quote calls (given a balance override).
+const QUOTE_CALLER: Address = address!("00000000000000000000000000000000000b0775");
 /// Extra gas a balance-share sink leg costs (token0/token1 + balanceOf lookups).
 const GAS_PER_SHARE_LEG: u64 = 8_000;
 
@@ -286,7 +288,7 @@ impl V3Router {
         Ok(&self.routes[&market])
     }
 
-    async fn quote_legs<P: Provider>(&self, p: &P, legs: &[&Leg], unit: U256, block: BlockId, ov: &StateOverride) -> Vec<Curve> {
+    async fn quote_legs<P: Provider>(&self, p: &P, legs: &[&Leg], unit: U256, block: BlockId, ov: &StateOverride, fee: Option<SimFee>) -> Vec<Curve> {
         let k = self.grid_points.max(1);
         let amounts: Vec<U256> = (1..=k).map(|i| unit * U256::from(i)).collect();
         let calls = legs.iter().map(|leg| {
@@ -296,7 +298,10 @@ impl V3Router {
             }
             .abi_encode()
             .into();
-            let tx = TransactionRequest::default().with_to(SIM_QUOTER).with_input(data).with_gas_limit(60_000_000);
+            let mut tx = TransactionRequest::default().with_to(SIM_QUOTER).with_input(data).with_gas_limit(60_000_000);
+            if let Some(f) = fee {
+                tx = tx.with_from(QUOTE_CALLER).with_max_fee_per_gas(f.max_fee_per_gas).with_max_priority_fee_per_gas(f.max_priority_fee_per_gas);
+            }
             async move {
                 let out = p.call(tx).block(block).overrides(ov.clone()).await?;
                 let r = IGridQuoter::quoteCall::abi_decode_returns(&out)?;
@@ -315,16 +320,23 @@ impl V3Router {
 
     /// Quotes every leg in parallel. `max_conn` bounds the connector grid (an estimate of the
     /// connector amount all collateral would buy, e.g. from oracle prices, with headroom).
-    pub async fn grid<P: Provider>(&self, p: &P, market: usize, max_seize: U256, max_conn: U256, block: BlockId, extra: &StateOverride) -> Result<Grid> {
+    /// `fee` = the fee fields the quote calls carry, so pools that read tx.gasprice (priority-fee
+    /// taxes, dynamic fees) quote what the real tx would get; the caller gets a balance override.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn grid<P: Provider>(&self, p: &P, market: usize, max_seize: U256, max_conn: U256, block: BlockId, extra: &StateOverride, fee: Option<SimFee>) -> Result<Grid> {
         let r = self.routes.get(&market).context("no routes discovered for market")?;
         let k = self.grid_points.max(1);
         let unit = max_seize / U256::from(k);
         let conn_unit = max_conn / U256::from(k);
         let mut ov = extra.clone();
         ov.insert(SIM_QUOTER, AccountOverride { code: Some(self.quoter_code.clone()), ..Default::default() });
+        if fee.is_some() {
+            // eth_call checks the caller can pay gas_limit x maxFeePerGas.
+            ov.insert(QUOTE_CALLER, AccountOverride { balance: Some(U256::from(u128::MAX)), ..Default::default() });
+        }
         let sources: Vec<&Leg> = r.direct.iter().chain(&r.to_conn).collect();
         let sinks: Vec<&Leg> = if r.to_conn.is_empty() { vec![] } else { r.sinks.iter().collect() };
-        let (src, snk) = tokio::join!(self.quote_legs(p, &sources, unit, block, &ov), self.quote_legs(p, &sinks, conn_unit, block, &ov));
+        let (src, snk) = tokio::join!(self.quote_legs(p, &sources, unit, block, &ov, fee), self.quote_legs(p, &sinks, conn_unit, block, &ov, fee));
         Ok(Grid { unit, sources: src, conn_unit, sinks: snk })
     }
 

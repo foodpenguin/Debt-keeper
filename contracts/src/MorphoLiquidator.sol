@@ -62,6 +62,9 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
     /// @dev Pool whose swap() is running right now, and the most it may ask to be paid.
     address private transient activePool;
     uint256 private transient activeMaxIn;
+    /// @dev Route mode: the pooled connector token split by share across sink hops (bit2), whose
+    ///      rounding remainder is swept after the liquidation.
+    address private transient connectorInFlight;
 
     /// @dev Packed production entry (see fallback): tag(1) loan(20) collateral(20) oracle(20) irm(20)
     ///      lltv(8) borrower(20) seized(16) minProfit(16) deadlineBlock(4) | route...
@@ -190,6 +193,9 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
         inFlight = true;
         collateralInFlight = marketParams.collateralToken;
         expectedCollateral = seizedAssets;
+        // Transient state lives for the whole tx: a second liquidation in the same tx (a solver
+        // bundling several) must not inherit the previous one's connector.
+        connectorInFlight = address(0);
         MORPHO.liquidate(marketParams, borrower, seizedAssets, 0, data);
         inFlight = false;
 
@@ -197,6 +203,13 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
         // collateral behind and needs the sweep.
         bool sweep = data[0] != MODE_ROUTE;
         profit = _settle(marketParams.loanToken, marketParams.collateralToken, minProfit, sweep);
+        // A pooled connector (e.g. WETH between collateral and loan pools) can keep a rounding
+        // remainder after the share-split sink hops: swept too, so nothing stays at rest.
+        address connector = connectorInFlight;
+        if (connector != address(0) && connector != marketParams.loanToken) {
+            uint256 rest = IERC20Min(connector).balanceOf(address(this));
+            if (rest > 0) _safeTransfer(connector, PROFIT_RECEIVER, rest);
+        }
     }
 
     /// @dev Called by Morpho after the collateral has been sent to this contract.
@@ -251,6 +264,7 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
             } else if (flags & 4 != 0) {
                 address tokenIn = zeroForOne ? IV3Pool(pool).token0() : IV3Pool(pool).token1();
                 amountIn = IERC20Min(tokenIn).balanceOf(address(this)) * amountIn / 10_000;
+                connectorInFlight = tokenIn;
             } else {
                 spent += amountIn;
             }
@@ -306,7 +320,9 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
         emit TargetAllowed(target, allowed);
     }
 
-    /// @notice Executor may pause (bot self-stop on anomalies); only owner may resume.
+    /// @notice The executor (hot wallet) or the owner may pause, e.g. an operator stop with the hot
+    ///         key at hand (the bot itself never calls it; its kill switch is a file); only owner may
+    ///         resume.
     function pause() external {
         if (msg.sender != owner && msg.sender != executor) revert Unauthorized();
         paused = true;

@@ -39,9 +39,17 @@ mode = "shadow"                # "live" also needs `watch --live`, a deployed li
 # keystore_password_env = "BOT_KEYSTORE_PASSWORD"       # read once, then removed; else a prompt
 # extra_broadcast = ["https://mainnet-sequencer.base.org"]   # opt-in; never in a fork/test config
 # min_profit_keep = 0.5        # on-chain minProfit = simulated profit x this
+# max_inflight = 3             # liquidation txs in flight at once (consecutive nonces); 1 = one at a time
 # max_failures_in_window = 3   # failed/dropped txs within failure_window_secs pause sending for
 #                              # failure_cooldown_secs, then it resumes by itself
 # liquidator = "0x..."         # set after deployment; until then simulations inject the bytecode
+# venue = "callback"           # "callback" = MorphoLiquidator (Morpho funds the repayment in its callback)
+#                              # "flash" = FlashLiquidator (flash-borrows the repayment: the path for
+#                              # protocols without a liquidate callback; aggregator exits only)
+# flash_liquidator = "0x..."   # deployed FlashLiquidator; unset = injected bytecode in simulations
+# flash_funding = "morpho"     # "morpho" (Morpho Blue flash loan) or "v4" (Uniswap V4 flash accounting)
+# pool_manager = "0x498581fF718922c3f8e6A244956aF099B2652b2b"   # Uniswap V4 PoolManager (Base)
+# flash_headroom_bps = 10      # borrowed on top of the planned repayment (accrued interest)
 executor = "0x000000000000000000000000000000000000dEaD"   # hot wallet ADDRESS only, never the key
 liquidator_artifact = "../contracts/out/MorphoLiquidator.sol/MorphoLiquidator.json"
 kyber_api = "https://aggregator-api.kyberswap.com/base/api/v1"
@@ -109,6 +117,17 @@ solver_gas_limit = 6000000     # the DappControl's solverGasLimit: liquidations 
 max_concurrent = 1             # valuations at once (they share the RPC pool)
 paper_margins = [0.01, 0.05, 0.1]   # dashboard paper trading: bid = bundle net x (1 - m) vs the decoded winning bid
 paper_deadline_ms = 2000       # a valuation later than this after the auction could not have bid in time
+
+# The AtlasLiquidationSolver venue, SIMULATION ONLY: the top position of each valued auction is also
+# wrapped into a solver operation (bid = its net x (1 - margin)) and simulated against an Atlas
+# stand-in; the net after the bid is journaled. Nothing is signed or submitted.
+[atlas.solver]
+simulate = false
+# address = "0x..."            # deployed AtlasLiquidationSolver; unset = injected bytecode
+# liquidator = "0x..."         # deployed MorphoLiquidator owned by the solver (executor = receiver = solver)
+# signer = "0x..."             # the solver operation signer; default: exec.executor
+# bid_router = "0x2626664c2603336E57B271c5C0b26F421741e481"   # Uniswap V3 SwapRouter02 (exactOutputSingle) for the ETH bid
+# bid_fee = 500                # fee tier of the loan token / WETH pool the bid is bought in
 
 # `bot dashboard`: durable SQLite history + data/dashboard.html.
 [dashboard]
