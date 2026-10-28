@@ -13,7 +13,7 @@
 //! The plumbing (RPC pool, heads, executor, simulation, gates) comes from `onchain-core` and is
 //! re-exported here under its usual module names.
 
-pub use onchain_core::{actor, chain, executor, gates, heads, num, rpc};
+pub use onchain_core::{actor, bid, chain, executor, gates, heads, num, rpc};
 
 pub mod atlas;
 pub mod atlas_venue;

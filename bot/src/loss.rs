@@ -38,6 +38,9 @@ pub struct LossTracker {
 pub struct LiquidationRow {
     pub kind: String,
     pub block: u64,
+    /// Block timestamp (0 in rows written before it was recorded).
+    #[serde(default)]
+    pub timestamp: u64,
     pub tx: B256,
     pub tx_index: u64,
     pub market: String,
@@ -53,6 +56,12 @@ pub struct LiquidationRow {
     /// Seized collateral valued at the oracle price of the block we processed it in.
     pub seized_value: f64,
     pub gross_bonus: f64,
+    /// `gross_bonus` in USD (the protocol's loan-token price); None = no price model.
+    #[serde(default)]
+    pub gross_usd: Option<f64>,
+    /// The tx's `to` (an Atlas metacall's priority fee is not the race's bid).
+    #[serde(default)]
+    pub tx_to: Option<Address>,
     pub bad_debt: f64,
     /// seen_first | below_min_bonus | interest_edge | same_block | untracked
     pub outcome: String,
@@ -70,6 +79,7 @@ pub struct LiquidationRow {
 
 pub struct TxInfo {
     pub eoa: Address,
+    pub to: Option<Address>,
     pub priority_fee_wei: u128,
     pub fee_wei: U256,
 }
@@ -78,8 +88,19 @@ impl LiquidationRow {
     /// Fills the sender / fee fields once the tx lookup is done (it runs off the hot path).
     pub fn apply_tx(&mut self, tx: TxInfo, eth_usd: f64) {
         self.eoa = Some(tx.eoa);
+        self.tx_to = tx.to;
         self.priority_fee_gwei = Some(tx.priority_fee_wei as f64 / 1e9);
         self.fee_usd = Some(math::units(tx.fee_wei, 18) * eth_usd);
+    }
+
+    /// This liquidation as a race someone won by priority fee: (unix time, priority fee per gas in
+    /// wei, gross USD it took). None for our own (`ours` = our liquidator), for Atlas metacalls
+    /// (`atlas`: the priority fee is the bundler's, the race was the auction), and for rows that
+    /// lack the fee lookup, the USD price or the time.
+    pub fn winning_bid(&self, ours: Address, atlas: Address) -> Option<(u64, u128, f64)> {
+        let (prio_gwei, gross_usd) = (self.priority_fee_gwei?, self.gross_usd?);
+        let theirs = self.liquidator != ours && self.tx_to != Some(atlas);
+        (theirs && self.timestamp > 0 && gross_usd > 0.0).then_some((self.timestamp, (prio_gwei * 1e9).round() as u128, gross_usd))
     }
 }
 
@@ -141,6 +162,9 @@ impl LossTracker {
         LiquidationRow {
             kind: "liquidation".into(),
             block: ev.block,
+            timestamp: 0,
+            gross_usd: None,
+            tx_to: tx.as_ref().and_then(|t| t.to),
             tx: ev.tx,
             tx_index: ev.tx_index,
             market: meta.name.clone(),
@@ -237,5 +261,32 @@ pub fn report(rows: &[LiquidationRow]) {
             prio / cnt as f64,
             idx[idx.len() / 2]
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(extra: &str) -> LiquidationRow {
+        let line = format!(
+            r#"{{"kind":"liquidation","block":7,"tx":"0x{}","tx_index":0,"market":"WETH/USDC","borrower":"0x{}","liquidator":"0x{}","eoa":null,"priority_fee_gwei":0.02,"fee_usd":0.01,"repaid":100.0,"seized_value":105.0,"gross_bonus":5.0,"bad_debt":0.0,"outcome":"same_block","our_first_block":null,"our_candidate_block":null,"delay_blocks":null,"first_hf":null,"prev_block_hf":null,"our_plan_block":null,"our_plan_net_usd":null,"our_plan_error":null{extra}}}"#,
+            "11".repeat(32),
+            "22".repeat(20),
+            "33".repeat(20)
+        );
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn a_journal_row_is_a_winning_bid_only_when_it_was_someone_elses_race() {
+        let (ours, atlas, theirs) = (Address::repeat_byte(0x44), Address::repeat_byte(0x55), Address::repeat_byte(0x33));
+        // Written before the time / USD fields existed: still parses, but is no observation.
+        assert_eq!(row("").winning_bid(ours, atlas), None);
+        let r = row(r#","timestamp":1700000000,"gross_usd":5.0,"tx_to":"0x6666666666666666666666666666666666666666""#);
+        assert_eq!(r.winning_bid(ours, atlas), Some((1_700_000_000, 20_000_000, 5.0)));
+        assert_eq!(r.winning_bid(theirs, atlas), None, "our own liquidation");
+        let via_atlas = row(r#","timestamp":1700000000,"gross_usd":5.0,"tx_to":"0x5555555555555555555555555555555555555555""#);
+        assert_eq!(via_atlas.winning_bid(ours, atlas), None, "an Atlas metacall: the race was the auction");
     }
 }

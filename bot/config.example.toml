@@ -39,7 +39,7 @@ mode = "shadow"                # "live" also needs `watch --live`, a deployed li
 # keystore_password_env = "BOT_KEYSTORE_PASSWORD"       # read once, then removed; else a prompt
 # extra_broadcast = ["https://mainnet-sequencer.base.org"]   # opt-in; never in a fork/test config
 # min_profit_keep = 0.5        # on-chain minProfit = simulated profit x this
-# max_inflight = 3             # liquidation txs in flight at once (consecutive nonces); 1 = one at a time
+# max_inflight = 1             # liquidation txs in flight at once (consecutive nonces, one per market); default 1
 # max_failures_in_window = 3   # failed/dropped txs within failure_window_secs pause sending for
 #                              # failure_cooldown_secs, then it resumes by itself
 # liquidator = "0x..."         # set after deployment; until then simulations inject the bytecode
@@ -60,6 +60,16 @@ deadline_secs = 4.0            # tx valid this long; converted to blocks with th
 replan_blocks = 5
 max_plans_per_block = 3
 eth_usd_fallback = 2400.0      # until an on-chain ETH price is read
+# Bidding (risk.rs, onchain_core::bid): just above what past winners paid per USD of gross, up to a
+# share of the net that grows with its size; never below priority_fee_wei, never above the cap.
+# max_priority_fee_wei = 1000000000   # hard cap (1 gwei)
+# priority_fee_share = 0.3     # share of the net a small liquidation may bid...
+# bid_share_large = 0.9        # ...rising to this at bid_large_net_usd (unset = priority_fee_share)
+# bid_large_net_usd = 1000.0
+# bid_quantile = 0.9           # beat 90% of past winners (priority per USD of gross)...
+# bid_outbid_bps = 500         # ...by 5%
+# bid_min_samples = 5          # winners needed before the model is used (per market, else all markets)
+# bid_window_secs = 604800     # winners older than this are forgotten; seeded from the journal at start
 
 [router]
 mode = "best"                  # best = direct + aggregator (Kyber) in parallel, keep the better; or "direct" / "aggregator" ("kyber" = alias)

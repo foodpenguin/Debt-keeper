@@ -25,6 +25,7 @@ use alloy::sol;
 
 use liquidation_framework::{
     actor::{self, ExecHandle},
+    bid::WinningBids,
     atlas, atlas_venue, config, dash, dex, executor, flash_venue, flashblocks, funding, gates, heads, live, loss, morpho, oracle, planner, protocol, risk, rpc, sim, v3router, venue,
     config::Config,
     engine::JournalRow,
@@ -679,12 +680,53 @@ struct PlannerParts {
     atlas_surcharge: f64,
     v3: v3router::V3Router,
     exec: config::ExecConfig,
+    /// What winners of past liquidations paid (the risk gate bids against it; see risk.rs).
+    bids: std::sync::Mutex<WinningBids>,
 }
 
 impl PlannerParts {
     fn planner<'a>(&'a self, mode: &'a str) -> Planner<'a, Morpho, Venue, Kyber> {
         Planner { protocol: &self.protocol, aggregator: &self.kyber, venue: &self.venue, cfg: &self.exec, v3: Some(&self.v3), mode }
     }
+
+    /// The competition model's priority per USD of gross for `market` now (None = too few winners
+    /// observed).
+    fn competition(&self, market: &str, now_unix: u64) -> Option<f64> {
+        let e = &self.exec;
+        self.bids.lock().unwrap().ratio_quantile(market, now_unix, e.bid_quantile, e.bid_min_samples)
+    }
+
+    /// A liquidation someone else won: its priority fee per gas against the gross it took. Atlas
+    /// metacalls are left out (their priority fee is the bundler's, the race was the auction), and
+    /// so are our own liquidations.
+    fn observe_winner(&self, row: &loss::LiquidationRow, ours: Address, atlas: Address) {
+        if let Some((at, prio_wei, gross_usd)) = row.winning_bid(ours, atlas) {
+            self.bids.lock().unwrap().observe(&row.market, at, prio_wei, gross_usd);
+        }
+    }
+}
+
+/// Seeds the competition model from the liquidations already in the journal (the last
+/// `JOURNAL_SEED_BYTES` of it), so a restart does not forget the competition.
+fn seed_winning_bids(parts: &PlannerParts, journal_path: &str, ours: Address, atlas: Address) {
+    const JOURNAL_SEED_BYTES: u64 = 64 << 20;
+    use std::io::{BufRead, Seek};
+    let Ok(mut f) = std::fs::File::open(journal_path) else { return };
+    let len = f.metadata().map_or(0, |m| m.len());
+    if f.seek(std::io::SeekFrom::Start(len.saturating_sub(JOURNAL_SEED_BYTES))).is_err() {
+        return;
+    }
+    let mut n = 0usize;
+    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+        if !line.contains("\"kind\":\"liquidation\"") {
+            continue;
+        }
+        if let Ok(row) = serde_json::from_str::<loss::LiquidationRow>(&line) {
+            parts.observe_winner(&row, ours, atlas);
+            n += 1;
+        }
+    }
+    info!(liquidations = n, "competition model seeded from the journal");
 }
 
 /// Same-block (Flashblocks) mode state.
@@ -835,7 +877,7 @@ async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngi
     let price = base.price * U256::from(10_000 - drop_bps) / U256::from(10_000u64);
     let m = auction_market(engine, mi, &base, price);
     let (kyber, simulator) = build_planner_parts(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone() });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)) });
     let a = atlas::Auction {
         id: format!("replay-{market}-{at_block}"),
         aggregator: Address::ZERO,
@@ -1196,7 +1238,7 @@ async fn on_oracle_update<P: Provider + Clone>(
                 Ok(plan) => {
                     planned.insert((mi, v.user), (u.block, ready_ms, plan.net_usd));
                     let kill = std::path::Path::new(&engine.cfg.exec.kill_switch_file).exists();
-                    let decision = risk::decide(&engine.cfg.exec, budget, &plan, eth_usd, head.base_fee, head.timestamp, kill);
+                    let decision = risk::decide(&engine.cfg.exec, budget, &plan, eth_usd, head.base_fee, head.timestamp, kill, parts.competition(&meta.name, head.timestamp));
                     let send_ok = may_send(u.path, state);
                     info!(market = %meta.name, user = %v.user, hf = v.hf, block = u.block, flashblock = u.index, state, ready_ms, net_usd = ?plan.net_usd, error = ?plan.error, decision = ?decision, "FLASHBLOCK PLAN");
                     writeln!(
@@ -1421,7 +1463,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         .with_context(|| format!("opening journal {}", engine.cfg.journal_path))?;
     let (kyber, simulator) = build_planner_parts(engine).await?;
     let v3 = build_v3(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone() });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)) });
 
     // Watchlist rows are journaled only when a position enters it or its HF moves > 0.2%.
     let mut last_logged_hf: HashMap<(usize, Address), f64> = HashMap::new();
@@ -1467,6 +1509,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     let mut prev_snaps: Option<Vec<Option<morpho::onchain::MarketSnapshot>>> = None;
     let market_ids = engine.market_ids();
     let liquidator = venue::LiquidationVenue::<Morpho>::target(&parts.venue);
+    seed_winning_bids(&parts, &engine.cfg.journal_path, liquidator, engine.cfg.flashblocks.atlas);
     if exec.is_some() {
         warn!(from_block = last_block + 1, ws = ws.is_some(), %liquidator, max_inflight = engine.cfg.exec.max_inflight, "LIVE mode: watching blocks, approved liquidations WILL be sent");
     } else {
@@ -1643,7 +1686,11 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             .iter()
             .map(|(mi, ev)| {
                 let ever = engine.ever_tracked.contains(&(*mi, ev.borrower));
-                tracker.classify(*mi, ev, &engine.metas[*mi], snaps[*mi].as_ref(), ever, None, eth_usd)
+                let (meta, snap) = (&engine.metas[*mi], snaps[*mi].as_ref());
+                let mut row = tracker.classify(*mi, ev, meta, snap, ever, None, eth_usd);
+                row.timestamp = h.timestamp;
+                row.gross_usd = snap.and_then(|s| protocol::LendingProtocol::loan_usd(&engine.protocol, meta, s, meta.params.loanToken, eth_usd)).map(|u| row.gross_bonus * u);
+                row
             })
             .collect();
         tracker.on_views(number, &views, engine.cfg.min_bonus);
@@ -1713,7 +1760,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                 Ok(plan) => {
                     tracker.on_plan((v.market, v.user), number, plan.net_usd, plan.error.clone());
                     let kill = std::path::Path::new(&engine.cfg.exec.kill_switch_file).exists();
-                    let decision = risk::decide(&engine.cfg.exec, &mut budget.borrow_mut(), &plan, eth_usd, h.base_fee, h.timestamp, kill);
+                    let decision = risk::decide(&engine.cfg.exec, &mut budget.borrow_mut(), &plan, eth_usd, h.base_fee, h.timestamp, kill, parts.competition(&meta.name, h.timestamp));
                     info!(
                         block = number, market = %meta.name, user = %v.user, hf = v.hf,
                         quoted_gross = plan.quoted_gross, net_usd = ?plan.net_usd, error = ?plan.error, decision = ?decision,
@@ -1776,7 +1823,10 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             let costs = futures::future::join_all(liq_rows.iter().map(|r| morpho::events::tx_cost(&engine.provider, r.tx))).await;
             for (row, cost) in liq_rows.iter_mut().zip(costs) {
                 match cost {
-                    Ok((eoa, prio, fee)) => row.apply_tx(loss::TxInfo { eoa, priority_fee_wei: prio, fee_wei: fee }, eth_usd),
+                    Ok((eoa, to, prio, fee)) => {
+                        row.apply_tx(loss::TxInfo { eoa, to, priority_fee_wei: prio, fee_wei: fee }, eth_usd);
+                        parts.observe_winner(row, liquidator, engine.cfg.flashblocks.atlas);
+                    }
                     Err(e) => warn!(tx = %row.tx, error = %e, "receipt lookup failed"),
                 }
                 info!(

@@ -82,7 +82,8 @@ pub async fn touched_positions<P: Provider>(p: &P, morpho: Address, markets: &[B
 }
 
 /// Who sent a transaction and what it paid: (from EOA, priority fee per gas, total fee incl. L1, in wei).
-pub async fn tx_cost<P: Provider>(p: &P, tx: B256) -> Result<(Address, u128, U256)> {
+/// (sender, `to`, priority fee per gas, total fee incl. the L1 fee) of a mined tx.
+pub async fn tx_cost<P: Provider>(p: &P, tx: B256) -> Result<(Address, Option<Address>, u128, U256)> {
     // Raw JSON so the OP-stack `l1Fee` receipt field is available.
     let r: Value = p.raw_request("eth_getTransactionReceipt".into(), (tx,)).await?;
     let t: Value = p.raw_request("eth_getTransactionByHash".into(), (tx,)).await?;
@@ -90,7 +91,8 @@ pub async fn tx_cost<P: Provider>(p: &P, tx: B256) -> Result<(Address, u128, U25
     let from: Address = r["from"].as_str().unwrap_or_default().parse().unwrap_or_default();
     let fee = hex(&r["gasUsed"]) * hex(&r["effectiveGasPrice"]) + hex(&r["l1Fee"]);
     let prio = hex(&t["maxPriorityFeePerGas"]).to::<u128>();
-    Ok((from, prio, fee))
+    let to = r["to"].as_str().and_then(|s| s.parse().ok());
+    Ok((from, to, prio, fee))
 }
 
 #[cfg(test)]

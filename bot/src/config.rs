@@ -583,9 +583,26 @@ pub struct ExecConfig {
     pub min_net_usd: f64,
     #[serde(default = "default_max_prio")]
     pub max_priority_fee_wei: u128,
-    /// Share of the expected net profit bid as priority fee.
+    /// Share of the expected net profit a bid may use (on top of priority_fee_wei; see risk.rs).
     #[serde(default = "default_prio_share")]
     pub priority_fee_share: f64,
+    /// The share rises linearly from priority_fee_share to this at bid_large_net_usd net (unset =
+    /// priority_fee_share throughout): a large liquidation may bid most of its profit.
+    #[serde(default)]
+    pub bid_share_large: Option<f64>,
+    #[serde(default = "default_bid_large")]
+    pub bid_large_net_usd: f64,
+    /// The competition: the bid_quantile of what past winners paid per USD of gross (within
+    /// bid_window_secs) x this plan's gross, outbid by bid_outbid_bps. Fewer than bid_min_samples
+    /// winners seen = no model (the share alone).
+    #[serde(default = "default_bid_quantile")]
+    pub bid_quantile: f64,
+    #[serde(default = "default_bid_outbid")]
+    pub bid_outbid_bps: u32,
+    #[serde(default = "default_bid_samples")]
+    pub bid_min_samples: usize,
+    #[serde(default = "default_bid_window")]
+    pub bid_window_secs: u64,
     /// Priority fee assumed when deciding whether an extra route leg pays for its gas.
     #[serde(default = "default_planning_prio")]
     pub planning_priority_fee_wei: u128,
@@ -655,6 +672,21 @@ fn default_max_prio() -> u128 {
 }
 fn default_prio_share() -> f64 {
     0.3
+}
+fn default_bid_large() -> f64 {
+    1_000.0
+}
+fn default_bid_quantile() -> f64 {
+    0.9
+}
+fn default_bid_outbid() -> u32 {
+    500
+}
+fn default_bid_samples() -> usize {
+    5
+}
+fn default_bid_window() -> u64 {
+    7 * 86_400
 }
 fn default_deadline_secs() -> f64 {
     4.0
