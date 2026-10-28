@@ -1,0 +1,29 @@
+# Local research notes (not part of the framework)
+research/
+__pycache__/
+*.pyc
+
+# Rust
+bot/target/
+target/
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Secrets: never commit keys, keystores or local configs
+.env
+.env.*
+!.env.example
+*.keystore
+keystore/
+keystores/
+bot/config*.local.toml
+bot/data/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

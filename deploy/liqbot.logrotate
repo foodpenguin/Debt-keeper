@@ -1,0 +1,10 @@
+# ~8 MB of log per day in shadow mode; keep two weeks. copytruncate: the service keeps its fd.
+@REPO@/bot/data/shadow_run.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su @USER@ @USER@
+}

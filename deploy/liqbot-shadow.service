@@ -1,0 +1,31 @@
+# Shadow-mode liquidation bot (never sends transactions). Installed by scripts/setup_wsl.sh
+# --install-service with @REPO@ / @USER@ filled in.
+#   sudo systemctl status liqbot-shadow     # state
+#   sudo systemctl restart liqbot-shadow    # after a rebuild
+#   sudo systemctl stop liqbot-shadow       # stop
+[Unit]
+Description=Base Morpho liquidation bot (shadow mode)
+Wants=network-online.target
+After=network-online.target
+# Restart back-off window (these keys belong in [Unit]): at most 10 starts per 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@REPO@/bot
+ExecStart=@REPO@/bot/target/release/bot -c config.local.toml watch
+Environment=NO_COLOR=1
+Environment=RUST_LOG=info
+# Restart after crashes or RPC outages, but back off if it keeps failing.
+Restart=always
+RestartSec=15
+StandardOutput=append:@REPO@/bot/data/shadow_run.log
+StandardError=append:@REPO@/bot/data/shadow_run.log
+# Shadow mode needs no privileges.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

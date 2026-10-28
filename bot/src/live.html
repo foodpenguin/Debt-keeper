@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live HF Monitor</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e4e3df;
+    --bad: #c62828; --warn: #d9822b; --soft: #b8860b; --ok: #2e7d32; --accent: #2f5fb3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141413; --panel: #1d1d1b; --text: #ecebe6; --muted: #9a9993; --line: #33332f;
+            --bad: #ef6b6b; --warn: #f0a050; --soft: #d9b84a; --ok: #6cc070; --accent: #7aa5f0; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 16px; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 12px; }
+  h1 { font-size: 18px; margin: 0; }
+  .fresh { font-variant-numeric: tabular-nums; color: var(--muted); }
+  .fresh.stale { color: var(--bad); font-weight: 600; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .chip { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; min-width: 150px; }
+  .chip b { display: block; font-size: 13px; }
+  .chip span { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .chip .liq { color: var(--bad); font-weight: 600; }
+  .wrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { padding: 6px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+  td.l, th.l { text-align: left; }
+  tr:last-child td { border-bottom: 0; }
+  .hf-liq { color: var(--bad); font-weight: 700; }
+  .hf-102 { color: var(--warn); font-weight: 600; }
+  .hf-105 { color: var(--soft); }
+  a { color: var(--accent); text-decoration: none; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Positions closest to liquidation</h1>
+    <div id="fresh" class="fresh">Loading…</div>
+  </header>
+  <div id="chips" class="chips"></div>
+  <div class="wrap">
+    <table>
+      <thead><tr>
+        <th>#</th><th class="l">Market</th><th class="l">Borrower</th><th>HF</th><th>Debt (USD)</th>
+        <th>Collateral</th><th>Price</th><th>Liq. price</th><th>Drop to liq.</th><th class="l">Status</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <p class="note">HF is recomputed by the liquidation bot every block (accrued interest included); liquidation price = price ÷ HF. Refreshes every 2 s; the data lives only in memory and one snapshot file (no history is kept).</p>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const num = (x, d = 2) => x == null || !isFinite(x) ? "—" : Number(x).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
+const px = x => x == null ? "—" : x >= 100 ? num(x, 2) : x >= 1 ? num(x, 4) : num(x, 6);
+const hfClass = h => h < 1 ? "hf-liq" : h < 1.02 ? "hf-102" : h < 1.05 ? "hf-105" : "";
+let last = null;
+
+async function tick() {
+  try {
+    const r = await fetch("/live.json", { cache: "no-store" });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    last = d;
+    render(d);
+  } catch (e) {
+    $("fresh").textContent = "Cannot read the snapshot: " + e.message;
+    $("fresh").className = "fresh stale";
+  }
+}
+
+function render(d) {
+  $("chips").innerHTML = d.markets.map(m =>
+    `<div class="chip"><b>${esc(m.name)}</b><span>Price ${px(m.price)}</span><br>` +
+    `<span>${m.liquidatable ? `<span class="liq">Liquidatable ${m.liquidatable}</span> · ` : ""}HF&lt;1.02: ${m.below_1_02} · HF&lt;1.05: ${m.below_1_05}` +
+    `${m.debt_below_1_05 > 0 ? ` (debt $${num(m.debt_below_1_05, 0)})` : ""}</span></div>`).join("");
+  $("rows").innerHTML = d.top.map((p, i) => {
+    const sym = p.market.split("/")[0];
+    const status = p.liquidatable ? '<span class="hf-liq">Liquidatable</span>' : p.hf < 1.02 ? '<span class="hf-102">Close</span>' : "";
+    return `<tr><td>${i + 1}</td><td class="l">${esc(p.market)}</td>` +
+      `<td class="l"><a href="https://basescan.org/address/${esc(p.borrower)}" target="_blank" rel="noopener">${esc(p.borrower.slice(0, 6))}…${esc(p.borrower.slice(-4))}</a></td>` +
+      `<td class="${hfClass(p.hf)}">${num(p.hf, 4)}</td><td>${num(p.debt, 2)}</td>` +
+      `<td>${p.collateral == null ? "—" : num(p.collateral, 4) + " " + esc(sym)}</td>` +
+      `<td>${px(p.price)}</td><td>${px(p.liq_price)}</td>` +
+      `<td>${p.drop_to_liq_pct <= 0 ? "—" : num(p.drop_to_liq_pct, 2) + "%"}</td><td class="l">${status}</td></tr>`;
+  }).join("");
+  ageTick();
+}
+
+function ageTick() {
+  if (!last) return;
+  const age = Date.now() / 1000 - last.written;
+  const el = $("fresh");
+  el.textContent = `Block ${last.block.toLocaleString("en-US")} · updated ${age < 1 ? "just now" : Math.round(age) + " s ago"}`;
+  el.className = "fresh" + (age > 10 ? " stale" : "");
+}
+
+tick();
+setInterval(tick, 2000);
+setInterval(ageTick, 1000);
+</script>
+</body>
+</html>

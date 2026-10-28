@@ -1,0 +1,688 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Liquidation bot dashboard</title>
+<style>
+:root {
+  --bg:#f5f6f8; --panel:#fff; --fg:#18202c; --muted:#6b7686; --faint:#9aa4b2; --line:#e6e9ee; --grid:#eef0f3;
+  --accent:#2f62d6; --atlas:#2f62d6; --direct:#12876a; --unk:#a7b0bd; --good:#12805c; --bad:#c8341f; --warn:#b06a00;
+  --chip:#eef3ff; --nav:#fbfbfc;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#0f1218; --panel:#171b23; --fg:#e7eaf0; --muted:#97a1b0; --faint:#6b7585; --line:#262c37; --grid:#1f242d;
+    --accent:#7aa2ff; --atlas:#7aa2ff; --direct:#3cc29a; --unk:#5f6876; --good:#3cc28b; --bad:#ff6b57; --warn:#f0a43a; --chip:#1d2740; --nav:#13171e; }
+}
+* { box-sizing:border-box; }
+html,body { margin:0; }
+body { background:var(--bg); color:var(--fg); font:13px/1.45 -apple-system,"Segoe UI",sans-serif; }
+a { color:var(--accent); text-decoration:none; }
+/* layout */
+.app { display:grid; grid-template-columns:196px minmax(0,1fr); min-height:100vh; }
+nav.side { position:sticky; top:0; height:100vh; background:var(--nav); border-right:1px solid var(--line); padding:16px 12px; display:flex; flex-direction:column; gap:2px; }
+nav.side h1 { font-size:14px; margin:0 6px 14px; }
+nav.side a { display:block; padding:6px 8px; border-radius:6px; color:var(--fg); }
+nav.side a:hover, nav.side a.on { background:var(--chip); }
+nav.side .fresh { margin-top:auto; font-size:11.5px; color:var(--muted); padding:8px; border-top:1px solid var(--line); }
+nav.side .fresh b { color:var(--fg); font-weight:600; }
+main { min-width:0; }
+.bar { position:sticky; top:0; z-index:5; background:color-mix(in srgb, var(--bg) 92%, transparent); backdrop-filter:blur(6px); border-bottom:1px solid var(--line);
+  padding:10px 20px; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; }
+.seg { display:inline-flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; background:var(--panel); }
+.seg button { border:0; background:none; color:var(--muted); padding:5px 10px; font:inherit; cursor:pointer; }
+.seg button.on { background:var(--chip); color:var(--fg); font-weight:600; }
+select { font:inherit; color:var(--fg); background:var(--panel); border:1px solid var(--line); border-radius:7px; padding:5px 8px; }
+.lbl { color:var(--muted); font-size:12px; }
+.chip { display:inline-flex; gap:6px; align-items:center; background:var(--chip); border-radius:999px; padding:3px 6px 3px 10px; font-size:12px; }
+.chip button { border:0; background:none; color:var(--muted); cursor:pointer; font-size:13px; }
+.spacer { flex:1; }
+.upd { color:var(--muted); font-size:12px; white-space:nowrap; }
+.upd.stale { color:var(--bad); }
+.toggle { font-size:12px; color:var(--muted); cursor:pointer; user-select:none; }
+.wrap { padding:16px 20px 60px; max-width:1500px; }
+section { margin:0 0 22px; scroll-margin-top:64px; }
+h2 { font-size:13px; font-weight:600; color:var(--muted); margin:0 0 8px; letter-spacing:.02em; }
+/* KPI cards */
+.kpis { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+.kpi { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px 8px; position:relative; min-height:96px; cursor:default; }
+.kpi[data-go] { cursor:pointer; }
+.kpi .k { color:var(--muted); font-size:12px; display:flex; gap:4px; align-items:center; }
+.kpi .v { font-size:21px; font-weight:650; margin:3px 0 1px; font-variant-numeric:tabular-nums; }
+.kpi .s { color:var(--muted); font-size:11.5px; }
+.kpi svg { position:absolute; right:12px; top:12px; width:64px; height:20px; overflow:visible; }
+.up { color:var(--good); } .down { color:var(--bad); } .flat { color:var(--muted); }
+.good { color:var(--good); } .bad { color:var(--bad); } .warn { color:var(--warn); } .muted { color:var(--muted); }
+.dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; vertical-align:1px; }
+/* charts */
+.grid { display:grid; grid-template-columns:repeat(12,minmax(0,1fr)); gap:10px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-width:0; }
+.card .t { display:flex; align-items:center; gap:5px; font-weight:600; font-size:12.5px; margin-bottom:6px; }
+.card .t .hint { margin-left:auto; color:var(--faint); font-weight:400; font-size:11.5px; }
+.w8 { grid-column:span 8; } .w6 { grid-column:span 6; } .w4 { grid-column:span 4; } .w12 { grid-column:span 12; }
+.ch { position:relative; height:220px; } .ch.s { height:190px; }
+.empty { color:var(--faint); font-size:12px; padding:30px 0; text-align:center; }
+/* info icon */
+.i { display:inline-grid; place-items:center; width:14px; height:14px; border-radius:50%; border:1px solid var(--faint); color:var(--faint);
+  font-size:9.5px; font-style:normal; font-weight:700; cursor:help; position:relative; flex:none; }
+.i.r:hover::after, .i.r:focus::after { left:auto; right:0; transform:none; }
+.i:hover::after, .i:focus::after { content:attr(data-tip); position:absolute; left:50%; top:18px; transform:translateX(-30%); width:270px; z-index:20;
+  background:var(--fg); color:var(--bg); padding:8px 10px; border-radius:7px; font-size:11.5px; font-weight:400; line-height:1.5; white-space:normal; text-align:left; }
+/* quota bullets */
+.q { display:grid; grid-template-columns:110px 1fr 120px; gap:4px 10px; align-items:center; font-size:12px; padding:5px 0; border-bottom:1px solid var(--line); }
+.q:last-child { border:0; }
+.q .track { position:relative; height:10px; background:var(--grid); border-radius:3px; }
+.q .used { position:absolute; inset:0 auto 0 0; background:var(--accent); border-radius:3px; }
+.q .proj { position:absolute; top:-3px; bottom:-3px; width:2px; background:var(--fg); }
+.q .r { text-align:right; font-variant-numeric:tabular-nums; }
+/* tables */
+.tabs { display:flex; gap:2px; border-bottom:1px solid var(--line); margin-bottom:8px; flex-wrap:wrap; }
+.tabs button { border:0; background:none; font:inherit; padding:7px 12px; color:var(--muted); cursor:pointer; border-bottom:2px solid transparent; }
+.tabs button.on { color:var(--fg); border-color:var(--accent); font-weight:600; }
+.tabs .n { color:var(--faint); font-weight:400; margin-left:3px; }
+.tbl { overflow-x:auto; }
+#liveTbl { max-height:520px; overflow:auto; }
+.livemk { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 8px; }
+.livemk span { background:var(--chip); border-radius:6px; padding:3px 8px; font-size:12px; font-variant-numeric:tabular-nums; }
+table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
+th, td { padding:6px 8px; text-align:right; white-space:nowrap; border-bottom:1px solid var(--line); }
+th { color:var(--muted); font-weight:500; font-size:12px; cursor:pointer; user-select:none; position:sticky; top:0; background:var(--panel); }
+th.l, td.l { text-align:left; }
+th .arr { color:var(--faint); }
+tbody tr.row { cursor:pointer; }
+tbody tr.row:hover { background:var(--bg); }
+tr.open > td { background:var(--bg); }
+tr.det td { background:var(--bg); white-space:normal; text-align:left; padding:10px 14px 14px; }
+.det h4 { margin:8px 0 4px; font-size:12px; color:var(--muted); font-weight:600; }
+.det .kv { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:3px 16px; }
+.det .kv div span { color:var(--muted); margin-right:6px; }
+.det table th, .det table td { font-size:12px; padding:4px 6px; background:transparent; position:static; }
+.more { margin-top:8px; }
+.more button { font:inherit; border:1px solid var(--line); background:var(--panel); color:var(--fg); border-radius:7px; padding:5px 12px; cursor:pointer; }
+.mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; }
+.pill { display:inline-block; padding:0 7px; border-radius:999px; font-size:11.5px; background:var(--chip); }
+@media (max-width: 960px) {
+  .app { grid-template-columns:minmax(0,1fr); }
+  nav.side { position:static; height:auto; flex-direction:row; flex-wrap:wrap; padding:8px 12px; border-right:0; border-bottom:1px solid var(--line); }
+  nav.side a { white-space:nowrap; }
+  nav.side h1 { width:100%; margin:4px 6px 6px; } nav.side .fresh { display:none; }
+  .w8, .w6, .w4 { grid-column:span 12; }
+  .kpis { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .bar, .wrap { padding-left:14px; padding-right:14px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+<nav class="side">
+  <h1>Morpho liquidation bot</h1>
+  <a href="#kpi">Overview</a>
+  <a href="#live">Live positions</a>
+  <a href="#health">System health</a>
+  <a href="#liq">Liquidations</a>
+  <a href="#atlas">Atlas auctions</a>
+  <a href="#rivals">Competitor exits</a>
+  <a href="#rpc">RPC quota</a>
+  <a href="#detail">Details</a>
+  <div class="fresh" id="fresh"></div>
+</nav>
+<main>
+  <div class="bar">
+    <span class="lbl">Range</span><span class="seg" id="fRange"></span>
+    <span class="lbl">Market</span><select id="fMarket"></select>
+    <span class="lbl">Channel</span><span class="seg" id="fChan"></span>
+    <span id="chips"></span>
+    <span class="spacer"></span>
+    <span class="upd" id="upd"></span>
+    <i class="i r" tabindex="0" id="updInfo">i</i>
+    <label class="toggle"><input type="checkbox" id="auto"> Auto-refresh</label>
+  </div>
+  <div class="wrap">
+    <section id="kpi"><div class="kpis" id="kpis"></div></section>
+
+    <section id="live"><h2>Live positions (the 50 closest to liquidation, refreshed every 2 s)</h2><div class="card">
+      <div class="t">Lowest-HF positions<i class="i" tabindex="0" data-k="live">i</i><span class="hint" id="liveAge"></span></div>
+      <div id="liveMk" class="livemk"></div>
+      <div class="tbl" id="liveTbl"></div>
+    </div></section>
+
+    <section id="health"><h2>System health</h2><div class="grid">
+      <div class="card w8"><div class="t">Block latency trend<i class="i" tabindex="0" data-k="latency">i</i><span class="hint" id="hLatHint"></span></div><div class="ch" id="cLat"></div></div>
+      <div class="card w4"><div class="t">Warning events<i class="i" tabindex="0" data-k="events">i</i><span class="hint">click the legend to hide</span></div><div class="ch" id="cEvt"></div></div>
+    </div></section>
+
+    <section id="liq"><h2>Liquidations</h2><div class="grid">
+      <div class="card w8"><div class="t">Daily liquidation gross<i class="i" tabindex="0" data-k="gross">i</i><span class="hint">click a bar → that day only</span></div><div class="ch" id="cDaily"></div></div>
+      <div class="card w4"><div class="t">By market<i class="i" tabindex="0" data-k="market">i</i><span class="hint">click a bar → filter by market</span></div><div class="ch" id="cMarket"></div></div>
+    </div></section>
+
+    <section id="atlas"><h2>Atlas auctions (solver phase 0, observe only)</h2><div class="grid">
+      <div class="card w8"><div class="t">Our bundle net vs on-chain winning bid<i class="i" tabindex="0" data-k="scatter">i</i><span class="hint">above the diagonal = winnable · click for details</span></div><div class="ch" id="cScatter"></div></div>
+      <div class="card w4"><div class="t">Valuable auctions per day<i class="i" tabindex="0" data-k="adays">i</i></div><div class="ch" id="cADays"></div></div>
+      <div class="card w12"><div class="t">Paper trading (simulated bids, nothing sent)<i class="i" tabindex="0" data-k="paper">i</i><span class="hint" id="paperHint"></span></div><div class="tbl" id="paperTbl"></div></div>
+    </div></section>
+
+    <section id="rivals"><h2>Competitor exits</h2><div class="grid">
+      <div class="card w6"><div class="t">Gross by liquidator<i class="i" tabindex="0" data-k="actor">i</i><span class="hint">click a bar → that liquidator only</span></div><div class="ch" id="cActor"></div></div>
+      <div class="card w6"><div class="t">Exit kind and slippage<i class="i" tabindex="0" data-k="exitkind">i</i></div><div class="ch" id="cKind"></div></div>
+    </div></section>
+
+    <section id="rpc"><h2>RPC quota (this month, not affected by the range filter)</h2><div class="grid">
+      <div class="card w6"><div class="t">Usage this month vs free quota<i class="i" tabindex="0" data-k="quota">i</i><span class="hint">| = month-end projection</span></div><div id="cQuota"></div></div>
+      <div class="card w6"><div class="t">Requests per hour (last 7 days)<i class="i" tabindex="0" data-k="rpcreq">i</i></div><div class="ch s" id="cRpc"></div></div>
+    </div></section>
+
+    <section id="detail"><h2>Details</h2><div class="card">
+      <div class="tabs" id="tabs"></div>
+      <div class="tbl" id="table"></div>
+      <div class="more" id="more"></div>
+    </div></section>
+  </div>
+</main>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+"use strict";
+const D = /*__DATA__*/null;
+const M = D.meta, TZ = M.tz_offset, NOW = M.generated_at;
+
+// ---------------------------------------------------------------- definitions (info icons)
+const DEF = {
+  live: "Every block the liquidation bot recomputes every position's HF (accrued interest included) and writes the 50 lowest to a snapshot; this section reads it every 2 s. HF < 1 can be liquidated; liquidation price = price ÷ HF; drop to liquidation = how much further the collateral price has to fall. Live data only when the page is opened through bot live (http://localhost:8787); no history is kept.",
+  status: "How long ago the bot finished its latest block. Over 30 s counts as stalled (bot down, every RPC failing, or the host asleep).",
+  latency: "Block arrival latency = block timestamp to the bot finishing the block (head_age_ms). Card: median of the hourly p50s in the range, compared with the previous period of the same length. Chart: p50 and p90 per time bucket, and fetch time p50. Needs a synced host clock (negative values are drawn from 0).",
+  missing: "Missed blocks = blocks skipped between two processed blocks, counted in the hour of the later one (across hour boundaries too; gaps while the bot restarts do not count). Usually a fetch failure or a stalled main loop: the block is folded into the next pass, so no event data is lost.",
+  events: "WARN / ERROR log lines by kind: fetch_failed (block fetch failed), rpc_failover (switched RPC endpoint), metacall_receipt_timeout (no Atlas receipt), stream reconnects, and so on.",
+  gross: "Liquidation gross = collateral received (oracle value) − debt repaid, from the journal's gross_bonus. Monitored markets only. Channel: Atlas = metacall through a Chainlink SVR auction; Direct = any other tx; Unchecked = not verified on-chain yet.",
+  market: "Liquidation gross per market in the range, after the range, channel and liquidator filters.",
+  atlasWin: "Winnable = our bundle net is above the on-chain winning bid (bidding just above it would have won). Potential profit = the sum of those gaps. Only auctions with a bundle valuation count.",
+  scatter: "Each dot is an auction with liquidatable positions. X = on-chain winning bid, Y = our bundle net (older records: per-position sum). Diagonal y = x: above it we could have outbid the winner. Both axes are logarithmic.",
+  paper: "For every auction with a known on-chain winning bid, assume we bid bundle net × (1 − kept margin). Won = our bid (converted to ETH) beats the actual winning bid; in time = the valuation finished within the deadline after the auction opened (later is too late to bid). PnL = bundle net − our bid, i.e. what our own exit estimate says we would keep. Not affected by the range and market filters.",
+  adays: "Per day, how many valued auctions had liquidatable positions. Hover for the day's total valued auctions and those skipped for queueing too long.",
+  actor: "Liquidation gross per liquidator (the caller of Morpho liquidate) in the range, top 12.",
+  exitkind: "Gross (bars) and average slippage by exit kind. Slippage = 1 − USDC received ÷ oracle value of the collateral sold; carried positions (collateral re-deposited into Morpho / Aave and borrowed against) have no slippage.",
+  slip: "Median slippage of DEX / aggregator exits in the range (unweighted).",
+  quota: "This month's usage priced at each provider's free-plan rates (estimates: check your own plan). Bar = used, line = month-end projection at the current pace. The bot's own requests only.",
+  rpcreq: "Requests per hour per endpoint (from the cumulative counters the bot logs every 300 blocks).",
+  wallet: "Hot wallet (executor) ETH balance, read by the dashboard every 10 minutes. Warns below 0.002 ETH.",
+  gas: "Gas actually spent today (UTC) by sent transactions vs the configured daily gas cap.",
+  upd: "The page is regenerated by bot dashboard every minute: new journal and run-log lines go into SQLite (data/metrics.db), then this file is written. No update for over 3 minutes means the dashboard loop has stopped.",
+};
+
+// ---------------------------------------------------------------- formatting
+const pad = n => String(n).padStart(2, "0");
+const tz = t => new Date((t + TZ) * 1000);
+const fmtT = t => { const d = tz(t); return `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`; };
+const fmtClock = t => { const d = tz(t); return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`; };
+const dayOf = t => Math.floor((t + TZ) / 86400);
+const dayLbl = d => { const x = new Date(d * 864e5); return `${pad(x.getUTCMonth() + 1)}-${pad(x.getUTCDate())}`; };
+const ago = s => s < 90 ? `${Math.round(s)} s ago` : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 172800 ? `${(s / 3600).toFixed(1)} h ago` : `${(s / 86400).toFixed(1)} d ago`;
+const num = (x, d = 0) => x == null || isNaN(x) ? "—" : Number(x).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
+const usd = x => x == null || isNaN(x) ? "—" : (x < 0 ? "−$" : "$") + (Math.abs(x) >= 1000 ? num(Math.abs(x)) : Math.abs(x).toFixed(2));
+const usdK = x => x == null ? "—" : Math.abs(x) >= 1e6 ? `$${(x / 1e6).toFixed(1)}M` : Math.abs(x) >= 1e4 ? `$${(x / 1e3).toFixed(0)}k` : Math.abs(x) >= 1000 ? `$${(x / 1e3).toFixed(1)}k` : `$${x.toFixed(x < 10 ? 2 : 0)}`;
+const short = a => a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "—";
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const median = v => { const a = v.filter(x => x != null).sort((p, q) => p - q); return a.length ? a[Math.floor((a.length - 1) / 2)] : null; };
+const sum = v => v.reduce((a, b) => a + (b || 0), 0);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const scan = h => `<a class="mono" href="https://basescan.org/tx/${h}" target="_blank" rel="noopener">${short(h)}</a>`;
+const addr = h => h ? `<a class="mono" href="https://basescan.org/address/${h}" target="_blank" rel="noopener">${short(h)}</a>` : "—";
+const KIND = { dex: "DEX", aggregator: "aggregator", rfq: "RFQ market maker", router: "router", "carry-morpho": "carried (Morpho)", "carry-aave": "carried (Aave)", kept: "kept", unknown: "unknown" };
+const kindName = k => (k || "unknown").split("+").map(p => KIND[p] || p).join("+");
+const EVT = { fetch_failed: "block fetch failed", head_fetch_failed: "head fetch failed", reload_failed: "position reload failed", rpc_failover: "RPC failover", rpc_method_learned: "method unsupported by endpoint",
+  fb_stream_reconnect: "flashblocks reconnect", ws_reconnect: "WS reconnect", atlas_feed_reconnect: "Atlas feed reconnect", atlas_skipped: "valuation skipped", metacall_receipt_timeout: "receipt timeout",
+  metacall_reverted: "metacall reverted", live_start: "live start", live_halted: "sending halted", planning_failed: "planning failed", other: "other" };
+
+// ---------------------------------------------------------------- data (rows -> objects once)
+const LIQ = D.liq.map(r => ({ t: r[0], market: r[1] || "", gross: r[2] || 0, liq: (r[3] || "").toLowerCase(), outcome: r[4] || "", via: r[5] || "unknown", tx: r[6], borrower: r[7] }));
+const EXITS = D.exits.map(e => ({ ...e, actor: (e.actor || "").toLowerCase() }));
+const EXIT_BY_TX = Object.fromEntries(EXITS.map(e => [e.tx, e]));
+const AUC = D.auctions;
+const HOURS = D.hours.map(h => ({ t: h[0], blocks: h[1], missing: h[2], a50: h[3], a90: h[4], f50: h[5], f90: h[6], d50: h[7], d90: h[8] }));
+const EVH = D.events.hourly.map(e => ({ t: e[0], kind: e[1], ep: e[2], n: e[3] }));
+const EVR = D.events.recent.map(e => ({ t: e[0], level: e[1], kind: e[2], ep: e[3], msg: e[4] || "" }));
+const MARKETS = [...new Set([...M.markets, ...LIQ.map(l => l.market)])].filter(Boolean);
+
+// ---------------------------------------------------------------- global filters (kept in the URL hash)
+const RANGES = { "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "90d": 90 * 86400 };
+const RANGE_LBL = { "24h": "24 h", "7d": "7 d", "30d": "30 d", "90d": "90 d" };
+const CHANS = { all: "All", atlas: "Atlas", direct: "Direct" };
+const F = { r: "7d", m: "all", c: "all", a: "", d: "", ar: "1", tab: "liq" };
+new URLSearchParams(location.hash.slice(1)).forEach((v, k) => { if (k in F) F[k] = v; });
+if (!RANGES[F.r]) F.r = "7d";
+// The hash is outside input: keep only well-formed values.
+if (!/^0x[0-9a-fA-F]{40}$/.test(F.a)) F.a = "";
+if (!CHANS[F.c]) F.c = "all";
+if (!/^\d{1,6}$/.test(F.d)) F.d = "";
+const saveHash = () => history.replaceState(null, "", "#" + new URLSearchParams(F).toString());
+function win() {
+  if (F.d) { const s = (+F.d) * 86400 - TZ; return [s, s + 86400]; }
+  return [NOW - RANGES[F.r], NOW + 1];
+}
+function slice() {
+  const [s, e] = win(), len = e - s;
+  const inW = t => t >= s && t < e, inP = t => t >= s - len && t < s;
+  const mOk = m => F.m === "all" || m === F.m;
+  const cOk = v => F.c === "all" || v === F.c;
+  const aOk = a => !F.a || a === F.a;
+  const liq = LIQ.filter(l => mOk(l.market) && cOk(l.via) && aOk(l.liq));
+  const ex = EXITS.filter(x => (F.m === "all" || x.markets.includes(F.m)) && cOk(x.via) && aOk(x.actor));
+  const au = AUC.filter(a => (F.m === "all" || a.markets.some(m => m.market === F.m)) && F.c !== "direct" && aOk((a.winner || "").toLowerCase()));
+  return {
+    s, e, len,
+    liq: liq.filter(l => inW(l.t)), liqP: liq.filter(l => inP(l.t)),
+    ex: ex.filter(x => inW(x.t)),
+    au: au.filter(a => inW(a.t)),
+    hours: HOURS.filter(h => inW(h.t)), hoursP: HOURS.filter(h => inP(h.t)),
+    evh: EVH.filter(x => inW(x.t)), evhP: EVH.filter(x => inP(x.t)),
+    evr: EVR.filter(x => inW(x.t)),
+    adays: D.auction_days.filter(d => d[0] >= dayOf(s) && d[0] <= dayOf(e - 1)),
+  };
+}
+
+// ---------------------------------------------------------------- charts
+const charts = {};
+function chart(id, cfg) {
+  const host = document.getElementById(id);
+  if (charts[id]) { charts[id].destroy(); delete charts[id]; }
+  if (!window.Chart) { host.innerHTML = '<div class="empty">Chart library failed to load (offline?)</div>'; return; }
+  if (cfg.empty) { host.innerHTML = `<div class="empty">${cfg.empty}</div>`; return; }
+  host.innerHTML = "<canvas></canvas>";
+  charts[id] = new Chart(host.firstChild, cfg);
+}
+function opts(extra = {}) {
+  const grid = css("--grid"), muted = css("--muted");
+  const base = {
+    responsive: true, maintainAspectRatio: false, animation: false, normalized: true,
+    interaction: { mode: "index", intersect: false },
+    plugins: { legend: { display: false, labels: { usePointStyle: true, boxWidth: 7, boxHeight: 7, color: muted, font: { size: 11 } } },
+      tooltip: { backgroundColor: css("--fg"), titleColor: css("--bg"), bodyColor: css("--bg"), padding: 8, boxPadding: 3 } },
+    scales: {
+      x: { grid: { display: false }, border: { color: grid }, ticks: { color: muted, maxTicksLimit: 8, maxRotation: 0, autoSkipPadding: 14, font: { size: 11 } } },
+      y: { grid: { color: grid }, border: { display: false }, ticks: { color: muted, maxTicksLimit: 5, font: { size: 11 } }, beginAtZero: true },
+    },
+  };
+  return merge(base, extra);
+}
+function merge(a, b) {
+  for (const k of Object.keys(b)) a[k] = b[k] && typeof b[k] === "object" && !Array.isArray(b[k]) && a[k] && typeof a[k] === "object" ? merge(a[k], b[k]) : b[k];
+  return a;
+}
+/// Time buckets: hourly up to 7 days, 6 h up to 30 days, daily beyond.
+function bucketSecs(len) { return len <= 8 * 86400 ? 3600 : len <= 31 * 86400 ? 6 * 3600 : 86400; }
+function bucketize(rows, s, e, size) {
+  const start = Math.floor(s / size) * size, n = Math.max(1, Math.ceil((e - start) / size));
+  const out = Array.from({ length: n }, (_, i) => ({ t: start + i * size, rows: [] }));
+  for (const r of rows) { const i = Math.floor((r.t - start) / size); if (i >= 0 && i < n) out[i].rows.push(r); }
+  return out;
+}
+const bucketLbl = (t, size) => size >= 86400 ? dayLbl(dayOf(t)) : fmtT(t);
+
+// ---------------------------------------------------------------- KPI cards
+function spark(values, color) {
+  const v = values.map(x => x ?? null), ok = v.filter(x => x != null);
+  if (ok.length < 2) return "";
+  const lo = Math.min(...ok), hi = Math.max(...ok), w = 72, h = 24, span = hi - lo || 1;
+  let d = "", pen = false;
+  v.forEach((x, i) => { if (x == null) { pen = false; return; } const px = (i / (v.length - 1)) * w, py = h - ((x - lo) / span) * h; d += `${pen ? "L" : "M"}${px.toFixed(1)},${py.toFixed(1)}`; pen = true; });
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path d="${d}" fill="none" stroke="${color}" stroke-width="1.4" vector-effect="non-scaling-stroke"/></svg>`;
+}
+function delta(cur, prev, lowerBetter, fmt = v => `${v > 0 ? "+" : ""}${v.toFixed(0)}%`) {
+  if (cur == null || prev == null || !prev) return '<span class="flat">no data for the previous period</span>';
+  const pct = (cur - prev) / Math.abs(prev) * 100;
+  if (Math.abs(pct) < 1) return '<span class="flat">flat vs the previous period</span>';
+  const good = lowerBetter ? pct < 0 : pct > 0;
+  return `<span class="${good ? "up" : "down"}">${pct > 0 ? "▲" : "▼"} ${fmt(pct)}</span> <span class="flat">vs previous</span>`;
+}
+function kpi(o) {
+  return `<div class="kpi" ${o.go ? `data-go="${o.go}"` : ""}><div class="k">${esc(o.k)}<i class="i" tabindex="0" data-tip="${esc(DEF[o.def] || "")}">i</i></div>
+    <div class="v ${o.cls || ""}">${o.v}</div><div class="s">${o.s || ""}</div>${o.spark || ""}</div>`;
+}
+function renderKpis(S) {
+  const acc = css("--accent"), out = [];
+  // status
+  const lb = M.last_block, age = lb ? NOW - lb.seen : null, alive = age != null && age < 30;
+  out.push(kpi({ k: "System status", def: "status", cls: alive ? "good" : "bad", go: "health",
+    v: `<span class="dot" style="background:${alive ? css("--good") : css("--bad")}"></span>${alive ? "running" : "stalled"}`,
+    s: lb ? `#${num(lb.block)} ·${ago(age)}${M.run_start ? `<br>started ${fmtT(M.run_start)}` : ""}` : "no data" }));
+  // latency
+  const lat = median(S.hours.map(h => h.a50)), latP = median(S.hoursP.map(h => h.a50));
+  const bs = bucketSecs(S.len), lb2 = bucketize(S.hours, S.s, S.e, bs).map(b => median(b.rows.map(r => r.a50)));
+  out.push(kpi({ k: "Block latency p50", def: "latency", go: "health", cls: lat > 1100 ? "warn" : "",
+    v: lat == null ? "—" : `${num(lat)}<span class="s"> ms</span>`, s: delta(lat, latP, true), spark: spark(lb2, acc) }));
+  // missing + fetch failures
+  const blocks = sum(S.hours.map(h => h.blocks)), miss = sum(S.hours.map(h => h.missing)), missP = sum(S.hoursP.map(h => h.missing));
+  const ff = sum(S.evh.filter(x => x.kind === "fetch_failed").map(x => x.n));
+  out.push(kpi({ k: "Missed blocks", def: "missing", go: "health", cls: blocks && miss / blocks > 0.005 ? "warn" : "",
+    v: `${num(miss)}<span class="s"> / ${num(blocks)} blocks</span>`, s: `${blocks ? (miss / blocks * 100).toFixed(2) : "0"}% · fetch failures ${num(ff)} ·${delta(miss, missP, true)}`,
+    spark: spark(bucketize(S.hours, S.s, S.e, bs).map(b => sum(b.rows.map(r => r.missing))), css("--bad")) }));
+  // liquidations
+  const g = sum(S.liq.map(l => l.gross)), gP = sum(S.liqP.map(l => l.gross));
+  const days = bucketize(S.liq, S.s, S.e, 86400).map(b => sum(b.rows.map(r => r.gross)));
+  out.push(kpi({ k: "Liquidation gross", def: "gross", go: "liq", v: usdK(g), s: `${num(S.liq.length)} liquidations ·${delta(g, gP, false)}`, spark: spark(days, acc) }));
+  // atlas winnable
+  const scored = S.au.filter(a => a.win != null && a.ours != null && a.basis === "bundle_net");
+  const winnable = scored.filter(a => a.ours > a.win), edge = sum(winnable.map(a => a.ours - a.win));
+  out.push(kpi({ k: "Atlas winnable", def: "atlasWin", go: "atlas", cls: winnable.length ? "good" : "",
+    v: `${winnable.length}<span class="s"> / ${scored.length} auctions</span>`, s: `potential profit ${usd(edge)} · valuable ${S.au.length}` }));
+  // rival slippage
+  const slip = median(S.ex.filter(x => x.slippage != null).map(x => x.slippage));
+  out.push(kpi({ k: "Competitor exit slippage", def: "slip", go: "rivals", v: slip == null ? "—" : `${num(slip)}<span class="s"> bp</span>`, s: `${S.ex.filter(x => x.slippage != null).length} DEX exits (median)` }));
+  // rpc quota
+  const qs = D.rpc.endpoints.filter(e => e.limit), worst = qs.map(e => ({ n: e.name, p: e.proj / e.limit })).sort((a, b) => b.p - a.p)[0];
+  out.push(kpi({ k: "RPC month-end projection", def: "quota", go: "rpc", cls: worst && worst.p > 1 ? "bad" : worst && worst.p > 0.8 ? "warn" : "",
+    v: worst ? `${(worst.p * 100).toFixed(1)}<span class="s">%</span>` : "—", s: worst ? `highest: ${esc(worst.n)} (endpoints with a published quota)` : "no records this month" }));
+  // wallet + gas
+  const w = M.wallet, wl = w.length ? w[w.length - 1] : null;
+  out.push(kpi({ k: "Hot wallet", def: "wallet", cls: wl && wl[1] < 0.002 ? "warn" : "",
+    v: wl ? `${wl[1].toFixed(5)}<span class="s"> ETH</span>` : "—",
+    s: `${wl ? `≈ ${usd(wl[1] * M.eth_usd)} ·` : ""}gas today ${usd(M.gas_today_usd)} / ${usd(M.gas_budget_usd)}${M.kill_switch ? ' <b class="bad">kill switch on</b>' : ""}`,
+    spark: spark(w.map(x => x[1]), css("--muted")) }));
+  const host = document.getElementById("kpis");
+  host.innerHTML = out.join("");
+  host.querySelectorAll("[data-go]").forEach(el => el.addEventListener("click", ev => { if (!ev.target.classList.contains("i")) document.getElementById(el.dataset.go).scrollIntoView({ behavior: "smooth" }); }));
+}
+
+// ---------------------------------------------------------------- middle layer
+function renderHealth(S) {
+  const bs = bucketSecs(S.len), B = bucketize(S.hours, S.s, S.e, bs);
+  document.getElementById("hLatHint").textContent = bs === 3600 ? "hourly" : bs === 86400 ? "daily" : "every 6 h";
+  chart("cLat", S.hours.length ? {
+    type: "line",
+    data: { labels: B.map(b => bucketLbl(b.t, bs)), datasets: [
+      { label: "arrival p50", data: B.map(b => median(b.rows.map(r => r.a50))), borderColor: css("--accent"), borderWidth: 1.6, pointRadius: 0, spanGaps: true },
+      { label: "arrival p90", data: B.map(b => median(b.rows.map(r => r.a90))), borderColor: css("--accent") + "66", borderWidth: 1, pointRadius: 0, spanGaps: true },
+      { label: "fetch p50", data: B.map(b => median(b.rows.map(r => r.f50))), borderColor: css("--direct"), borderWidth: 1.2, pointRadius: 0, spanGaps: true },
+    ] },
+    options: opts({ plugins: { legend: { display: true, position: "top", align: "end" }, tooltip: { callbacks: { label: c => `${c.dataset.label}: ${num(c.raw)} ms` } } }, scales: { y: { min: 0, ticks: { callback: v => `${v} ms` } } } }),
+  } : { empty: "No block data in the range" });
+  // events: top kinds stacked
+  const tot = {}; S.evh.forEach(x => tot[x.kind] = (tot[x.kind] || 0) + x.n);
+  const kinds = Object.entries(tot).sort((a, b) => b[1] - a[1]).map(x => x[0]);
+  const top = kinds.slice(0, 4), EB = bucketize(S.evh, S.s, S.e, bs);
+  const pal = [css("--bad"), css("--warn"), css("--accent"), css("--direct"), css("--unk")];
+  const ds = top.map((k, i) => ({ label: EVT[k] || k, data: EB.map(b => sum(b.rows.filter(r => r.kind === k).map(r => r.n))), backgroundColor: pal[i], stack: "e" }));
+  if (kinds.length > 4) ds.push({ label: "other kinds", data: EB.map(b => sum(b.rows.filter(r => !top.includes(r.kind)).map(r => r.n))), backgroundColor: pal[4], stack: "e" });
+  chart("cEvt", S.evh.length ? { type: "bar", data: { labels: EB.map(b => bucketLbl(b.t, bs)), datasets: ds },
+    options: opts({ interaction: { mode: "index" }, plugins: { legend: { display: true, position: "top", align: "start" } }, scales: { x: { stacked: true, ticks: { maxTicksLimit: 5 } }, y: { stacked: true } } }) }
+    : { empty: "No warnings in the range" });
+}
+
+function renderLiq(S) {
+  const days = []; for (let d = dayOf(S.s); d <= dayOf(S.e - 1); d++) days.push(d);
+  const by = (via, d) => sum(S.liq.filter(l => l.via === via && dayOf(l.t) === d).map(l => l.gross));
+  chart("cDaily", S.liq.length ? { type: "bar",
+    data: { labels: days.map(dayLbl), datasets: [
+      { label: "Atlas", data: days.map(d => by("atlas", d)), backgroundColor: css("--atlas"), stack: "g" },
+      { label: "Direct", data: days.map(d => by("direct", d)), backgroundColor: css("--direct"), stack: "g" },
+      { label: "Unchecked", data: days.map(d => by("unknown", d)), backgroundColor: css("--unk"), stack: "g" },
+    ] },
+    options: opts({ plugins: { legend: { display: true, position: "top", align: "end" }, tooltip: { callbacks: { label: c => `${c.dataset.label}: ${usd(c.raw)}`,
+      footer: items => `total ${usd(sum(items.map(i => i.raw)))} · ${S.liq.filter(l => dayOf(l.t) === days[items[0].dataIndex]).length} liquidations` } } },
+      scales: { x: { stacked: true }, y: { stacked: true, ticks: { callback: v => usdK(v) } } },
+      onClick: (ev, el) => { if (el.length) setF({ d: String(days[el[0].index]) }); } }) }
+    : { empty: "No liquidations in the range" });
+  // markets (ignores the market filter itself, so the comparison stays visible)
+  const base = LIQ.filter(l => l.t >= S.s && l.t < S.e && (F.c === "all" || l.via === F.c) && (!F.a || l.liq === F.a));
+  const mk = {}; base.forEach(l => { mk[l.market] = mk[l.market] || { g: 0, n: 0 }; mk[l.market].g += l.gross; mk[l.market].n++; });
+  const rows = Object.entries(mk).sort((a, b) => b[1].g - a[1].g);
+  chart("cMarket", rows.length ? { type: "bar",
+    data: { labels: rows.map(r => r[0]), datasets: [{ data: rows.map(r => r[1].g), backgroundColor: rows.map(r => F.m === "all" || F.m === r[0] ? css("--accent") : css("--unk")), borderRadius: 3, barPercentage: .7 }] },
+    options: opts({ indexAxis: "y", interaction: { mode: "nearest", axis: "y", intersect: false },
+      plugins: { tooltip: { callbacks: { label: c => `${usd(c.raw)} · ${rows[c.dataIndex][1].n} liquidations` } } },
+      scales: { x: { grid: { color: css("--grid") }, ticks: { callback: v => usdK(v), maxTicksLimit: 4 } }, y: { grid: { display: false }, ticks: { autoSkip: false } } },
+      onClick: (ev, el) => { if (el.length) setF({ m: F.m === rows[el[0].index][0] ? "all" : rows[el[0].index][0] }); } }) }
+    : { empty: "No liquidations in the range" });
+}
+
+function renderAtlas(S) {
+  const good = css("--good"), bad = css("--bad"), unk = css("--unk");
+  const pts = S.au.filter(a => a.win > 0 && a.ours > 0).map(a => ({ x: a.win, y: a.ours, a }));
+  const lo = Math.min(...pts.map(p => Math.min(p.x, p.y)), 1), hi = Math.max(...pts.map(p => Math.max(p.x, p.y)), 10);
+  chart("cScatter", pts.length ? { type: "scatter",
+    data: { datasets: [
+      { label: "y = x", type: "line", data: [{ x: lo, y: lo }, { x: hi, y: hi }], borderColor: css("--faint"), borderDash: [4, 4], borderWidth: 1, pointRadius: 0 },
+      { label: "auctions", data: pts, pointRadius: pts.map(p => 3 + Math.min(6, Math.log10(1 + p.a.n) * 4)), pointHoverRadius: 8,
+        backgroundColor: pts.map(p => p.a.basis !== "bundle_net" ? unk : p.y > p.x ? good : bad) },
+    ] },
+    options: opts({ interaction: { mode: "nearest", intersect: true },
+      plugins: { tooltip: { filter: i => i.datasetIndex === 1, callbacks: { title: () => "", label: c => { const a = c.raw.a;
+        return [`${fmtT(a.t)} · ${a.markets.map(m => m.market).join(", ")} · ${a.n} positions`, `winning bid ${usd(a.win)} (${short(a.winner)})`, `ours ${usd(a.ours)}${a.basis !== "bundle_net" ? " (old method: per-position sum)" : ""}`]; } } } },
+      scales: { x: { type: "logarithmic", min: lo / 1.5, max: hi * 1.5, title: { display: true, text: "On-chain winning bid (USD)", color: css("--muted") }, ticks: { callback: v => usdK(v) }, grid: { color: css("--grid") } },
+        y: { type: "logarithmic", min: lo / 1.5, max: hi * 1.5, beginAtZero: false, title: { display: true, text: "Our net (USD)", color: css("--muted") }, ticks: { callback: v => usdK(v) } } },
+      onClick: (ev, el) => { const p = el.find(e => e.datasetIndex === 1); if (p) openRow("atlas", pts[p.index].a.id); } }) }
+    : { empty: F.c === "direct" ? "Channel filter is Direct: Atlas auctions do not apply" : "No auctions matched to a winning bid in the range" });
+  const ad = S.adays;
+  chart("cADays", ad.length ? { type: "bar",
+    data: { labels: ad.map(d => dayLbl(d[0])), datasets: [{ label: "with liquidatable positions", data: ad.map(d => d[2]), backgroundColor: css("--atlas"), borderRadius: 3, barPercentage: .7 }] },
+    options: opts({ plugins: { tooltip: { callbacks: { label: c => `${c.raw} with liquidatable positions`, afterLabel: c => `valued ${num(ad[c.dataIndex][1])} · skipped ${ad[c.dataIndex][3]}` } } },
+      scales: { y: { ticks: { precision: 0 } } } }) }
+    : { empty: "No auctions recorded in the range" });
+}
+
+function renderRivals(S) {
+  // gross per liquidator (ignores the liquidator filter itself)
+  const base = LIQ.filter(l => l.t >= S.s && l.t < S.e && (F.m === "all" || l.market === F.m) && (F.c === "all" || l.via === F.c));
+  const by = {}; base.forEach(l => { by[l.liq] = by[l.liq] || { g: 0, n: 0 }; by[l.liq].g += l.gross; by[l.liq].n++; });
+  const rows = Object.entries(by).sort((a, b) => b[1].g - a[1].g).slice(0, 12);
+  const total = sum(base.map(l => l.gross));
+  chart("cActor", rows.length ? { type: "bar",
+    data: { labels: rows.map(r => short(r[0])), datasets: [{ data: rows.map(r => r[1].g), backgroundColor: rows.map(r => !F.a || F.a === r[0] ? css("--accent") : css("--unk")), borderRadius: 3, barPercentage: .7 }] },
+    options: opts({ indexAxis: "y", interaction: { mode: "nearest", axis: "y", intersect: false },
+      plugins: { tooltip: { callbacks: { label: c => { const r = rows[c.dataIndex], ex = EXITS.filter(x => x.actor === r[0]);
+        const kinds = [...new Set(ex.map(x => kindName(x.kind)))].join(", ");
+        return [`${usd(r[1].g)} (${(r[1].g / total * 100).toFixed(1)}%) · ${r[1].n} liquidations`, kinds ? `exits: ${kinds}` : ""]; } } } },
+      scales: { x: { grid: { color: css("--grid") }, ticks: { callback: v => usdK(v), maxTicksLimit: 4 } }, y: { grid: { display: false }, ticks: { autoSkip: false, font: { family: "ui-monospace,Consolas,monospace", size: 11 } } } },
+      onClick: (ev, el) => { if (el.length) { const a = rows[el[0].index][0]; setF({ a: F.a === a ? "" : a }); } } }) }
+    : { empty: "No liquidations in the range" });
+  // exit kinds: gross (bars) + median slippage (in tooltip and label)
+  const kk = {}; S.ex.forEach(x => { const k = kindName(x.kind); kk[k] = kk[k] || { g: 0, n: 0, s: [] }; kk[k].g += x.gross || 0; kk[k].n++; if (x.slippage != null) kk[k].s.push(x.slippage); });
+  const kr = Object.entries(kk).sort((a, b) => b[1].g - a[1].g);
+  chart("cKind", kr.length ? { type: "bar",
+    data: { labels: kr.map(r => r[1].s.length ? `${r[0]} · slippage ${num(median(r[1].s))} bp` : r[0]), datasets: [{ data: kr.map(r => r[1].g), backgroundColor: css("--direct"), borderRadius: 3, barPercentage: .7 }] },
+    options: opts({ indexAxis: "y", interaction: { mode: "nearest", axis: "y", intersect: false },
+      plugins: { tooltip: { callbacks: { label: c => { const r = kr[c.dataIndex][1]; return [`gross ${usd(r.g)} · ${r.n} txs`, r.s.length ? `median slippage ${num(median(r.s))} bp (${r.s.length} txs)` : "no slippage"]; } } } },
+      scales: { x: { grid: { color: css("--grid") }, ticks: { callback: v => usdK(v), maxTicksLimit: 4 } }, y: { grid: { display: false }, ticks: { autoSkip: false } } } }) }
+    : { empty: "No decoded liquidation txs in the range" });
+}
+
+function renderRpc() {
+  const R = D.rpc, host = document.getElementById("cQuota");
+  const rows = R.endpoints.map(e => {
+    if (e.limit) {
+      const used = e.used / e.limit, proj = e.proj / e.limit, cls = proj > 1 ? "bad" : proj > .8 ? "warn" : "";
+      return `<div class="q"><div>${esc(e.name)}</div><div class="track" title="${(used * 100).toFixed(2)}% used · month-end projection ${(proj * 100).toFixed(1)}%">
+        <div class="used" style="width:${Math.min(100, used * 100).toFixed(2)}%"></div><div class="proj" style="left:${Math.min(100, proj * 100).toFixed(2)}%"></div></div>
+        <div class="r ${cls}">${(e.used / 1e6).toFixed(2)}M / ${(e.limit / 1e6).toFixed(0)}M ${esc(e.unit)}</div></div>`;
+    }
+    return `<div class="q"><div>${esc(e.name)}</div><div class="muted">no published quota · ${num(e.reqs)} requests this month</div><div class="r muted">projected ${num(e.proj_reqs)}</div></div>`;
+  });
+  host.innerHTML = rows.length ? rows.join("") : '<div class="empty">No rpc_usage records this month yet (written every 300 blocks)</div>';
+  const eps = [...new Set(R.hourly.map(h => h[1]))].sort();
+  const hrs = [...new Set(R.hourly.map(h => h[0]))].sort((a, b) => a - b);
+  const pal = [css("--accent"), css("--direct"), css("--warn"), css("--bad"), "#8a63d2", "#0f8fa3"];
+  chart("cRpc", hrs.length ? { type: "line",
+    data: { labels: hrs.map(fmtT), datasets: eps.map((ep, i) => ({ label: ep, data: hrs.map(h => sum(R.hourly.filter(x => x[0] === h && x[1] === ep).map(x => x[2]))), borderColor: pal[i % pal.length], borderWidth: 1.3, pointRadius: 0 })) },
+    options: opts({ plugins: { legend: { display: true, position: "top", align: "end" } } }) }
+    : { empty: "No records in the last 7 days" });
+}
+
+// ---------------------------------------------------------------- bottom layer: detail tables
+let openId = null, shown = 100, sortKey = null, sortDir = -1;
+const TABS = {
+  liq: { name: "Liquidations", rows: S => S.liq, id: r => r.tx + r.borrower, cols: [
+    ["Time", r => r.t, fmtT, "l"], ["Market", r => r.market, esc, "l"], ["Gross", r => r.gross, usd], ["Liquidator", r => r.liq, addr, "l"],
+    ["Channel", r => r.via, v => ({ atlas: "Atlas", direct: "Direct", unknown: "Unchecked" }[v]), "l"], ["Exit", r => (EXIT_BY_TX[r.tx] || {}).kind, kindName, "l"],
+    ["Timing", r => r.outcome, esc, "l"], ["Tx", r => r.tx, scan, "l"]], detail: liqDetail },
+  atlas: { name: "Atlas auctions", rows: S => S.au, id: r => r.id, cols: [
+    ["Time", r => r.t, fmtT, "l"], ["Market", r => r.markets.map(m => m.market).join(", "), esc, "l"], ["Positions", r => r.n, num], ["Gross", r => r.gross ?? r.bonus, usd],
+    ["Our net", r => r.ours, usd], ["Our bid", r => r.bid, usd], ["Winning bid", r => r.win, usd], ["Gap", r => r.win != null && r.ours != null ? r.ours - r.win : null, v => v == null ? "—" : `<span class="${v > 0 ? "good" : "bad"}">${v > 0 ? "+" : ""}${usd(v)}</span>`],
+    ["Winner", r => r.winner, addr, "l"], ["Quote", r => r.ms, v => v == null ? "—" : `${num(v)} ms`], ["Verdict", r => verdict(r), v => v, "l"]], detail: atlasDetail },
+  rivals: { name: "Competitor exits", rows: S => S.ex, id: r => r.tx, cols: [
+    ["Time", r => r.t, fmtT, "l"], ["Liquidator", r => r.actor, addr, "l"], ["Positions", r => r.n, num], ["Gross", r => r.gross, usd], ["Entry", r => r.via, v => v === "atlas" ? "Atlas" : "Direct", "l"],
+    ["flash loan", r => r.flash, v => v ? esc(v.replace(/,/g, "+")) : "—", "l"], ["Exit", r => r.kind, kindName, "l"], ["Route", r => r.route, v => `<span class="muted">${esc((v || "—").slice(0, 70))}</span>`, "l"],
+    ["Slippage", r => r.slippage, v => v == null ? "—" : `${num(v)} bp`], ["gas", r => r.gas, v => `${(v / 1e6).toFixed(2)}M`], ["priority", r => r.prio, v => v == null ? "—" : `${v.toFixed(4)} gwei`]], detail: rivalDetail },
+  events: { name: "Events", rows: S => S.evr, id: r => r.t + r.kind + r.msg.slice(0, 20), cols: [
+    ["Time", r => r.t, fmtT, "l"], ["Level", r => r.level, v => `<span class="${v === "ERROR" ? "bad" : "warn"}">${v}</span>`, "l"], ["Kind", r => r.kind, k => EVT[k] || k, "l"],
+    ["Endpoint", r => r.ep, esc, "l"], ["Message", r => r.msg, v => `<span class="muted">${esc(v.slice(0, 110))}</span>`, "l"]], detail: r => `<div class="mono">${esc(r.msg)}</div>` },
+  rpcstats: { name: "RPC endpoints", rows: () => D.rpc.stats.map(s => ({ ep: s[0], req: s[1], fo: s[2], lag: s[3], hedge: s[4], ewma: s[5], cool: s[6] })), id: r => r.ep, cols: [
+    ["Endpoint", r => r.ep, esc, "l"], ["Requests", r => r.req, num], ["Failovers", r => r.fo, num], ["Lagging", r => r.lag, num], ["Hedged", r => r.hedge, num], ["Avg latency", r => r.ewma, v => `${v} ms`],
+    ["Status", r => r.cool, v => v ? '<span class="bad">cooling down</span>' : '<span class="good">ok</span>', "l"]],
+    detail: r => { const e = D.rpc.endpoints.find(x => x.name === r.ep); return e ? `<h4>Methods this month</h4>${e.top.map(t => `${esc(t[0])} ${num(t[1])}`).join(" ·")}` : ""; },
+    note: () => D.rpc.stats_ts ? `Cumulative since this start, as of ${fmtT(D.rpc.stats_ts)} (not filtered)` : "" },
+};
+function verdict(a) {
+  if (a.win == null) return '<span class="muted">unmatched</span>';
+  if (a.ours == null) return '<span class="muted">no valuation</span>';
+  if (a.basis !== "bundle_net") return a.ours > a.win ? '<span class="warn">winnable? (old method)</span>' : '<span class="bad">lost</span>';
+  return a.ours > a.win ? '<span class="good">winnable</span>' : '<span class="bad">lost</span>';
+}
+function kv(pairs) { return `<div class="kv">${pairs.filter(p => p[1] != null && p[1] !== "").map(p => `<div><span>${p[0]}</span>${p[1]}</div>`).join("")}</div>`; }
+function liqDetail(r) {
+  const e = EXIT_BY_TX[r.tx];
+  return kv([["Tx", scan(r.tx)], ["Borrower", addr(r.borrower)], ["Liquidator", addr(r.liq)], ["Timing", esc(r.outcome)]]) + (e ? `<h4>This tx's route</h4>${rivalDetail(e)}` : '<p class="muted">route not decoded yet</p>');
+}
+function atlasDetail(a) {
+  const bids = a.bids.length ? `<h4>On-chain bids</h4><table><tr><th class="l">solver</th><th>Bid</th></tr>${a.bids.map(b => `<tr><td class="l">${addr(b.solver)}</td><td>${usd(b.usd)}</td></tr>`).join("")}</table>` : "";
+  const mk = `<h4>Bundle valuation (per market)</h4><table><tr><th class="l">Market</th><th>Positions</th><th>Gross</th><th class="l">Router</th><th>Bundle net</th><th>direct</th><th>Kyber</th><th>swap gas / budget</th><th class="l">Error</th></tr>${a.markets.map(m => { const b = m.bundle || {};
+    return `<tr><td class="l">${esc(m.market)}</td><td>${num(m.n)}</td><td>${usd(m.bonus)}</td><td class="l">${esc(b.router || "—")}</td><td>${usd(b.net_usd)}</td><td>${usd(b.direct_net_usd)}</td><td>${usd(b.kyber_net_usd)}</td>
+      <td>${b.swap_gas ? `${(b.swap_gas / 1e6).toFixed(2)}M / ${(b.swap_gas_budget / 1e6).toFixed(2)}M` : "—"}</td><td class="l muted">${esc(b.error || "")}</td></tr>`; }).join("")}</table>`;
+  const pos = (a.positions || []).length ? `<h4>Per-position check (largest positions)</h4><table><tr><th class="l">Borrower</th><th>HF</th><th>Gross</th><th class="l">Router</th><th>Net</th><th>Quote</th><th>Sim</th><th class="l">Error</th></tr>${a.positions.map(p =>
+    `<tr><td class="l">${addr(p.user)}</td><td>${p.hf != null ? p.hf.toFixed(4) : "—"}</td><td>${usd(p.bonus_usd)}</td><td class="l">${esc(p.router || "—")}</td><td>${usd(p.net_usd)}</td><td>${p.quote_ms != null ? p.quote_ms + " ms" : "—"}</td><td>${p.sim_ms != null ? p.sim_ms + " ms" : "—"}</td><td class="l muted">${esc((p.error || "").slice(0, 80))}</td></tr>`).join("")}</table>` : "";
+  return kv([["Auction", `<span class="mono">${esc(a.id)}</span>`], ["Winning tx", a.tx ? scan(a.tx) : null], ["Valuation basis", a.basis === "bundle_net" ? "bundle net" : "per-position sum (old)"], ["Our bid", usd(a.bid)]]) + bids + mk + pos;
+}
+function rivalDetail(e) {
+  const venues = (e.venues || []).length ? `<h4>Venues (in tx order)</h4><table><tr><th class="l">Protocol</th><th class="l">Kind</th><th class="l">Address</th><th class="l">In</th><th class="l">Out</th></tr>${e.venues.map(v =>
+    `<tr><td class="l">${esc(v.protocol)}</td><td class="l">${esc(kindName(v.kind))}</td><td class="l">${addr(v.address)}</td><td class="l">${esc((v.token_in || []).join(", "))}</td><td class="l">${esc((v.token_out || []).join(", "))}</td></tr>`).join("")}</table>` : "";
+  const unk = (e.unknown || []).length ? `<h4>Unidentified addresses</h4>${e.unknown.map(addr).join(", ")}` : "";
+  return kv([["Tx", scan(e.tx)], ["Liquidator", addr(e.actor)], ["Sender", addr(e.eoa)], ["Collateral", esc(e.collateral)], ["Seized", e.seized != null ? num(e.seized, 2) : null],
+    ["Sold", e.sold != null ? num(e.sold, 2) : null], ["Carried", e.carried ? num(e.carried, 2) : null], ["Kept", e.kept ? num(e.kept, 2) : null], ["USDC received", e.loan_in != null ? num(e.loan_in, 2) : null],
+    ["Oracle value sold", e.oracle_usd != null ? usd(e.oracle_usd) : null], ["Gas price", e.gas_price != null ? `${e.gas_price.toFixed(4)} gwei` : null]]) + venues + unk;
+}
+function renderTable(S) {
+  const tabsEl = document.getElementById("tabs");
+  tabsEl.innerHTML = Object.entries(TABS).map(([k, t]) => `<button data-t="${k}" class="${F.tab === k ? "on" : ""}">${t.name}<span class="n">${t.rows(S).length}</span></button>`).join("");
+  tabsEl.querySelectorAll("button").forEach(b => b.onclick = () => { F.tab = b.dataset.t; openId = null; shown = 100; sortKey = null; saveHash(); renderTable(S); });
+  const T = TABS[F.tab] || TABS.liq;
+  let rows = T.rows(S).slice();
+  if (sortKey != null) { const g = T.cols[sortKey][1]; rows.sort((a, b) => { const x = g(a), y = g(b); return (x == null) - (y == null) || (x > y ? 1 : x < y ? -1 : 0) * sortDir; }); }
+  const head = `<tr>${T.cols.map((c, i) => `<th class="${c[3] || ""}" data-i="${i}">${c[0]}<span class="arr">${sortKey === i ? (sortDir > 0 ? " ▲" : " ▼") : ""}</span></th>`).join("")}</tr>`;
+  const body = rows.slice(0, shown).map(r => {
+    const id = T.id(r), open = id === openId;
+    const tr = `<tr class="row ${open ? "open" : ""}" data-id="${esc(id)}">${T.cols.map(c => `<td class="${c[3] || ""}">${c[2](c[1](r))}</td>`).join("")}</tr>`;
+    return open ? tr + `<tr class="det"><td colspan="${T.cols.length}"><div class="det">${T.detail(r)}</div></td></tr>` : tr;
+  }).join("");
+  document.getElementById("table").innerHTML = rows.length ? `<table><thead>${head}</thead><tbody>${body}</tbody></table>${T.note ? `<p class="muted">${T.note()}</p>` : ""}` : '<div class="empty">No data for the current filters</div>';
+  document.getElementById("more").innerHTML = rows.length > shown ? `<button>Show 100 more (of ${rows.length})</button>` : "";
+  const more = document.querySelector("#more button"); if (more) more.onclick = () => { shown += 100; renderTable(S); };
+  document.querySelectorAll("#table th").forEach(th => th.onclick = () => { const i = +th.dataset.i; sortDir = sortKey === i ? -sortDir : -1; sortKey = i; renderTable(S); });
+  document.querySelectorAll("#table tr.row").forEach(tr => tr.onclick = ev => { if (ev.target.closest("a")) return; openId = openId === tr.dataset.id ? null : tr.dataset.id; renderTable(S); });
+}
+function openRow(tab, id) {
+  F.tab = tab; openId = id; shown = 100; sortKey = null; saveHash();
+  renderTable(slice());
+  const el = document.querySelector(`#table tr.row[data-id="${CSS.escape(id)}"]`);
+  (el || document.getElementById("detail")).scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+// ---------------------------------------------------------------- filters bar, freshness, refresh
+function setF(p) { Object.assign(F, p); if (p.r) F.d = ""; openId = null; shown = 100; saveHash(); render(); }
+function renderBar() {
+  document.getElementById("fRange").innerHTML = Object.keys(RANGES).map(k => `<button data-v="${k}" class="${!F.d && F.r === k ? "on" : ""}">${RANGE_LBL[k]}</button>`).join("");
+  document.querySelectorAll("#fRange button").forEach(b => b.onclick = () => setF({ r: b.dataset.v, d: "" }));
+  const sel = document.getElementById("fMarket");
+  sel.innerHTML = `<option value="all">All markets</option>` + MARKETS.map(m => `<option ${F.m === m ? "selected" : ""}>${esc(m)}</option>`).join("");
+  sel.onchange = () => setF({ m: sel.value });
+  document.getElementById("fChan").innerHTML = Object.entries(CHANS).map(([k, v]) => `<button data-v="${k}" class="${F.c === k ? "on" : ""}">${v}</button>`).join("");
+  document.querySelectorAll("#fChan button").forEach(b => b.onclick = () => setF({ c: b.dataset.v }));
+  const chips = [];
+  if (F.d) chips.push(`<span class="chip">Date ${dayLbl(+F.d)}<button data-x="d" title="Remove">✕</button></span>`);
+  if (F.a) chips.push(`<span class="chip">Liquidator <span class="mono">${esc(short(F.a))}</span><button data-x="a" title="Remove">✕</button></span>`);
+  if (F.m !== "all") chips.push(`<span class="chip">Market ${esc(F.m)}<button data-x="m" title="Remove">✕</button></span>`);
+  if (chips.length > 1) chips.push(`<span class="chip">Clear all<button data-x="*">✕</button></span>`);
+  const host = document.getElementById("chips"); host.innerHTML = chips.join(" ");
+  host.querySelectorAll("button").forEach(b => b.onclick = () => setF(b.dataset.x === "*" ? { d: "", a: "", m: "all" } : { [b.dataset.x]: b.dataset.x === "m" ? "all" : "" }));
+  document.getElementById("auto").checked = F.ar === "1";
+  document.getElementById("auto").onchange = e => { F.ar = e.target.checked ? "1" : "0"; saveHash(); };
+}
+function tick() {
+  const now = Date.now() / 1000, age = now - NOW, stale = age > 180;
+  const u = document.getElementById("upd");
+  u.textContent = `Data from ${fmtClock(NOW)} (${ago(age)})`;
+  u.className = "upd" + (stale ? " stale" : "");
+  const lb = M.last_block;
+  document.getElementById("fresh").innerHTML = `Generated <b>${fmtClock(NOW)}</b><br>bot's latest block <b>${lb ? ago(NOW - lb.seen) : "—"}</b> (at generation)<br>database ${(M.db_bytes / 1e6).toFixed(1)} MB · mode ${esc(M.mode)}<br>same-block send ${M.fb_send ? "on" : "off"} · Atlas ${M.atlas_observe ? "observing" : "off"}`;
+  // Reload for fresh data once a minute after load (the file is rewritten every minute), unless
+  // paused or a detail row is open. Counted from page load, so stale data cannot cause a reload loop.
+  if (F.ar === "1" && openId == null && Date.now() - LOADED > 60000) location.reload();
+}
+const LOADED = Date.now();
+// ---------------------------------------------------------------- live positions (bot live)
+// Served by `bot live` (http://localhost:8787): polls /live.json, which `watch` rewrites every block.
+// Opened as a file there is no server to ask, so the section says how to get it instead.
+let liveLast = null;
+const pxl = x => x == null ? "—" : x >= 100 ? num(x, 2) : x >= 1 ? num(x, 4) : num(x, 6);
+async function liveTick() {
+  const tbl = document.getElementById("liveTbl");
+  if (location.protocol === "file:") {
+    tbl.innerHTML = '<p class="muted">Live data needs <code>bot live</code>: open <b>http://localhost:8787</b> in a browser (this page is served there too, with this section live).</p>';
+    return;
+  }
+  try {
+    const r = await fetch("/live.json", { cache: "no-store" });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    liveLast = d;
+    document.getElementById("liveMk").innerHTML = d.markets.map(m =>
+      `<span>${esc(m.name)} ${pxl(m.price)}${m.liquidatable ? ` · <b class="bad">liquidatable ${m.liquidatable}</b>` : ""} · &lt;1.02: ${m.below_1_02} · &lt;1.05: ${m.below_1_05}</span>`).join("");
+    const cls = h => h < 1 ? "bad" : h < 1.02 ? "warn" : "";
+    tbl.innerHTML = `<table><thead><tr><th>#</th><th class="l">Market</th><th class="l">Borrower</th><th>HF</th><th>Debt USD</th><th>Collateral</th><th>Price</th><th>Liq. price</th><th>Drop to liq.</th></tr></thead><tbody>` +
+      d.top.map((p, i) => `<tr><td>${i + 1}</td><td class="l">${esc(p.market)}</td>` +
+        `<td class="l"><a href="https://basescan.org/address/${esc(p.borrower)}" target="_blank" rel="noopener">${esc(short(p.borrower))}</a></td>` +
+        `<td class="${cls(p.hf)}"><b>${num(p.hf, 4)}</b></td><td>${num(p.debt, 2)}</td>` +
+        `<td>${p.collateral == null ? "—" : num(p.collateral, 4) + " " + esc(p.market.split("/")[0])}</td>` +
+        `<td>${pxl(p.price)}</td><td>${pxl(p.liq_price)}</td><td>${p.drop_to_liq_pct <= 0 ? '<b class="bad">liquidatable</b>' : num(p.drop_to_liq_pct, 2) + "%"}</td></tr>`).join("") +
+      "</tbody></table>";
+  } catch (e) {
+    tbl.innerHTML = `<p class="bad">Cannot read the live snapshot: ${esc(e.message)}</p>`;
+  }
+  liveAge();
+}
+function liveAge() {
+  if (!liveLast) return;
+  const age = Date.now() / 1000 - liveLast.written;
+  const el = document.getElementById("liveAge");
+  el.textContent = `block ${liveLast.block.toLocaleString("en-US")} · ${age < 1.5 ? "just now" : Math.round(age) + " s ago"}`;
+  el.className = "hint" + (age > 10 ? " bad" : "");
+}
+liveTick(); setInterval(liveTick, 2000); setInterval(liveAge, 1000);
+function render() {
+  const S = slice();
+  renderBar(); renderKpis(S); renderHealth(S); renderLiq(S); renderAtlas(S); renderRivals(S); renderRpc(); renderTable(S);
+}
+document.querySelectorAll(".i[data-k]").forEach(i => i.dataset.tip = DEF[i.dataset.k] || "");
+document.getElementById("updInfo").dataset.tip = DEF.upd;
+// Paper trading (static: whole history, not filtered).
+(function paperTable() {
+  const P = D.paper, el = document.getElementById("paperTbl");
+  if (!P || !el) return;
+  document.getElementById("paperHint").textContent = `${P.auctions} auctions with a winning bid · valued in time (≤ ${P.deadline_ms} ms): ${P.in_time}`;
+  const pct = x => (x * 100).toFixed(1) + "%";
+  let h = `<table><thead><tr><th class="l">Kept margin</th><th>Won</th><th>PnL</th><th>Won in time</th><th>PnL in time</th><th>Winning bids of won auctions</th></tr></thead><tbody>`;
+  for (const m of P.margins) h += `<tr><td class="l">${pct(m.m)}</td><td>${m.wins}</td><td>${usd(m.pnl)}</td><td>${m.wins_t}</td><td>${usd(m.pnl_t)}</td><td>${usdK(m.won_usd)}</td></tr>`;
+  h += `</tbody></table><h4 style="margin:12px 0 4px;font-size:12px;color:var(--muted)">By market (kept ${pct(P.m1)}, in time)</h4><table><thead><tr><th class="l">Market</th><th>Auctions</th><th>Won</th><th>PnL</th><th>Our bundle net (sum)</th><th>Winning bids (sum)</th></tr></thead><tbody>`;
+  for (const m of P.markets) h += `<tr><td class="l">${esc(m.market)}</td><td>${m.n}</td><td>${m.wins}</td><td>${usd(m.pnl)}</td><td>${usdK(m.ours)}</td><td>${usdK(m.win_usd)}</td></tr>`;
+  h += `</tbody></table><h4 style="margin:12px 0 4px;font-size:12px;color:var(--muted)">Daily (kept ${pct(P.m1)}, in time)</h4><table><thead><tr><th class="l">Date</th><th>Auctions</th><th>Won</th><th>PnL</th></tr></thead><tbody>`;
+  for (const [d, n, w, p] of P.days.slice().reverse()) { const t = new Date(d * 86400e3); h += `<tr><td class="l">${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}-${pad(t.getUTCDate())}</td><td>${n}</td><td>${w}</td><td>${usd(p)}</td></tr>`; }
+  el.innerHTML = h + `</tbody></table>`;
+})();
+render();
+tick(); setInterval(tick, 5000);
+// Left nav: scroll without touching the hash (it holds the filters); highlight the section in view.
+const links = [...document.querySelectorAll("nav.side a")];
+links.forEach(a => a.onclick = ev => { ev.preventDefault(); document.querySelector(a.getAttribute("href")).scrollIntoView({ behavior: "smooth" }); });
+const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) links.forEach(a => a.classList.toggle("on", a.getAttribute("href") === "#" + e.target.id)); }), { rootMargin: "-40% 0px -55% 0px" });
+document.querySelectorAll("section[id]").forEach(s => io.observe(s));
+</script>
+</body>
+</html>
