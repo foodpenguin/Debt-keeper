@@ -68,7 +68,23 @@ impl AtlasSolver {
 
     /// `atlasSolverCall` for one liquidation (`inner` = MorphoLiquidator calldata) that repays in
     /// `loan_token` and bids `bid_wei` in ETH; the bid is bought with the loan token unless it is WETH.
+    /// As Atlas calls it in a simulation (execution environment = a placeholder).
     pub fn calldata(&self, loan_token: Address, inner: &Bytes, bid_wei: U256, min_profit: U256) -> Bytes {
+        IAtlasSolver::atlasSolverCallCall {
+            solverOpFrom: self.signer,
+            executionEnvironment: SIM_EXECUTION_ENVIRONMENT,
+            bidToken: Address::ZERO,
+            bidAmount: bid_wei,
+            solverOpData: self.op_data(loan_token, inner, bid_wei, min_profit),
+            extraReturnData: Bytes::new(),
+        }
+        .abi_encode()
+        .into()
+    }
+
+    /// The solver operation's `data` (what Atlas hands the solver as `solverOpData`):
+    /// `(calls, bidSwap, profitToken, minProfit)`.
+    pub fn op_data(&self, loan_token: Address, inner: &Bytes, bid_wei: U256, min_profit: U256) -> Bytes {
         let calls = vec![SolverCall { target: self.liquidator.liquidator, data: inner.clone() }];
         let bid_swap = if loan_token == self.weth || bid_wei.is_zero() {
             SwapStep { target: Address::ZERO, tokenIn: Address::ZERO, amountIn: U256::ZERO, data: Bytes::new() }
@@ -87,17 +103,7 @@ impl AtlasSolver {
             // Exact allowance of the whole balance; the router pulls only what the bid costs.
             SwapStep { target: self.bid_router, tokenIn: loan_token, amountIn: U256::MAX, data: buy.abi_encode().into() }
         };
-        let op_data = (calls, bid_swap, loan_token, min_profit).abi_encode_params();
-        IAtlasSolver::atlasSolverCallCall {
-            solverOpFrom: self.signer,
-            executionEnvironment: SIM_EXECUTION_ENVIRONMENT,
-            bidToken: Address::ZERO,
-            bidAmount: bid_wei,
-            solverOpData: op_data.into(),
-            extraReturnData: Bytes::new(),
-        }
-        .abi_encode()
-        .into()
+        (calls, bid_swap, loan_token, min_profit).abi_encode_params().into()
     }
 
     /// Atlas stand-in + the solver (if not deployed) + its liquidator (if not deployed).

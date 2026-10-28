@@ -177,10 +177,10 @@ impl Default for AtlasConfig {
     }
 }
 
-/// `[atlas.solver]`: the AtlasLiquidationSolver venue (atlas_venue.rs), SIMULATION ONLY. With
-/// `simulate`, the top position of each valued auction (direct-router plan) is also wrapped into a
-/// solver operation with the journaled bid and simulated against an Atlas stand-in; the net after
-/// the bid is journaled. Nothing is signed or submitted.
+/// `[atlas.solver]`: the AtlasLiquidationSolver venue (atlas_venue.rs). With `simulate`, the top
+/// position of each valued auction (direct-router plan) is also wrapped into a solver operation
+/// with the journaled bid and simulated against an Atlas stand-in; the net after the bid is
+/// journaled. With `submit` (live only) that op is also signed and submitted.
 #[derive(Debug, Deserialize, Clone)]
 pub struct SolverConfig {
     #[serde(default)]
@@ -206,6 +206,16 @@ pub struct SolverConfig {
     pub artifact: String,
     #[serde(default = "default_atlas_stub_artifact")]
     pub stub_artifact: String,
+    /// Sign the solver operation of each valued auction whose op succeeds with a profit after the
+    /// bid, and submit it to `endpoint` (atlas_submit.rs). Only in live mode (exec.mode = "live"
+    /// and `watch --live`), with the solver and its liquidator deployed (`address`, `liquidator`),
+    /// the signer = the hot wallet, and at least `min_bond_eth` atlETH bonded by it.
+    #[serde(default)]
+    pub submit: bool,
+    #[serde(default = "default_bid_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_min_bond")]
+    pub min_bond_eth: f64,
 }
 
 impl Default for SolverConfig {
@@ -220,10 +230,19 @@ impl Default for SolverConfig {
             bid_fee: default_bid_fee(),
             artifact: default_solver_artifact(),
             stub_artifact: default_atlas_stub_artifact(),
+            submit: false,
+            endpoint: default_bid_endpoint(),
+            min_bond_eth: default_min_bond(),
         }
     }
 }
 
+fn default_bid_endpoint() -> String {
+    crate::atlas_submit::SVR_BID_ENDPOINT.into()
+}
+fn default_min_bond() -> f64 {
+    0.01
+}
 fn default_atlas_surcharge() -> f64 {
     0.1
 }

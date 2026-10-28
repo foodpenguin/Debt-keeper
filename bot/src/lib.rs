@@ -16,6 +16,7 @@
 pub use onchain_core::{actor, bid, chain, executor, gates, heads, num, rpc};
 
 pub mod atlas;
+pub mod atlas_submit;
 pub mod atlas_venue;
 pub mod config;
 pub mod contracts;

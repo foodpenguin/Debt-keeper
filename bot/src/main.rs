@@ -26,7 +26,7 @@ use alloy::sol;
 use liquidation_framework::{
     actor::{self, ExecHandle},
     bid::WinningBids,
-    atlas, atlas_venue, config, dash, dex, executor, flash_venue, flashblocks, funding, gates, heads, live, loss, morpho, oracle, planner, protocol, risk, rpc, sim, v3router, venue,
+    atlas, atlas_submit, atlas_venue, config, dash, dex, executor, flash_venue, flashblocks, funding, gates, heads, live, loss, morpho, oracle, planner, protocol, risk, rpc, sim, v3router, venue,
     config::Config,
     engine::JournalRow,
     heads::Head,
@@ -618,6 +618,28 @@ sol! {
     }
 }
 
+/// `[atlas.solver] submit` in live mode: the solver operations' signer, after checking that the
+/// deployed solver is run by it and that it has atlETH bonded. None in shadow mode or without
+/// `submit`.
+async fn build_submitter<P: Provider>(engine: &MorphoEngine<P>, signer: Option<&alloy::signers::local::PrivateKeySigner>) -> Result<Option<atlas_submit::Submitter>> {
+    use alloy::sol_types::SolCall;
+    let c = &engine.cfg.atlas.solver;
+    let Some(signer) = signer.filter(|_| c.submit) else { return Ok(None) };
+    let (p, atlas, control) = (&engine.provider, engine.cfg.flashblocks.atlas, engine.cfg.atlas.control);
+    let solver = c.address.context("atlas.solver.submit needs the deployed solver address")?;
+    anyhow::ensure!(c.signer.is_none_or(|s| s == signer.address()), "atlas.solver.signer must be the hot wallet (it signs the solver ops)");
+    let req = alloy::rpc::types::TransactionRequest::default().to(solver).input(alloy::primitives::Bytes::from(ILiquidatorView::executorCall {}.abi_encode()).into());
+    let run_by = ILiquidatorView::executorCall::abi_decode_returns(&p.call(req).await.context("solver executor()")?)?;
+    anyhow::ensure!(run_by == signer.address(), "solver {solver} is run by {run_by}, not the hot wallet {}", signer.address());
+    let bonded = atlas_submit::bonded(p, atlas, signer.address()).await?;
+    let bonded_eth = math::units(bonded, 18);
+    anyhow::ensure!(bonded_eth >= c.min_bond_eth, "{bonded_eth} atlETH bonded by {} < atlas.solver.min_bond_eth {} (Atlas.depositAndBond, see docs)", signer.address(), c.min_bond_eth);
+    let domain = atlas_submit::read_domain(p, atlas).await?;
+    let gas_limit = atlas_submit::solver_gas_limit(p, control).await?;
+    warn!(%solver, signer = %signer.address(), bonded_eth, gas_limit, version = ?domain.version, "ATLAS LIVE: profitable solver operations WILL be signed and submitted");
+    Ok(Some(atlas_submit::Submitter::new(signer.clone(), domain, atlas, control, c.endpoint.clone(), engine.http.clone(), gas_limit)))
+}
+
 /// Live pre-flight: refuses to send unless the deployed contract, the hot wallet and the
 /// standing Morpho allowances are all consistent.
 async fn preflight_live<P: Provider>(engine: &MorphoEngine<P>, signer_addr: Address) -> Result<()> {
@@ -682,6 +704,8 @@ struct PlannerParts {
     exec: config::ExecConfig,
     /// What winners of past liquidations paid (the risk gate bids against it; see risk.rs).
     bids: std::sync::Mutex<WinningBids>,
+    /// Signs and submits solver operations (live + `[atlas.solver] submit`).
+    submitter: Option<atlas_submit::Submitter>,
 }
 
 impl PlannerParts {
@@ -877,7 +901,7 @@ async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngi
     let price = base.price * U256::from(10_000 - drop_bps) / U256::from(10_000u64);
     let m = auction_market(engine, mi, &base, price);
     let (kyber, simulator) = build_planner_parts(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)) });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: None });
     let a = atlas::Auction {
         id: format!("replay-{market}-{at_block}"),
         aggregator: Address::ZERO,
@@ -978,12 +1002,15 @@ fn unix_ms() -> u64 {
 
 /// The auction's top position as a solver operation (`[atlas.solver] simulate`): its direct-router
 /// plan, wrapped into `atlasSolverCall` with a bid of the plan's net x (1 - margin), simulated against
-/// the Atlas stand-in. Journaled only; nothing is signed or sent. None: solver venue off, or no
-/// direct-router plan to wrap (an aggregator route is built for the direct liquidator's address).
+/// the Atlas stand-in. With a submitter (live + `submit`), an op that succeeds with a profit after
+/// the bid is signed and submitted (unless the kill switch is on, or this EOA already bid for that
+/// block). None: solver venue off, or no direct-router plan to wrap (an aggregator route is built
+/// for the direct liquidator's address).
 #[allow(clippy::too_many_arguments)]
 async fn solver_op<P: Provider>(
     provider: &P,
     parts: &PlannerParts,
+    a: &atlas::Auction,
     m: &AuctionMarket,
     top: Option<&Result<planner::Plan>>,
     overrides: &StateOverride,
@@ -1004,9 +1031,46 @@ async fn solver_op<P: Provider>(
     let at = Some(venue::SimAt { number: block + 1, time: sim_time });
     let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
     Some(match r {
-        Ok(s) => json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": math::units(s.profit, m.meta.loan_decimals), "gas_used": s.gas_used }),
+        Ok(s) => {
+            let submitted = match &parts.submitter {
+                Some(sub) if !s.profit.is_zero() => Some(submit_solver_op(sub, parts, solver, a, m, payload, bid_wei, &s).await),
+                _ => None,
+            };
+            json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": math::units(s.profit, m.meta.loan_decimals), "gas_used": s.gas_used, "submitted": submitted })
+        }
         Err(e) => json!({ "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() }),
     })
+}
+
+/// Signs and submits the simulated solver op `s` for auction `a` (see solver_op): minProfit after
+/// the bid = the simulated net x min_profit_keep, gas = simulated x gas_limit_buffer (within the
+/// DappControl's limit), the auction's own max fee and deadline. The journal row says what happened.
+#[allow(clippy::too_many_arguments)]
+async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, solver: &atlas_venue::AtlasSolver, a: &atlas::Auction, m: &AuctionMarket, payload: &executor::Payload, bid_wei: U256, s: &venue::SimResult) -> serde_json::Value {
+    let e = &parts.exec;
+    if gates::kill_switch_on(&e.kill_switch_file) {
+        return json!({ "ok": false, "error": "kill switch file present" });
+    }
+    if !sub.claim(a.deadline) {
+        return json!({ "ok": false, "error": "this EOA already bid for that block (one op per block per EOA)" });
+    }
+    let min_profit = s.profit * U256::from((e.min_profit_keep * 1e4) as u64) / U256::from(10_000u64);
+    let gas = ((s.gas_used as f64 * e.gas_limit_buffer) as u64).min(sub.gas_limit);
+    let data = solver.op_data(m.meta.params.loanToken, &payload.calldata, bid_wei, min_profit);
+    let signed = match sub.op(solver.solver, a.user_op_hash, a.deadline, a.max_fee_per_gas, gas, bid_wei, data).and_then(|op| atlas_submit::sign(op, &sub.domain, &sub.signer)) {
+        Ok(x) => x,
+        Err(err) => return json!({ "ok": false, "error": err.to_string() }),
+    };
+    match atlas_submit::submit(&sub.http, &sub.endpoint, &a.id, &signed).await {
+        Ok(r) => {
+            warn!(auction = %a.id, market = %m.meta.name, bid_eth = math::units(bid_wei, 18), gas, "ATLAS solver op SUBMITTED");
+            json!({ "ok": true, "bid_wei": bid_wei.to_string(), "gas": gas, "min_profit": min_profit.to_string(), "answer": r })
+        }
+        Err(err) => {
+            warn!(auction = %a.id, error = %err, "ATLAS solver op submission failed");
+            json!({ "ok": false, "error": err.to_string() })
+        }
+    }
 }
 
 async fn valuation<P: Provider>(
@@ -1053,7 +1117,7 @@ async fn valuation<P: Provider>(
     // What Atlas charges a solver op for its gas: the metacall's gas price (the auction's
     // maxFeePerGas) plus the escrow's surcharge, per gas unit, in USD.
     let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
-    let solvers = futures::future::join_all(markets.iter().zip(&valued).map(|(m, (_, _, ov, plans))| solver_op(provider, parts, m, plans.first().map(|(_, p)| p), ov, head.number, sim_time, atlas_gas_usd, eth_usd, atlas.margin))).await;
+    let solvers = futures::future::join_all(markets.iter().zip(&valued).map(|(m, (_, _, ov, plans))| solver_op(provider, parts, a, m, plans.first().map(|(_, p)| p), ov, head.number, sim_time, atlas_gas_usd, eth_usd, atlas.margin))).await;
 
     let (mut rows, mut positions) = (vec![], vec![]);
     let (mut n_liq, mut bonus_sum, mut net_sum, mut bundle_net, mut bundle_ms_max) = (0usize, 0.0f64, 0.0f64, 0.0f64, 0u64);
@@ -1463,7 +1527,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         .with_context(|| format!("opening journal {}", engine.cfg.journal_path))?;
     let (kyber, simulator) = build_planner_parts(engine).await?;
     let v3 = build_v3(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)) });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: build_submitter(engine, live.as_ref().map(|l| &l.0)).await? });
 
     // Watchlist rows are journaled only when a position enters it or its HF moves > 0.2%.
     let mut last_logged_hf: HashMap<(usize, Address), f64> = HashMap::new();
