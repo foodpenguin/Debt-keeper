@@ -6,7 +6,7 @@
 
 ## 範圍：目前哪些是通用的
 
-這個 crate 是一個函式庫（`liquidation_framework`，`bot/src/lib.rs`）加上 Morpho bot 的執行檔（`bot/src/main.rs`）。鏈的基礎管線（RPC 連線池、heads、Flashblocks 串流、`eth_simulateV1` 模擬、executor 和它的 task、送單關卡、出價、共用的設定區段）是 `onchain-core` crate，和 `arbitrage-framework` 共用，並以原本的模組名稱重新匯出（`liquidation_framework::executor`、`::rpc`……）；請把兩個 repo 並排 checkout。
+這個 crate 是一個函式庫（`liquidation_framework`，`bot/src/lib.rs`）加上 Morpho bot 的執行檔（`bot/src/main.rs`）。鏈的基礎管線（RPC 連線池、heads、Flashblocks 串流、`eth_simulateV1` 模擬、executor 和它的 task、送單關卡、出價、共用的設定區段）是 `onchain-core` crate（repo 為 bot-onchain-core，鎖定 tag 的 git 依賴），和 Arb-seeker 共用，並以原本的模組名稱重新匯出（`liquidation_framework::executor`、`::rpc`……）。
 
 通用（針對 trait 撰寫，不指名任何協議）：HF 引擎（`engine.rs`）、planner（`planner.rs`）、venue / DEX / 資金來源三個接口（`venue.rs`、`dex.rs`、`funding.rs`）和它們的 venue 實作（`sim.rs`、`flash_venue.rs`、`atlas_venue.rs`）、風控閘門（`risk.rs`），以及 `onchain-core` 的所有部分。仍然綁定 Morpho 的應用層程式：`main.rs` 的 watch 迴圈（區塊路徑、同塊路徑、送單路徑、pre-flight）、預言機價格模型（`oracle.rs`，MorphoChainlinkOracleV2）、Atlas 估值、儀表板和輸單分析。新的協議可以直接沿用通用核心，但目前需要自己的應用迴圈（從 `main.rs` 改起）。
 

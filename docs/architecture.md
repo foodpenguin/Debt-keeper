@@ -12,8 +12,9 @@ implementation and the reference for new ones.
 The crate is a library (`liquidation_framework`, `bot/src/lib.rs`) plus the Morpho bot binary
 (`bot/src/main.rs`). The chain plumbing (RPC pool, heads, Flashblocks stream, `eth_simulateV1`
 simulation, executor and its task, send gates, bidding, the shared config sections) is the
-`onchain-core` crate, shared with `arbitrage-framework` and re-exported under its usual module
-names (`liquidation_framework::executor`, `::rpc`, ...); check the repositories out side by side.
+`onchain-core` crate (repository bot-onchain-core, a git dependency pinned to a tag), shared with
+Arb-seeker and re-exported under its usual module names (`liquidation_framework::executor`,
+`::rpc`, ...).
 
 Generic (written against the traits, no protocol named): the HF engine (`engine.rs`), the planner
 (`planner.rs`), the venue / DEX / funding seams (`venue.rs`, `dex.rs`, `funding.rs`) and their

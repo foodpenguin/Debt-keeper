@@ -1,4 +1,4 @@
-# liquidation-framework — notes for AI coding assistants and contributors
+# Debt-keeper (crate `liquidation-framework`) — notes for AI coding assistants and contributors
 
 A framework for building on-chain **liquidation bots** in Rust (alloy) + Foundry. The core
 (health-factor engine, planner, executor, RPC pool) is protocol-agnostic; Morpho Blue on Base is the
@@ -13,9 +13,11 @@ first implementation. Read `docs/architecture.md` before changing core code.
   (MorphoLiquidator), `flash_venue.rs` (FlashLiquidator), `atlas_venue.rs` + `atlas_submit.rs`
   (AtlasLiquidationSolver; EIP-712 solver ops), `router.rs` (KyberSwap), `v3router.rs` (self-built
   direct router). Test doubles: `testkit.rs` (`Toy` isolated, `ToyPool` account-level).
-- `../onchain-core` — the plumbing (rpc, heads, Flashblocks stream, simulation, executor + its task,
-  gates, bidding, shared config sections), a separate repository checked out next to this one and
-  used by path. Changes there must keep this crate and `arbitrage-framework` building and passing.
+- `onchain-core` (repository bot-onchain-core) — the plumbing (rpc, heads, Flashblocks stream,
+  simulation, executor + its task, gates, bidding, shared config sections), a git dependency pinned
+  to a tag in `bot/Cargo.toml`. Build against a local checkout with
+  `--config 'patch."https://github.com/foodpenguin/bot-onchain-core".onchain-core.path="<path>"'`.
+  Changes there must keep this crate and Arb-seeker building and passing.
 - `contracts/` — Foundry. `MorphoLiquidator.sol`, `FlashLiquidator.sol`,
   `AtlasLiquidationSolver.sol`, and the simulation-only `sim/GridQuoter.sol` and `sim/AtlasStub.sol`.
 - `docs/` — architecture and setup, in English and Traditional Chinese (`*.zh-TW.md`).

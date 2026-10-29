@@ -11,8 +11,9 @@ safety come before features.
   `LiquidationVenue`, `Dex`) and why the core is shaped the way it is.
 - For a larger change (a new protocol, a new venue, a change to the engine or the contract), open an
   issue first to agree on the approach.
-- The chain plumbing (RPC pool, executor, simulation, gates, bidding) lives in `onchain-core`, a
-  separate repository checked out next to this one; a change there is a pull request there.
+- The chain plumbing (RPC pool, executor, simulation, gates, bidding) lives in `onchain-core`
+  ([bot-onchain-core](https://github.com/foodpenguin/bot-onchain-core), a git dependency pinned to
+  a tag); a change there is a pull request there.
 
 ## Development setup
 

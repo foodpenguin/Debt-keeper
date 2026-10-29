@@ -19,12 +19,11 @@ rustls and SQLite is bundled, so no OpenSSL or system SQLite is needed.
 
 ## 2. Code
 
-The bot builds on the `onchain-core` crate (by path), so clone both side by side:
+The bot builds on the `onchain-core` crate, a git dependency cargo fetches by itself:
 
 ```bash
-git clone <onchain-core-url> onchain-core
-git clone --recurse-submodules <repo-url> liquidation-framework
-cd liquidation-framework
+git clone --recurse-submodules https://github.com/foodpenguin/Debt-keeper.git
+cd Debt-keeper
 git submodule update --init --recursive    # if you cloned without --recurse-submodules (forge-std)
 cd contracts && forge build && cd ..        # also produces the artifacts the bot simulates with
                                             # (MorphoLiquidator, FlashLiquidator, AtlasLiquidationSolver, AtlasStub, GridQuoter)

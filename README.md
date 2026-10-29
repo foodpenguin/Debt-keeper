@@ -1,4 +1,4 @@
-# liquidation-framework
+# Debt-keeper
 
 [繁體中文](README.zh-TW.md)
 
@@ -9,7 +9,8 @@ aggregator and a liquidation contract plug in through traits; both isolated mark
 and account-level protocols (Aave-style pools: health over the whole account, several collateral /
 debt pairs) fit them. **Morpho Blue on Base** is the first implementation, with a capital-free
 liquidation contract (the repayment is funded inside Morpho's liquidate callback). The chain
-plumbing comes from [`onchain-core`](#building), shared with `arbitrage-framework`.
+plumbing comes from [bot-onchain-core](https://github.com/foodpenguin/bot-onchain-core) (crate `onchain-core`),
+shared with [Arb-seeker](https://github.com/foodpenguin/Arb-seeker). This crate is `liquidation-framework`.
 
 > **Status:** experimental. Nothing here is financial advice and nothing is tuned for you: the
 > example configuration uses neutral values. Run it in shadow mode, test sends on an anvil fork,
@@ -91,12 +92,15 @@ docs/           architecture and setup (English / 繁體中文)
 
 ## Building
 
-This crate depends on `onchain-core` by path: check the repositories out side by side.
+`onchain-core` is a git dependency pinned to a tag (`bot/Cargo.toml`); cargo fetches it, nothing to
+check out by hand. To build against a local checkout of bot-onchain-core (e.g. while changing both),
+override it from `bot/`:
 
 ```
-<dir>/onchain-core
-<dir>/liquidation-framework
+cargo test --config 'patch."https://github.com/foodpenguin/bot-onchain-core".onchain-core.path="../../bot-onchain-core"'
 ```
+
+The override rewrites `bot/Cargo.lock`; do not commit that change.
 
 ## Quick start
 

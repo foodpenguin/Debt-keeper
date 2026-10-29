@@ -9,8 +9,9 @@
 - 先讀 [docs/architecture.zh-TW.md](docs/architecture.zh-TW.md)：trait 介面（`LendingProtocol`、
   `LiquidationVenue`、`Dex`），以及核心為什麼長這樣。
 - 較大的改動（新協議、新 venue、改引擎或合約）請先開 issue 討論做法。
-- 鏈的基礎管線（RPC 池、executor、模擬、關卡、出價）放在 `onchain-core`，這是另一個 repo，和這個
-  repo 並排 checkout；那裡的改動請在那個 repo 開 pull request。
+- 鏈的基礎管線（RPC 池、executor、模擬、關卡、出價）放在 `onchain-core`
+  （[bot-onchain-core](https://github.com/foodpenguin/bot-onchain-core)，鎖定 tag 的 git 依賴）；那裡的
+  改動請在那個 repo 開 pull request。
 
 ## 開發環境
 

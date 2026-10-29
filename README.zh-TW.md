@@ -1,4 +1,4 @@
-# liquidation-framework
+# Debt-keeper
 
 [English](README.md)
 
@@ -7,7 +7,8 @@
 借貸協議、DEX 聚合器和清算合約透過 trait 接上；隔離市場（Morpho 式）和帳戶層級的協議（Aave 式的
 池子：健康度以整個帳戶計算，有多組抵押品／負債組合）都適用。第一個實作是 **Base 上的 Morpho Blue**，
 搭配一個不需要本金的清算合約（還款資金在 Morpho 的 liquidate callback 裡籌措）。鏈的基礎管線來自
-[`onchain-core`](#編譯)，和 `arbitrage-framework` 共用。
+[bot-onchain-core](https://github.com/foodpenguin/bot-onchain-core)（crate `onchain-core`），和
+[Arb-seeker](https://github.com/foodpenguin/Arb-seeker) 共用。這個 crate 名稱是 `liquidation-framework`。
 
 > **狀態：**實驗性。這裡沒有任何投資建議，也沒有替你調好的參數：範例設定用的是中性值。請先用
 > shadow 模式跑、在 anvil fork 上測試送單，並有學習期間會虧 gas 的心理準備。
@@ -81,12 +82,14 @@ docs/           架構與安裝（English / 繁體中文）
 
 ## 編譯
 
-這個 crate 以路徑依賴 `onchain-core`：請把兩個 repo 並排 checkout。
+`onchain-core` 是鎖定 tag 的 git 依賴（`bot/Cargo.toml`），cargo 會自己抓，不必手動 checkout。要改用
+本機 checkout 的 bot-onchain-core 編譯（例如兩邊同時在改），在 `bot/` 目錄覆寫依賴：
 
 ```
-<dir>/onchain-core
-<dir>/liquidation-framework
+cargo test --config 'patch."https://github.com/foodpenguin/bot-onchain-core".onchain-core.path="../../bot-onchain-core"'
 ```
+
+覆寫會改動 `bot/Cargo.lock`，這個變更不要 commit。
 
 ## 快速開始
 
