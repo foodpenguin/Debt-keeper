@@ -35,8 +35,10 @@ struct SolverCall {
 ///      - every call target and the bid-swap router must be owner-allowlisted; the bid-swap
 ///        allowance is exact and reset to zero;
 ///      - bids are in ETH only (SVR); the bid goes to the execution environment Atlas names;
-///      - the whole call reverts unless the profit token left after paying the bid is at least
-///        `minProfit`; that profit and any leftover WETH go to PROFIT_RECEIVER (nothing at rest).
+///      - the whole call reverts unless the profit token this call gained, after paying the bid, is
+///        at least `minProfit` (a balance change: tokens a liquidator left here earlier, e.g. its
+///        leftover collateral, never count); the whole profit-token balance and any leftover WETH
+///        then go to PROFIT_RECEIVER.
 ///      `atlasSolverCall` returns the net profit (callers that expect no return value ignore it).
 contract AtlasLiquidationSolver {
     address public immutable ATLAS;
@@ -102,6 +104,9 @@ contract AtlasLiquidationSolver {
         if (bidToken != address(0)) revert UnsupportedBidToken(bidToken);
         (SolverCall[] memory calls, SwapStep memory bidSwap, address profitToken, uint256 minProfit) =
             abi.decode(solverOpData, (SolverCall[], SwapStep, address, uint256));
+        // The liquidators this solver drives send it their leftover collateral, so a later op's
+        // profit token may already sit here: only what this call adds is profit.
+        uint256 before = IERC20S(profitToken).balanceOf(address(this));
 
         for (uint256 i; i < calls.length; ++i) {
             if (!allowedTarget[calls[i].target]) revert TargetNotAllowed(calls[i].target);
@@ -126,9 +131,10 @@ contract AtlasLiquidationSolver {
         (uint256 gasLiability,) = IAtlasEscrow(ATLAS).shortfall();
         IAtlasEscrow(ATLAS).reconcile{value: repay}(gasLiability);
 
-        profit = IERC20S(profitToken).balanceOf(address(this));
+        uint256 bal = IERC20S(profitToken).balanceOf(address(this));
+        profit = bal > before ? bal - before : 0;
         if (profit < minProfit) revert InsufficientProfit(profit, minProfit);
-        if (profit > 0) _safeTransfer(profitToken, PROFIT_RECEIVER, profit);
+        if (bal > 0) _safeTransfer(profitToken, PROFIT_RECEIVER, bal);
         if (profitToken != WETH) {
             uint256 weth = IERC20S(WETH).balanceOf(address(this));
             if (weth > 0) _safeTransfer(WETH, PROFIT_RECEIVER, weth);

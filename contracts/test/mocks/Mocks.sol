@@ -119,7 +119,8 @@ interface IV3CallbackLike {
 
 /// V3-pool lookalike: token0 = collateral (sold), token1 = loan (bought), 1:1 price.
 /// `mode` 0 = honest, 1 = asks for 2x the input, 2 = calls back twice, 3 = pays nothing out,
-/// 4 = reports the output with the wrong (positive) sign.
+/// 4 = reports the output with the wrong (positive) sign, 5 = runs out of liquidity and fills only
+/// 95% of the input.
 contract MockV3Pool {
     MockERC20 public immutable token0;
     MockERC20 public immutable token1;
@@ -139,10 +140,44 @@ contract MockV3Pool {
         returns (int256, int256)
     {
         uint256 amountIn = uint256(amountSpecified);
+        if (mode == 5) amountIn = amountIn * 95 / 100;
         if (mode != 3) token1.transfer(recipient, amountIn);
         int256 ask = mode == 1 ? int256(amountIn * 2) : int256(amountIn);
         IV3CallbackLike(msg.sender).uniswapV3SwapCallback(ask, -int256(amountIn), "");
         if (mode == 2) IV3CallbackLike(msg.sender).uniswapV3SwapCallback(ask, -int256(amountIn), "");
         return (ask, mode == 4 ? int256(amountIn) : -int256(amountIn));
+    }
+}
+
+/// Fake pool that reports collateral as token0 when the hop starts, then switches token0 to the
+/// loan token inside its swap, hoping to be paid in what the contract has just received.
+contract TokenSwitchingPool {
+    MockERC20 public immutable collateral;
+    MockERC20 public immutable loan;
+    bool private switched;
+
+    constructor(MockERC20 c, MockERC20 l) {
+        collateral = c;
+        loan = l;
+    }
+
+    function token0() external view returns (address) {
+        return switched ? address(loan) : address(collateral);
+    }
+
+    function token1() external view returns (address) {
+        return address(loan);
+    }
+
+    function swap(address recipient, bool, int256 amountSpecified, uint160, bytes calldata)
+        external
+        returns (int256, int256)
+    {
+        uint256 amountIn = uint256(amountSpecified);
+        loan.transfer(recipient, amountIn);
+        switched = true;
+        IV3CallbackLike(msg.sender).uniswapV3SwapCallback(int256(amountIn), -int256(amountIn), "");
+        switched = false;
+        return (int256(amountIn), -int256(amountIn));
     }
 }

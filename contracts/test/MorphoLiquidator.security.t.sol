@@ -12,7 +12,8 @@ import {
     GreedyRouter,
     ReentrantRouter,
     CallbackForger,
-    MockV3Pool
+    MockV3Pool,
+    TokenSwitchingPool
 } from "./mocks/Mocks.sol";
 
 /// Attack and misuse scenarios against the liquidator, using mocks (no fork, fast).
@@ -251,6 +252,42 @@ contract MorphoLiquidatorSecurityTest is Test {
         vm.expectRevert(); // Morpho cannot be repaid -> whole tx reverts, pool keeps nothing
         liq.liquidateRoute(mp, address(0xB0B), SEIZE, route, 0, block.number);
         assertEq(coll.balanceOf(address(pool)), 0);
+    }
+
+    /// A pool that runs out of liquidity takes less than its hop input: the liquidation still goes
+    /// through, and the collateral it did not take is swept instead of staying at rest.
+    function test_route_partialFillLeftoverIsSwept() public {
+        MockV3Pool pool = new MockV3Pool(coll, loan);
+        loan.mint(address(pool), 1_000_000e18);
+        bytes memory route = _poolRoute(pool, 5);
+        vm.prank(executor);
+        uint256 p = liq.liquidateRoute(mp, address(0xB0B), SEIZE, route, 1, block.number);
+        assertEq(p, SEIZE * 95 / 100 - SEIZE * 9 / 10, "profit on the 95% that was sold");
+        assertEq(coll.balanceOf(address(liq)), 0, "nothing at rest");
+        assertEq(coll.balanceOf(receiver), SEIZE * 5 / 100, "unsold collateral swept");
+    }
+
+    /// The token a pool is paid in is read before its swap: switching `token0` inside the swap does
+    /// not make the contract pay it the loan token it has just received.
+    function test_route_poolCannotSwitchItsPaymentToken() public {
+        TokenSwitchingPool pool = new TokenSwitchingPool(coll, loan);
+        loan.mint(address(pool), 1_000_000e18);
+        bytes memory route = abi.encodePacked(address(pool), uint8(1), uint128(SEIZE));
+        vm.prank(executor);
+        uint256 p = liq.liquidateRoute(mp, address(0xB0B), SEIZE, route, 1, block.number);
+        assertEq(p, SEIZE / 10);
+        assertEq(coll.balanceOf(address(pool)), SEIZE, "paid in collateral");
+        assertEq(loan.balanceOf(address(liq)), 0);
+    }
+
+    /// A source leg sells the seized collateral and nothing else.
+    function test_route_sourceLegMustSellCollateral() public {
+        MockV3Pool pool = new MockV3Pool(loan, coll); // token0 = loan token
+        coll.mint(address(pool), 1_000_000e18);
+        bytes memory route = abi.encodePacked(address(pool), uint8(1), uint128(SEIZE));
+        vm.prank(executor);
+        vm.expectRevert(MorphoLiquidator.BadRoute.selector);
+        liq.liquidateRoute(mp, address(0xB0B), SEIZE, route, 0, block.number);
     }
 
     // ------------------------------------------------------------- packed entry

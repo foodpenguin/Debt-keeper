@@ -11,6 +11,7 @@ interface IV3Pool {
     function token1() external view returns (address);
 }
 
-/// @dev TickMath bounds (+/-1 so the limit never binds: exact-input swaps run to completion).
+/// @dev TickMath bounds +/-1, the widest limits `swap` accepts. An exact-input swap still stops at
+///      the limit when the pool runs out of liquidity, and then takes less than its input.
 uint160 constant MIN_SQRT_PRICE_LIMIT = 4295128740;
 uint160 constant MAX_SQRT_PRICE_LIMIT = 1461446703485210103287273052203988822378723970341;
