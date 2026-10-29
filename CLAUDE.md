@@ -21,7 +21,7 @@ first implementation. Read `docs/architecture.md` before changing core code.
 - `docs/` — architecture and setup, in English and Traditional Chinese (`*.zh-TW.md`).
 
 ## Commands
-- `cd bot && cargo check --all-targets` must stay at **0 warnings**; `cargo test` must pass.
+- `cd bot && cargo check --all-targets` and `cargo clippy --all-targets` must stay at **0 warnings**; `cargo test` must pass.
 - `cargo test e2e -- --ignored` runs the send path against a local **anvil fork** (needs anvil).
 - `cd contracts && forge build && forge test` (fork tests need `BASE_RPC_URL`; use `-j 1` on
   free RPC plans).

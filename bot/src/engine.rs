@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use crate::{
     config::Config,
-    protocol::{BorrowerInfo, LendingProtocol, LiquidationOption, MarketInfo, Pair, Touched},
+    protocol::{BorrowerInfo, LendingProtocol, MarketInfo, Pair, Touched},
 };
 
 pub struct Engine<P, L: LendingProtocol> {
@@ -36,7 +36,7 @@ pub struct Engine<P, L: LendingProtocol> {
 
 /// One tracked position evaluated against its market's snapshot. `pair`, `max_seize`, `quote`
 /// and `bonus` describe its best liquidation option (the account's main pair and zeros while it is
-/// healthy); `options` lists every option, best first (an account-level protocol may have several).
+/// healthy): the first of `LendingProtocol::evaluate`'s options, which are ranked best first.
 pub struct PositionView<L: LendingProtocol> {
     pub market: usize,
     pub user: Address,
@@ -49,18 +49,6 @@ pub struct PositionView<L: LendingProtocol> {
     pub quote: Option<L::Quote>,
     /// Seized value at the oracle price minus repaid debt, in debt-token units (before swap costs and gas).
     pub bonus: f64,
-    pub options: Vec<LiquidationOption<L::Quote>>,
-}
-
-impl<L: LendingProtocol> PositionView<L> {
-    /// This view liquidated on another of its options (`options[i]`).
-    pub fn with_option(&self, i: usize) -> Self {
-        let mut v = self.clone();
-        if let Some(o) = self.options.get(i) {
-            (v.pair, v.max_seize, v.quote, v.bonus) = (o.pair, o.max_seize, o.quote.clone(), o.bonus);
-        }
-        v
-    }
 }
 
 // Manual impls: a derive would also require the protocol type itself to be Clone/Debug.
@@ -76,7 +64,6 @@ impl<L: LendingProtocol> Clone for PositionView<L> {
             max_seize: self.max_seize,
             quote: self.quote.clone(),
             bonus: self.bonus,
-            options: self.options.clone(),
         }
     }
 }
@@ -92,7 +79,6 @@ impl<L: LendingProtocol> std::fmt::Debug for PositionView<L> {
             .field("max_seize", &self.max_seize)
             .field("quote", &self.quote)
             .field("bonus", &self.bonus)
-            .field("options", &self.options.len())
             .finish()
     }
 }
@@ -265,7 +251,6 @@ pub fn view<L: LendingProtocol>(protocol: &L, market: usize, user: Address, m: &
         quote: best.and_then(|o| o.quote.clone()),
         bonus: best.map_or(0.0, |o| o.bonus),
         health: e.health,
-        options: e.options,
     }
 }
 

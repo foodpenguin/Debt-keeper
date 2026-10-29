@@ -139,13 +139,17 @@ fn events(db: &Connection, since: f64) -> Result<Value> {
     Ok(json!({ "hourly": hourly, "recent": recent }))
 }
 
+/// A `liquidations` row joined with its tx: (block, market, gross_usd, liquidator, outcome,
+/// is_atlas, tx, borrower).
+type LiquidationDbRow = (i64, Option<String>, Option<f64>, Option<String>, Option<String>, Option<bool>, Option<String>, Option<String>);
+
 /// [ts, market, gross_usd, liquidator, outcome, via ("atlas" | "direct" | null = not looked up), tx, borrower]
 fn liquidations(db: &Connection, clock: &Clock, since: f64) -> Result<Vec<Value>> {
     let mut q = db.prepare(
         "SELECT l.block, l.market, l.gross_usd, l.liquidator, l.outcome, t.is_atlas, l.tx, l.borrower
          FROM liquidations l LEFT JOIN liq_txs t ON t.tx = l.tx WHERE l.block >= ?1 ORDER BY l.block DESC",
     )?;
-    let rows: Vec<(i64, Option<String>, Option<f64>, Option<String>, Option<String>, Option<bool>, Option<String>, Option<String>)> =
+    let rows: Vec<LiquidationDbRow> =
         q.query_map(params![clock.block_at(since)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?;
     Ok(rows
         .into_iter()
@@ -212,13 +216,17 @@ fn auctions(db: &Connection, clock: &Clock, since: f64, eth_usd_now: f64) -> Res
 /// bundle net x (1 - m) for each atlas.paper_margins m. Won = our bid above the winning one (in ETH,
 /// at the auction's ETH price); in time = our valuation done within atlas.paper_deadline_ms of the
 /// auction. P&L of a win = bundle net - our bid (what our own exit would have left).
+/// An auction valuation with the winning bid: (head, bundle_net_usd, eth_usd, value_ms, json,
+/// win_bid_eth, winner).
+type PaperRow = (i64, f64, f64, Option<i64>, String, f64, Option<String>);
+
 fn paper(db: &Connection, clock: &Clock, since: f64, cfg: &Config) -> Result<Value> {
     let mut q = db.prepare(
         "SELECT a.head, a.bundle_net_usd, a.eth_usd, a.value_ms, a.json, t.win_bid_eth, t.winner
          FROM atlas_auctions a JOIN liq_txs t ON t.user_op_hash = a.user_op_hash
          WHERE a.liquidatable > 0 AND a.bid_basis = 'bundle_net' AND t.win_bid_eth IS NOT NULL AND a.head >= ?1 ORDER BY a.head",
     )?;
-    let rows: Vec<(i64, f64, f64, Option<i64>, String, f64, Option<String>)> = q
+    let rows: Vec<PaperRow> = q
         .query_map(params![clock.block_at(since)], |r| Ok((r.get(0)?, r.get::<_, Option<f64>>(1)?.unwrap_or(0.0), r.get::<_, Option<f64>>(2)?.unwrap_or(0.0), r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let deadline = cfg.atlas.paper_deadline_ms as i64;
@@ -303,9 +311,12 @@ fn exits(db: &Connection, clock: &Clock, since: f64) -> Result<Vec<Value>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// (unit name, monthly allowance, cost per method).
+type RpcPlan = (&'static str, Option<f64>, &'static [(&'static str, f64)]);
+
 /// Free-plan price list (estimates from the providers' published plans; check them, plans change):
 /// unit name, monthly allowance (None = not published), cost per method (default last).
-fn plan(endpoint: &str, days_in_month: f64) -> Option<(&'static str, Option<f64>, &'static [(&'static str, f64)])> {
+fn plan(endpoint: &str, days_in_month: f64) -> Option<RpcPlan> {
     match endpoint {
         "alchemy" => Some((
             "CU",

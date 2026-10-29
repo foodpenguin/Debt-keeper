@@ -52,12 +52,12 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
-                if v["index"].as_u64() == Some(0) {
-                    if let Some(bn) = v["base"]["block_number"].as_str() {
-                        let n = u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap_or(0);
-                        // index 0 of N opens block N: block N-1 is sealed
-                        arr.lock().unwrap().entry(("fb-index0".into(), n - 1)).or_insert(now);
-                    }
+                if v["index"].as_u64() == Some(0)
+                    && let Some(bn) = v["base"]["block_number"].as_str()
+                {
+                    let n = u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap_or(0);
+                    // index 0 of N opens block N: block N-1 is sealed
+                    arr.lock().unwrap().entry(("fb-index0".into(), n - 1)).or_insert(now);
                 }
             }
         });

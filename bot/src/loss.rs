@@ -190,6 +190,9 @@ impl LossTracker {
     }
 }
 
+/// Per liquidator: (liquidations, gross, summed priority fee in gwei, tx indexes in their blocks).
+type LiquidatorTally = (usize, f64, f64, Vec<u64>);
+
 /// Summary over all `liquidation` rows in a journal.
 pub fn report(rows: &[LiquidationRow]) {
     if rows.is_empty() {
@@ -243,7 +246,7 @@ pub fn report(rows: &[LiquidationRow]) {
     }
 
     println!("\ntop liquidators (by gross):");
-    let mut bl: HashMap<(Address, Option<Address>), (usize, f64, f64, Vec<u64>)> = HashMap::new();
+    let mut bl: HashMap<(Address, Option<Address>), LiquidatorTally> = HashMap::new();
     for r in rows {
         let e = bl.entry((r.liquidator, r.eoa)).or_default();
         e.0 += 1;

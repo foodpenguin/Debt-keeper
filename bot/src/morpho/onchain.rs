@@ -109,11 +109,11 @@ pub async fn load_snapshots<P: Provider>(
         let base = calls.len();
         calls.push((morpho, IMorpho::marketCall { id: m.id }.abi_encode().into()));
         calls.push((m.params.oracle, IOracle::priceCall {}.abi_encode().into()));
-        if m.params.irm != Address::ZERO {
-            if let Some(Some(prev_snap)) = prev.and_then(|p| p.get(i)) {
-                irm_index[i] = Some(calls.len());
-                calls.push(irm_call(m, &prev_snap.raw));
-            }
+        if m.params.irm != Address::ZERO
+            && let Some(Some(prev_snap)) = prev.and_then(|p| p.get(i))
+        {
+            irm_index[i] = Some(calls.len());
+            calls.push(irm_call(m, &prev_snap.raw));
         }
         layout.push(base);
     }
@@ -133,11 +133,11 @@ pub async fn load_snapshots<P: Provider>(
     let mut missing = Vec::new();
     let mut second = Vec::new();
     for (i, m) in metas.iter().enumerate() {
-        if rates[i].is_none() && m.params.irm != Address::ZERO {
-            if let (Some(state), _) = &states[i] {
-                missing.push(i);
-                second.push(irm_call(m, state));
-            }
+        if rates[i].is_none() && m.params.irm != Address::ZERO
+            && let (Some(state), _) = &states[i]
+        {
+            missing.push(i);
+            second.push(irm_call(m, state));
         }
     }
     if !second.is_empty() {

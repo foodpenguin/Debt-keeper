@@ -23,12 +23,11 @@ const LIQUIDATE: B256 = b256!("a4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010
 async fn rpc(http: &reqwest::Client, url: &str, method: &str, params: Value) -> anyhow::Result<Value> {
     for attempt in 0..6 {
         tokio::time::sleep(std::time::Duration::from_millis(450)).await;
-        if let Ok(r) = http.post(url).json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).send().await {
-            if let Ok(v) = r.json::<Value>().await {
-                if let Some(x) = v.get("result") {
-                    return Ok(x.clone());
-                }
-            }
+        if let Ok(r) = http.post(url).json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).send().await
+            && let Ok(v) = r.json::<Value>().await
+            && let Some(x) = v.get("result")
+        {
+            return Ok(x.clone());
         }
         tokio::time::sleep(std::time::Duration::from_millis(800 * (attempt + 1))).await;
     }
@@ -72,11 +71,11 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if t.first() == Some(&SolverTxResult::SIGNATURE_HASH) {
                     let data: Bytes = l["data"].as_str().unwrap_or("0x").parse()?;
-                    if let Ok(e) = SolverTxResult::decode_raw_log(t.iter().copied(), &data) {
-                        if e.success && winner.is_null() {
-                            let bid = e.bidAmount.to_string().parse::<f64>().unwrap_or(0.0) / 1e18;
-                            winner = json!({ "solver": e.solverTo, "bid_eth": bid, "bid_usd": bid * eth_usd });
-                        }
+                    if let Ok(e) = SolverTxResult::decode_raw_log(t.iter().copied(), &data)
+                        && e.success && winner.is_null()
+                    {
+                        let bid = e.bidAmount.to_string().parse::<f64>().unwrap_or(0.0) / 1e18;
+                        winner = json!({ "solver": e.solverTo, "bid_eth": bid, "bid_usd": bid * eth_usd });
                     }
                 }
             }

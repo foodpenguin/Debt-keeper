@@ -48,7 +48,7 @@
 - 規劃用的 hook，全部針對某個 `Pair`（出場是把 `pair.collateral` 賣成 `pair.debt`；利潤以負債代幣計）：`token_decimals(market, token)`、`repay_for_seize(market, snap, pair, seize)`、`collateral_value(market, snap, pair, amount)`（以協議的價格換算成負債代幣單位）、`pairs(market)`（出場路由必須涵蓋的所有組合），以及 `loan_usd(market, snap, debt_token, eth_usd)`：每單位負債代幣的美元價格。利潤、gas 取捨和出價都以 USD 比較；回傳 `None` 表示沒有價格模型，這筆清算會被拒絕，而不是被錯誤計價。Morpho 用 `morpho::loan_usd_model`：USD 穩定幣（`USDC`、`USDbC`、`USDT`、`DAI`、`USDS`）以 1 計、`WETH` 以 ETH 價格計，其他一律 `None`。程式啟動時也會拒絕這類市場。
 - `eth_usd`（可選）：從追蹤中的市場推出 ETH/USD，用來計算 gas 成本。
 
-**隔離市場與帳戶層級的協議。**engine 追蹤的是（市場, 帳戶）倉位。隔離型協議（Morpho Blue）的一個市場就是一種抵押品／一種借款代幣。帳戶層級的協議（Aave 式的池子、Compound 式的 comptroller）的「市場」是池子，倉位是整個帳戶在所有 reserve 上的部位：`evaluate` 綜合所有 reserve 計算健康度，並為每一組（抵押品, 負債）回傳一個選項。`PositionView` 帶著最好的選項（`pair`、`max_seize`、`quote`、`bonus`）和全部選項（`options`；`with_option(i)` 改規劃另一個）。`testkit::ToyPool`（兩種抵押品和兩種負債 reserve、close factor 50%、5% 獎勵）是完整範例：`planner.rs` 裡的 `account_level_tests` 檢查被清算的是最好的組合，而且還款、利潤代幣和 USD 價格都跟著它走。
+**隔離市場與帳戶層級的協議。**engine 追蹤的是（市場, 帳戶）倉位。隔離型協議（Morpho Blue）的一個市場就是一種抵押品／一種借款代幣。帳戶層級的協議（Aave 式的池子、Compound 式的 comptroller）的「市場」是池子，倉位是整個帳戶在所有 reserve 上的部位：`evaluate` 綜合所有 reserve 計算健康度，並為每一組（抵押品, 負債）回傳一個選項。`PositionView` 帶著最好的選項（`pair`、`max_seize`、`quote`、`bonus`）。`testkit::ToyPool`（兩種抵押品和兩種負債 reserve、close factor 50%、5% 獎勵）是完整範例：`planner.rs` 裡的 `account_level_tests` 檢查被清算的是最好的組合，而且還款、利潤代幣和 USD 價格都跟著它走。
 
 每個方法都維持熱路徑上「批次、增量」的形狀：所有被動到的倉位一次讀完，所有快照一次讀完。
 

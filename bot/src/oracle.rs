@@ -84,6 +84,10 @@ struct Feed {
     svr: bool,
 }
 
+/// `PriceModel::for_test`'s market: (scale, base feed indexes, quote feed indexes).
+#[cfg(test)]
+type TestMarket = (U256, Vec<usize>, Vec<usize>);
+
 #[derive(Debug, Clone)]
 struct MarketFeeds {
     scale: U256,
@@ -310,8 +314,10 @@ impl PriceModel {
         }
     }
 
+    /// A model for unit tests: feeds as (proxy, aggregator, answer, svr), markets as (scale, base
+    /// feed indexes, quote feed indexes).
     #[cfg(test)]
-    pub fn for_test(feeds: Vec<(Address, Address, U256, bool)>, markets: Vec<Option<(U256, Vec<usize>, Vec<usize>)>>) -> Self {
+    pub fn for_test(feeds: Vec<(Address, Address, U256, bool)>, markets: Vec<Option<TestMarket>>) -> Self {
         PriceModel {
             feeds: feeds.into_iter().map(|(proxy, aggregator, answer, svr)| Feed { proxy, aggregator, answer, svr }).collect(),
             markets: markets.into_iter().map(|m| m.map(|(scale, base, quote)| MarketFeeds { scale, base, quote })).collect(),

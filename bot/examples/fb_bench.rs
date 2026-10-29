@@ -14,6 +14,8 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 const WS: &str = "wss://mainnet.flashblocks.base.org/ws";
+/// Flashblocks seen over WS: (block, index, cumulative tx count, arrival ms).
+type Seen = Arc<Mutex<Vec<(u64, u64, usize, i64)>>>;
 
 fn env_urls() -> Vec<(String, String)> {
     let text = std::fs::read_to_string("../.env").unwrap_or_default();
@@ -60,8 +62,7 @@ async fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let deadline = t0 + Duration::from_secs(secs);
 
-    // WS: (block, index) -> (cumulative tx count, arrival ms)
-    let ws_seen: Arc<Mutex<Vec<(u64, u64, usize, i64)>>> = Arc::default();
+    let ws_seen: Seen = Arc::default();
     let ws_task = {
         let ws_seen = ws_seen.clone();
         tokio::spawn(async move {

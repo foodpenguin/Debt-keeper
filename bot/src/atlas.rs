@@ -102,10 +102,10 @@ pub fn spawn(url: String, chain_id: u64, control: Address, tx: mpsc::Sender<FbEv
                     while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(60), ws.next()).await {
                         match msg {
                             Ok(Message::Text(t)) => {
-                                if let Some(a) = parse(&t, chain_id, control, Instant::now()) {
-                                    if tx.try_send(FbEvent::Auction(a)).is_err() {
-                                        warn!("flashblock event channel full; auction dropped");
-                                    }
+                                if let Some(a) = parse(&t, chain_id, control, Instant::now())
+                                    && tx.try_send(FbEvent::Auction(a)).is_err()
+                                {
+                                    warn!("flashblock event channel full; auction dropped");
                                 }
                             }
                             Ok(Message::Ping(p)) => {

@@ -260,7 +260,7 @@ impl V3Router {
                 out.push((addr, label, depth));
             }
         }
-        out.sort_by(|x, y| y.2.cmp(&x.2));
+        out.sort_by_key(|x| std::cmp::Reverse(x.2));
         Ok(out.into_iter().map(|(a, l, _)| (a, l)).collect())
     }
 
@@ -419,10 +419,10 @@ pub fn allocate(
     for s in 0..n {
         let mut only = vec![false; n];
         only[s] = true;
-        if let Some(c) = greedy(grid, n_direct, &sink, &only, &repay, gas_per_extra_leg, &gas_cost, &to_units) {
-            if best.as_ref().is_none_or(|b| c.0 > b.0) {
-                best = Some(c);
-            }
+        if let Some(c) = greedy(grid, n_direct, &sink, &only, &repay, gas_per_extra_leg, &gas_cost, &to_units)
+            && best.as_ref().is_none_or(|b| c.0 > b.0)
+        {
+            best = Some(c);
         }
     }
     best.filter(|b| b.0 > 0.0).map(|b| b.1)

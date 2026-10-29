@@ -756,6 +756,12 @@ fn seed_winning_bids(parts: &PlannerParts, journal_path: &str, ours: Address, at
     info!(liquidations = n, "competition model seeded from the journal");
 }
 
+/// (aggregator, median) -> (first seen, its valuation, computed once): see `FbState::auction_cache`.
+type AuctionCache = HashMap<(Address, U256), (Instant, Arc<tokio::sync::OnceCell<serde_json::Value>>)>;
+
+/// The background borrower refresh's result: (market, its borrowers or the error) per market.
+type BorrowerRefresh = Vec<(usize, Result<Vec<protocol::BorrowerInfo>>)>;
+
 /// Same-block (Flashblocks) mode state.
 struct FbState<P> {
     /// Pool of endpoints for same-block quotes and sims (pending state + the snapshot's block, see
@@ -781,7 +787,7 @@ struct FbState<P> {
     /// median, different ids and userOpHashes; only one ends on-chain). The sibling waited behind the
     /// first for the only permit and was valued again, 0.3-10 s late (10/24). (aggregator, median) ->
     /// (first seen, its valuation), kept AUCTION_SHARE_SECS.
-    auction_cache: Arc<std::sync::Mutex<HashMap<(Address, U256), (Instant, Arc<tokio::sync::OnceCell<serde_json::Value>>)>>>,
+    auction_cache: Arc<std::sync::Mutex<AuctionCache>>,
 }
 
 /// Writes the journal rows background tasks have finished.
@@ -983,7 +989,7 @@ async fn value_auction<P: Provider>(
     let bid_usd = bundle_net * (1.0 - atlas.margin);
     // From this auction's arrival to the end of the valuation proper (before any solver-op
     // simulation, see valuation()).
-    let since_valued = v["valued_unix_ms"].as_u64().map_or(0, |t| unix_ms().saturating_sub(t));
+    let since_valued = v["valued_unix_ms"].as_u64().map_or(0, |t| gates::unix_ms().saturating_sub(t));
     let value_ms = (a.seen.elapsed().as_millis() as u64).saturating_sub(since_valued);
     info!(auction = %a.id, aggregator = %a.aggregator, deadline = a.deadline, liquidatable = %v["liquidatable"], bonus_usd = %v["bonus_usd"], bundle_net_usd = bundle_net, net_usd = %v["net_usd"], bid_usd, bundle_ms = %v["bundle_ms"], value_ms, shared = %v["shared"], "ATLAS auction valued (observe only)");
     let mut row = json!({ "kind": "atlas_auction", "auction_id": a.id, "user_op_hash": a.user_op_hash, "aggregator": a.aggregator, "median": a.median.to_string(),
@@ -998,10 +1004,6 @@ async fn value_auction<P: Provider>(
 /// The valuation proper (see value_auction): per-market rows, positions and totals, timed from
 /// when `a` (the first auction of its report) arrived.
 #[allow(clippy::too_many_arguments)]
-fn unix_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
-}
-
 /// A simulated solver op that would pay: what `submit_solver_op` needs to sign and submit it.
 struct OpCandidate {
     /// Index of its market in the auction.
@@ -1072,7 +1074,7 @@ async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, s
     // What Atlas may take from the bond for this op: all of its gas at the auction's max fee plus
     // the escrow's surcharge (also when the op fails).
     let worst_usd = gas as f64 * a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let now = gates::unix_secs();
     if !sub.budget.lock().unwrap().allows(now, worst_usd, e.daily_gas_budget_usd) {
         return refused(format!("daily gas budget: the op's worst-case bond charge {worst_usd:.4} USD does not fit {}", e.daily_gas_budget_usd));
     }
@@ -1104,6 +1106,7 @@ async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, s
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn valuation<P: Provider>(
     provider: &P,
     parts: &PlannerParts,
@@ -1144,7 +1147,7 @@ async fn valuation<P: Provider>(
     // The valuation (what paper trading times against the auction deadline) is complete here; the
     // optional solver-op simulations below are diagnostics and must not count towards it. Wall-clock,
     // because a shared valuation is timed against each sibling auction's own arrival.
-    let valued_unix_ms = unix_ms();
+    let valued_unix_ms = gates::unix_ms();
     // What Atlas charges a solver op for its gas: the metacall's gas price (the auction's
     // maxFeePerGas) plus the escrow's surcharge, per gas unit, in USD.
     let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
@@ -1469,7 +1472,7 @@ async fn send_approved<P: Provider>(e: &ExecHandle, parts: &PlannerParts, provid
     // together. Released in on_settled.
     let key = tx_key(v);
     let worst_usd = worst_wei as f64 / 1e18 * c.eth_usd + plan.l1_fee_usd.unwrap_or(0.0);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let now = gates::unix_secs();
     // A reservation already held for this position (the other path is sending it) is refused, not
     // replaced.
     let reserved = parts.budget.lock().unwrap().reserve(key, now, worst_usd, cfg.daily_gas_budget_usd);
@@ -1633,7 +1636,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         }
     };
     // Background borrower refresh (see the end of the loop).
-    let mut refresh_job: Option<tokio::task::JoinHandle<Vec<(usize, Result<Vec<protocol::BorrowerInfo>>)>>> = None;
+    let mut refresh_job: Option<tokio::task::JoinHandle<BorrowerRefresh>> = None;
     // Observed block time (for deadline_secs -> blocks): anchor on the first live block.
     let mut bt_anchor: Option<(u64, u64)> = None;
     let mut known_tip = heads::http_head(&engine.provider, BlockNumberOrTag::Latest).await?.number;
@@ -1948,10 +1951,10 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             // chain (else an update was missed or reverted, or an aggregator was swapped).
             if f.max_update_block <= number {
                 for (mi, s) in snaps.iter().enumerate() {
-                    if let Some(s) = s.as_ref().filter(|_| f.model.is_modelled(mi)) {
-                        if f.model.price(mi) != Some(s.price) {
-                            f.model.resync(&engine.provider, mi, s.price, number.into()).await;
-                        }
+                    if let Some(s) = s.as_ref().filter(|_| f.model.is_modelled(mi))
+                        && f.model.price(mi) != Some(s.price)
+                    {
+                        f.model.resync(&engine.provider, mi, s.price, number.into()).await;
                     }
                 }
             }
@@ -2027,10 +2030,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             info!("background borrower refresh started");
         }
         // Wall-clock age of the block when we finished deciding (needs a synced clock, e.g. chrony).
-        let head_age_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64 - (h.timestamp as i64) * 1000)
-            .unwrap_or_default();
+        let head_age_ms = gates::unix_ms() as i64 - (h.timestamp as i64) * 1000;
         info!(
             block = number, tracked = views.len(), touched, planned, fetch_ms, reload_ms, eval_us, decide_ms, head_age_ms,
             "block"

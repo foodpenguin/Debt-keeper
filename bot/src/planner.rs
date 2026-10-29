@@ -259,11 +259,11 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
                 return;
             }
         }
-        if c.pending {
-            if let Some(why) = pending_staleness(plan.sim_block, res.is_ok(), c.block + 2) {
-                plan.error = Some(why);
-                return;
-            }
+        if c.pending
+            && let Some(why) = pending_staleness(plan.sim_block, res.is_ok(), c.block + 2)
+        {
+            plan.error = Some(why);
+            return;
         }
         match res {
             Ok(r) => {
@@ -588,7 +588,6 @@ mod tests {
             max_seize: U256::from(max_seize),
             quote: None,
             bonus: 0.0,
-            options: vec![],
         }
     }
 
@@ -766,12 +765,14 @@ mod account_level_tests {
         let snap = [1.0, 1.0, 1.0, 2.0];
         let v = view(&pool, 0, user(1), &m, &snap, &[60, 40, 50, 50]);
         assert!((v.hf - 80.0 / 150.0).abs() < 1e-9);
-        assert_eq!(v.options.len(), 4, "every (collateral, debt) pair the account holds");
+        // The protocol ranks one option per (collateral, debt) pair the account holds; the view
+        // takes the best.
+        let opts = pool.evaluate(&m, &snap, &[60, 40, 50, 50]).options;
+        assert_eq!(opts.len(), 4, "every (collateral, debt) pair the account holds");
+        assert_eq!((opts[1].pair, opts[3].pair.debt), (Pair { collateral: RES_B, debt: RES_Y }, RES_X));
         // Repaying half of Y ($50) against A pays the largest bonus.
         assert_eq!(v.pair, Pair { collateral: RES_A, debt: RES_Y });
         assert_eq!(v.max_seize, U256::from(52u64), "$50 x 1.05 of A");
-        assert_eq!(v.with_option(1).pair, Pair { collateral: RES_B, debt: RES_Y });
-        assert!(v.with_option(3).pair.debt == RES_X);
 
         let ctx = PlanCtx { meta: &m, snap: &snap, view: &v, block: 1, base_fee_wei: 0, eth_usd: 2000.0, overrides: StateOverride::default(), deadline_block: 3, sim_time: 0, pending: false, price_probe: None };
         let plan = Planner { protocol: &pool, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "aggregator" }.plan(&provider, &ctx).await.unwrap();

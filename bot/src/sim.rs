@@ -308,6 +308,14 @@ impl LiquidationVenue<Morpho> for Simulator {
     }
 }
 
+/// Bytecode that returns `price` for any call: stands in for a Morpho oracle in "what if" runs.
+pub fn constant_price_oracle(price: U256) -> Bytes {
+    let mut code = vec![0x7f];
+    code.extend_from_slice(&price.to_be_bytes::<32>());
+    code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    code.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,12 +450,4 @@ mod tests {
         assert_eq!(&d[141..145], &[1, 2, 3, 4]);
         assert_eq!(&d[145..], &route);
     }
-}
-
-/// Bytecode that returns `price` for any call: stands in for a Morpho oracle in "what if" runs.
-pub fn constant_price_oracle(price: U256) -> Bytes {
-    let mut code = vec![0x7f];
-    code.extend_from_slice(&price.to_be_bytes::<32>());
-    code.extend_from_slice(&[0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
-    code.into()
 }

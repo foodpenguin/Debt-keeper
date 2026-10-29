@@ -55,11 +55,13 @@ impl Morpho {
 #[cfg(test)]
 impl Morpho {
     /// An instance for unit tests (its address/API are never contacted by the pure methods).
+    #[cfg(test)]
     pub fn for_tests() -> Self {
         Self::for_tests_at(Address::ZERO)
     }
 
     /// The same, at a real Morpho address (for venues that build calls to it).
+    #[cfg(test)]
     pub fn for_tests_at(address: Address) -> Self {
         Self { address, api_url: String::new(), chain_id: 8453, markets: vec![], log_chunk: 100 }
     }

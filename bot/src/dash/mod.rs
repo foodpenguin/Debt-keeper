@@ -105,30 +105,27 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let cutoff = now() - d.raw_block_days as f64 * 86_400.0;
     db.execute("DELETE FROM blocks WHERE seen < ?1", params![cutoff])?;
 
-    match rpc_url(cfg)? {
-        Some(url) => {
-            let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
-            if let Err(e) = fetch_liq_raw(&db, &http, &url).await {
-                warn!(error = format!("{e:#}"), "dashboard: liquidation tx fetch failed");
-            }
-            if let Err(e) = analyze_liq_txs(&db, &http, &url, cfg).await {
-                warn!(error = format!("{e:#}"), "dashboard: liquidation decoding failed");
-            }
-            if let Err(e) = record_wallet(&db, &http, &url, cfg.exec.executor).await {
-                warn!(error = format!("{e:#}"), "dashboard: wallet balance failed");
-            }
+    if let Some(url) = rpc_url(cfg)? {
+        let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+        if let Err(e) = fetch_liq_raw(&db, &http, &url).await {
+            warn!(error = format!("{e:#}"), "dashboard: liquidation tx fetch failed");
         }
-        None => {}
+        if let Err(e) = analyze_liq_txs(&db, &http, &url, cfg).await {
+            warn!(error = format!("{e:#}"), "dashboard: liquidation decoding failed");
+        }
+        if let Err(e) = record_wallet(&db, &http, &url, cfg.exec.executor).await {
+            warn!(error = format!("{e:#}"), "dashboard: wallet balance failed");
+        }
     }
 
     let html = render::page(&db, cfg)?;
     let tmp = format!("{}.tmp", d.html_path);
     std::fs::write(&tmp, html)?;
     std::fs::rename(&tmp, &d.html_path)?;
-    if let Some(dir) = &d.backup_dir {
-        if let Err(e) = backup(&db, dir, &cfg.journal_path) {
-            warn!(error = format!("{e:#}"), "dashboard: backup failed");
-        }
+    if let Some(dir) = &d.backup_dir
+        && let Err(e) = backup(&db, dir, &cfg.journal_path)
+    {
+        warn!(error = format!("{e:#}"), "dashboard: backup failed");
     }
     info!(log_lines = lines, journal_rows = rows, html = %d.html_path, "dashboard updated");
     Ok(())
@@ -315,12 +312,12 @@ fn ingest_log(db: &mut Connection, path: &str) -> Result<(usize, Option<f64>)> {
                     ins_block.execute(params![b, bts, ts, num(&line, "fetch_ms"), num(&line, "decide_ms"), age, num(&line, "planned")])?;
                 } else if msg.contains("rpc endpoints (urls hidden)") {
                     tx.execute("INSERT OR IGNORE INTO runs (ts) VALUES (?1)", params![ts])?;
-                } else if msg.contains("source stats") {
-                    if let Some(list) = msg.split_once("rpc=[").map(|x| x.1.trim_end_matches(']')) {
-                        for entry in list.split("\", \"") {
-                            if let Some((name, v, cooling)) = parse_rpc_stat(entry.trim_matches('"')) {
-                                ins_stat.execute(params![ts, name, v[0], v[1], v[2], v[3], v[4], cooling])?;
-                            }
+                } else if msg.contains("source stats")
+                    && let Some(list) = msg.split_once("rpc=[").map(|x| x.1.trim_end_matches(']'))
+                {
+                    for entry in list.split("\", \"") {
+                        if let Some((name, v, cooling)) = parse_rpc_stat(entry.trim_matches('"')) {
+                            ins_stat.execute(params![ts, name, v[0], v[1], v[2], v[3], v[4], cooling])?;
                         }
                     }
                 }
@@ -344,6 +341,9 @@ fn percentile(v: &mut [i64], p: f64) -> Option<i64> {
 }
 
 /// Recomputes the hourly aggregates of every hour from `from` (block time) on.
+/// One hour of the block log: (blocks, fetch_ms, decide_ms, head_age_ms, missing blocks).
+type HourStats = (i64, Vec<i64>, Vec<i64>, Vec<i64>, i64);
+
 fn refresh_hour_stats(db: &Connection, from: Option<f64>) -> Result<()> {
     let Some(from) = from else { return Ok(()) };
     let start = (from / 3600.0).floor() as i64 * 3600;
@@ -352,8 +352,7 @@ fn refresh_hour_stats(db: &Connection, from: Option<f64>) -> Result<()> {
     // (seeded with the last block before `start`); not when the bot was restarted in between.
     let mut prev: Option<(i64, f64)> = db.query_row("SELECT block, ts FROM blocks WHERE ts < ?1 ORDER BY block DESC LIMIT 1", params![start as f64], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
     let runs: Vec<f64> = db.prepare("SELECT ts FROM runs")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-    // hour -> (blocks, fetch_ms, decide_ms, head_age_ms, missing)
-    let mut hours: HashMap<i64, (i64, Vec<i64>, Vec<i64>, Vec<i64>, i64)> = HashMap::new();
+    let mut hours: HashMap<i64, HourStats> = HashMap::new();
     let rows = q.query_map(params![start as f64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, Option<i64>>(4)?)))?;
     for row in rows {
         let (b, ts, f, d, a) = row?;
@@ -362,10 +361,10 @@ fn refresh_hour_stats(db: &Connection, from: Option<f64>) -> Result<()> {
         h.1.extend(f);
         h.2.extend(d);
         h.3.extend(a);
-        if let Some((pb, pts)) = prev {
-            if !runs.iter().any(|r| *r > pts && *r <= ts) {
-                h.4 += (b - pb - 1).max(0);
-            }
+        if let Some((pb, pts)) = prev
+            && !runs.iter().any(|r| *r > pts && *r <= ts)
+        {
+            h.4 += (b - pb - 1).max(0);
         }
         prev = Some((b, ts));
     }
@@ -456,8 +455,11 @@ async fn rpc(http: &reqwest::Client, url: &str, method: &str, params: Value) -> 
     Ok(resp["result"].clone())
 }
 
-/// Bids and winner of one Atlas metacall: (userOpHash, winner, winning bid in ETH, all bids).
-fn decode_metacall(input: &Bytes, receipt: &Value) -> Option<(B256, Option<Address>, Option<f64>, Vec<(Address, f64)>)> {
+/// (userOpHash, winner, winning bid in ETH, all bids as (solver, ETH)).
+type MetacallBids = (B256, Option<Address>, Option<f64>, Vec<(Address, f64)>);
+
+/// Bids and winner of one Atlas metacall.
+fn decode_metacall(input: &Bytes, receipt: &Value) -> Option<MetacallBids> {
     let mc = metacallCall::abi_decode(input).ok()?;
     let uoh = mc.solverOps.first()?.userOpHash;
     let bids = mc.solverOps.iter().map(|s| (s.solver, s.bidAmount.to_string().parse::<f64>().unwrap_or(0.0) / 1e18)).collect();
@@ -468,11 +470,11 @@ fn decode_metacall(input: &Bytes, receipt: &Value) -> Option<(B256, Option<Addre
             continue;
         }
         let data: Bytes = l["data"].as_str().unwrap_or("0x").parse().ok()?;
-        if let Ok(e) = SolverTxResult::decode_raw_log(t.iter().copied(), &data) {
-            if e.success {
-                winner = Some((e.solverTo, e.bidAmount.to_string().parse::<f64>().unwrap_or(0.0) / 1e18));
-                break;
-            }
+        if let Ok(e) = SolverTxResult::decode_raw_log(t.iter().copied(), &data)
+            && e.success
+        {
+            winner = Some((e.solverTo, e.bidAmount.to_string().parse::<f64>().unwrap_or(0.0) / 1e18));
+            break;
         }
     }
     Some((uoh, winner.map(|w| w.0), winner.map(|w| w.1), bids))

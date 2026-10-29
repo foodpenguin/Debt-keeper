@@ -23,6 +23,7 @@ an RPC endpoint in `.env` for fork tests.
 
 ```
 cd bot && cargo check --all-targets     # 0 warnings
+cd bot && cargo clippy --all-targets     # 0 warnings
 cd bot && cargo test
 cd contracts && forge build && forge test   # fork tests need BASE_RPC_URL; -j 1 on free plans
 ```

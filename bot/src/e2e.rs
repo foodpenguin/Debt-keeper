@@ -145,7 +145,7 @@ async fn e2e_live_send_on_anvil_fork() {
     assert!(ex.send(mk(b, b + 2, U256::from(1u64))).await.is_err(), "this position is already in flight");
     let i2 = ex.send(other).await.unwrap();
     assert_eq!(i2.nonce, i1.nonce + 1, "consecutive nonces");
-    assert!(!ex.can_send(), "max_inflight reached");
+    assert_eq!(ex.inflight.len(), 2, "max_inflight reached");
     let mut settled = vec![];
     for _ in 0..30 {
         settled.extend(ex.poll(b + 1).await.unwrap());

@@ -21,12 +21,11 @@ const ATLAS: Address = address!("583dcFef0D240DC80753F0F0B26513feE27D9B77");
 async fn rpc(http: &reqwest::Client, url: &str, method: &str, params: Value) -> anyhow::Result<Value> {
     for attempt in 0..6 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Ok(r) = http.post(url).json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).send().await {
-            if let Ok(v) = r.json::<Value>().await {
-                if let Some(x) = v.get("result") {
-                    return Ok(x.clone());
-                }
-            }
+        if let Ok(r) = http.post(url).json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})).send().await
+            && let Ok(v) = r.json::<Value>().await
+            && let Some(x) = v.get("result")
+        {
+            return Ok(x.clone());
         }
         tokio::time::sleep(std::time::Duration::from_millis(1000 * (attempt + 1))).await;
     }

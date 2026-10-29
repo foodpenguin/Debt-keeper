@@ -125,6 +125,7 @@ pub type Watched = Arc<RwLock<HashMap<Address, Authorized>>>;
 ///   transmitter and the metacall's DappControl one of its authorized senders. The tx signer is
 ///   just the bundler, so this is weaker; the price model therefore only lets a secondary answer
 ///   take effect when it equals a primary answer already accepted for that aggregator.
+///
 /// Non-positive answers are rejected (the price model divides by them).
 pub fn oracle_update(raw: &[u8], watched: &HashMap<Address, Authorized>, atlas: Address) -> Option<(Address, U256, Path)> {
     let tx = TxEnvelope::decode_2718(&mut &raw[..]).ok()?; // OP deposit txs (0x7e) are skipped

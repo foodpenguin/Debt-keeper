@@ -81,7 +81,7 @@ isolated protocol (Morpho Blue) a market is one collateral / one loan token. For
 protocol (an Aave-style pool, a Compound-style comptroller) a "market" is the pool and a position
 is the whole account across its reserves: `evaluate` computes health over all of them and returns
 an option per (collateral, debt) pair. `PositionView` carries the best option (`pair`,
-`max_seize`, `quote`, `bonus`) and all of them (`options`; `with_option(i)` plans another one).
+`max_seize`, `quote`, `bonus`).
 `testkit::ToyPool` (two collateral and two debt reserves, close factor 50%, 5% bonus) is the
 worked example: `account_level_tests` in `planner.rs` checks that the best pair is liquidated and
 that the repayment, profit token and USD price all follow it.
