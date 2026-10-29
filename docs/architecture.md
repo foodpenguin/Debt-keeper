@@ -213,9 +213,11 @@ estimate by a safety factor.
   `allocate_within` enforces a gas budget. Leg gas is priced at `planning_priority_fee_wei` and
   converted to loan-token units with `loan_usd`.
 - **Execution:** the packed route calls pools directly; pools are paid inside their own swap
-  callback (only the pool currently swapping, once, at most its input). A pooled connector token
-  split by share across sink hops (bit 2) can keep a rounding remainder: it is swept to
-  `PROFIT_RECEIVER` after the liquidation, so nothing stays at rest.
+  callback (only the pool currently swapping, once, at most its input, in the hop's input token
+  read before the swap; source legs must sell the collateral). A pooled connector token split by
+  share across sink hops (bit 2) can keep a rounding remainder, and a pool that runs out of
+  liquidity takes less than its input: both the connector remainder and the unsold collateral are
+  swept to `PROFIT_RECEIVER` after the liquidation, so nothing stays at rest.
 
 ## On-chain: `contracts/src/MorphoLiquidator.sol`
 
@@ -240,8 +242,8 @@ estimate by a safety factor.
 | Router stealing collateral / pulling more than allowed | exact allowances reset to zero; Morpho reverts the whole tx if unpaid | `test_thiefRouterGainsNothing`, `test_greedyRouterCannotExceedAllowance` |
 | Fee-on-transfer / rebasing collateral | the callback checks the collateral actually received | `test_feeOnTransferCollateralRejected` |
 | Not enough profit | `minProfit` on the loan-token balance delta (fuzzed) | `test_minProfitEnforced`, `testFuzz_profitAtLeastMin` |
-| Fake pool in a direct route | pools are only called for `swap`/`token0`/`token1` and paid inside their own callback, at most the hop input; nothing is held at rest | `test_route_poolAskingMoreThanInputGetsNothing`, `test_route_doubleCallbackRejected`, `test_swapCallbackFromStrangerRejected` |
-| Route not spending all seized collateral | explicit source legs must sum exactly to `seizedAssets` (`RouteSpendMismatch`) | `test_route_mustSpendExactlySeized` |
+| Fake pool in a direct route | pools are only called for `swap`/`token0`/`token1` and paid inside their own callback, at most the hop input, in the input token read before the swap (source legs: the collateral); nothing is held at rest. Within that a fake pool can still keep the profit above `minProfit`, so route pools come from configured factories (`getPool`) | `test_route_poolAskingMoreThanInputGetsNothing`, `test_route_doubleCallbackRejected`, `test_swapCallbackFromStrangerRejected`, `test_route_poolCannotSwitchItsPaymentToken`, `test_route_sourceLegMustSellCollateral` |
+| Route not spending all seized collateral | explicit source legs must sum exactly to `seizedAssets` (`RouteSpendMismatch`); collateral a pool did not take (out of liquidity) is swept | `test_route_mustSpendExactlySeized`, `test_route_partialFillLeftoverIsSwept` |
 | Connector left in the contract | the pooled connector's remainder is swept to `PROFIT_RECEIVER` | `test_route_pooledConnectorRemainderIsSwept` |
 | Pool reporting positive output | every hop's output must be a negative delta (`BadRoute`) | `test_route_positiveOutputRejected` |
 | Malformed packed calldata | strict decoding, no selector collision with the ABI entries | `test_packed_malformedRejected`, `test_packed_noSelectorCollision`, `test_packedEntry_equalsAbiEntry` |
@@ -322,8 +324,9 @@ MorphoLiquidator deployed with the solver as executor and profit receiver), runs
 (loan token -> WETH, `target = address(0)` = none), unwraps WETH as needed (keeping aside any ETH
 Atlas lent, so the bid never spends it) and pays the ETH bid to the execution environment, settles
 with Atlas (repays that loan and approves the gas liability read at the end through `reconcile`),
-checks `minProfit` on the profit token left AFTER the bid, sends it and any leftover WETH or ETH to
-`PROFIT_RECEIVER`, and returns the net profit. Constructor: `(atlas, weth, owner, executor,
+checks `minProfit` on the profit token this call added AFTER the bid (a balance change: leftover
+collateral its liquidator sent it earlier never counts), sends the whole profit-token balance and
+any leftover WETH or ETH to `PROFIT_RECEIVER`, and returns the net profit. Constructor: `(atlas, weth, owner, executor,
 profitReceiver)`; `executor` is the solver operation signer.
 
 | Threat | Defence | Tests (`AtlasLiquidationSolver.security.t.sol`) |
@@ -333,6 +336,7 @@ profitReceiver)`; `executor` is the solver operation signer.
 | ETH that Atlas lent spent on the bid | the borrow liability (up to `msg.value`) is kept aside: WETH is unwrapped for bid + repayment, and the loan goes back through `reconcile` | `test_borrowedEthIsRepaidEvenWhenTheBidNeedsEth` |
 | Poisoned calls or bid swap | every call target and the bid-swap router must be owner-allowlisted; exact allowance reset | `test_callAndBidSwapTargetsMustBeAllowlisted` |
 | Bid larger than what the op earns | the bid must be bought and paid, and `minProfit` holds after it | `test_aBidTheSwapCannotFundReverts`, `test_minProfitIsCheckedAfterTheBid` |
+| Tokens already in the solver counted as this op's profit | `minProfit` is checked on the profit-token balance change of this call; the old balance is swept with it | `test_tokensAlreadyHereDoNotCountAsProfit` |
 | Admin by others | owner-only admin | `test_adminIsOwnerOnly` |
 
 `test_runsTheLiquidationPaysTheEthBidSettlesAndKeepsTheRest` covers the happy path;

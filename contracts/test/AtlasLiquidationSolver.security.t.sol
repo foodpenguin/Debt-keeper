@@ -119,6 +119,19 @@ contract AtlasLiquidationSolverSecurityTest is Test {
         atlas.solve(solver, signer, ee, address(0), 100e6, _data(1_000e6, 100e6, 901e6));
     }
 
+    /// The solver's liquidators send it their leftover collateral, which can be a later op's profit
+    /// token: a balance already here is not this op's profit, but it is still swept.
+    function test_tokensAlreadyHereDoNotCountAsProfit() public {
+        usdc.mint(address(solver), 500e6);
+        vm.expectRevert(abi.encodeWithSelector(AtlasLiquidationSolver.InsufficientProfit.selector, 900e6, 901e6));
+        atlas.solve(solver, signer, ee, address(0), 100e6, _data(1_000e6, 100e6, 901e6));
+
+        uint256 net = atlas.solve(solver, signer, ee, address(0), 100e6, _data(1_000e6, 100e6, 900e6));
+        assertEq(net, 900e6, "only this op's gain");
+        assertEq(usdc.balanceOf(receiver), 1_400e6, "the old balance is swept with it");
+        assertEq(usdc.balanceOf(address(solver)), 0, "nothing at rest");
+    }
+
     function test_onlyAtlasForTheSignersOperation() public {
         bytes memory d = _data(1_000e6, 100e6, 0);
         vm.expectRevert(AtlasLiquidationSolver.InvalidEntry.selector);

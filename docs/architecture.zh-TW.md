@@ -99,7 +99,7 @@
 - 透過直達 leg 和 connector leg（抵押品 -> WETH -> 借款代幣），在 `[[router.factories]]` 列出的 Uniswap V3 類池子上把抵押品換成借款代幣（依 fee tier 或 tick spacing 區分的 factory）。factory 地址放在設定檔，不寫死在程式碼裡。路線對每個市場的每個 `Pair`（`LendingProtocol::pairs`）各找一次，並以它為索引。
 - **報價**：`contracts/src/sim/GridQuoter.sol` 不會部署，而是用 state override 注入，用一次 `eth_call`（Uniswap quoter 的 revert 技巧）報出每條 leg 的一整排數量；每一跳都有 gas 上限，避免異常的池子把整個呼叫的 gas 用光。報價呼叫帶規劃用的 fee（`Planner::sim_fee`），由一個有餘額覆寫的佔位呼叫者（`QUOTE_CALLER`）送出，所以會讀 `tx.gasprice` 的池子報出的是交易實際會拿到的量。
 - **分配**：在合成的凹曲線上依邊際產出做 greedy（共用的 connector sink 不會重複計算），再和「只用單一 leg」比較，因為每多一條 leg 都有 gas 成本；`allocate_within` 會遵守 gas 預算。leg 的 gas 用 `planning_priority_fee_wei` 計價，並用 `loan_usd` 換算成借款代幣單位。
-- **執行**：packed 路線直接呼叫池子；池子在自己的 swap callback 裡收款（只有正在交易的那個池子、只收一次、最多收該跳的輸入量）。以比例分給多個 sink 的共用 connector 代幣（bit 2）可能留下捨入餘額：清算結束後會清到 `PROFIT_RECEIVER`，平常不留存任何資金。
+- **執行**：packed 路線直接呼叫池子；池子在自己的 swap callback 裡收款（只有正在交易的那個池子、只收一次、最多收該跳的輸入量，而且只收 swap 前就讀好的該跳輸入代幣；來源 leg 只能賣抵押品）。以比例分給多個 sink 的共用 connector 代幣（bit 2）可能留下捨入餘額，流動性用完的池子也可能只吃下部分輸入：connector 餘額和沒賣掉的抵押品都會在清算結束後清到 `PROFIT_RECEIVER`，平常不留存任何資金。
 
 ## 鏈上：`contracts/src/MorphoLiquidator.sol`
 
@@ -119,8 +119,8 @@
 | router 偷抵押品或拉走超過授權的量 | 只給剛好的授權，用完歸零；Morpho 沒收到還款就整筆 revert | `test_thiefRouterGainsNothing`、`test_greedyRouterCannotExceedAllowance` |
 | 轉帳收費或 rebase 的抵押品 | callback 檢查實際收到的抵押品 | `test_feeOnTransferCollateralRejected` |
 | 利潤不足 | `minProfit` 檢查借款代幣的餘額差（含 fuzz） | `test_minProfitEnforced`、`testFuzz_profitAtLeastMin` |
-| direct 路線裡的假池子 | 只呼叫池子的 `swap`/`token0`/`token1`，只在它自己的 callback 裡付款、最多付該跳輸入；平常不留存資金 | `test_route_poolAskingMoreThanInputGetsNothing`、`test_route_doubleCallbackRejected`、`test_swapCallbackFromStrangerRejected` |
-| 路線沒用完沒收的抵押品 | 明確金額的來源 leg 加總必須剛好等於 `seizedAssets`（`RouteSpendMismatch`） | `test_route_mustSpendExactlySeized` |
+| direct 路線裡的假池子 | 只呼叫池子的 `swap`/`token0`/`token1`，只在它自己的 callback 裡付款、最多付該跳輸入，付的是 swap 前讀好的輸入代幣（來源 leg 為抵押品）；平常不留存資金。在這些限制內，假池子仍可拿走 `minProfit` 以上的利潤，所以路線池子必須來自設定的 factory（`getPool`） | `test_route_poolAskingMoreThanInputGetsNothing`、`test_route_doubleCallbackRejected`、`test_swapCallbackFromStrangerRejected`、`test_route_poolCannotSwitchItsPaymentToken`、`test_route_sourceLegMustSellCollateral` |
+| 路線沒用完沒收的抵押品 | 明確金額的來源 leg 加總必須剛好等於 `seizedAssets`（`RouteSpendMismatch`）；池子沒吃下的抵押品（流動性用完）會被清走 | `test_route_mustSpendExactlySeized`、`test_route_partialFillLeftoverIsSwept` |
 | connector 留在合約裡 | 共用 connector 的餘額會清到 `PROFIT_RECEIVER` | `test_route_pooledConnectorRemainderIsSwept` |
 | 池子回報正的產出 | 每一跳的產出必須是負的 delta（`BadRoute`） | `test_route_positiveOutputRejected` |
 | 格式錯誤的 packed calldata | 嚴格解碼，不和 ABI 入口的 selector 衝突 | `test_packed_malformedRejected`、`test_packed_noSelectorCollision`、`test_packedEntry_equalsAbiEntry` |
@@ -161,7 +161,7 @@ gas 基準測試在 `contracts/test/MorphoLiquidator.gas.fork.t.sol`（`forge te
 
 ## 鏈上：`contracts/src/AtlasLiquidationSolver.sol`（只模擬）
 
-給 Fastlane Atlas 舉辦的 Chainlink SVR 拍賣用的 solver 合約，依 Atlas 的 solver 介面（`atlasSolverCall`）自行撰寫，不是從 Atlas 的程式碼改來的。在得標者的時段裡，Atlas 會呼叫 `atlasSolverCall(solverOpFrom, executionEnvironment, bidToken, bidAmount, solverOpData, extraReturnData)`；`solverOpData` = `(SolverCall[] calls, SwapStep bidSwap, address profitToken, uint256 minProfit)`。solver 依序執行 calls（透過一個以 solver 為 executor 和利潤接收者的 MorphoLiquidator 清算）、執行出價用的 swap（借款代幣 -> WETH；`target = address(0)` 表示不需要）、視需要把 WETH 換回 ETH（Atlas 借出的 ETH 會先保留，出價不會動用）並把 ETH 出價付給 execution environment、和 Atlas 結算（透過 `reconcile` 還清借款，並核准最後讀到的 gas 負債）、檢查**扣掉出價後**剩下的利潤代幣 ≥ `minProfit`、把它和剩餘的 WETH 或 ETH 送到 `PROFIT_RECEIVER`，並回傳淨利潤。constructor：`(atlas, weth, owner, executor, profitReceiver)`；`executor` 是 solver operation 的簽名者。
+給 Fastlane Atlas 舉辦的 Chainlink SVR 拍賣用的 solver 合約，依 Atlas 的 solver 介面（`atlasSolverCall`）自行撰寫，不是從 Atlas 的程式碼改來的。在得標者的時段裡，Atlas 會呼叫 `atlasSolverCall(solverOpFrom, executionEnvironment, bidToken, bidAmount, solverOpData, extraReturnData)`；`solverOpData` = `(SolverCall[] calls, SwapStep bidSwap, address profitToken, uint256 minProfit)`。solver 依序執行 calls（透過一個以 solver 為 executor 和利潤接收者的 MorphoLiquidator 清算）、執行出價用的 swap（借款代幣 -> WETH；`target = address(0)` 表示不需要）、視需要把 WETH 換回 ETH（Atlas 借出的 ETH 會先保留，出價不會動用）並把 ETH 出價付給 execution environment、和 Atlas 結算（透過 `reconcile` 還清借款，並核准最後讀到的 gas 負債）、檢查**扣掉出價後**這次呼叫增加的利潤代幣 ≥ `minProfit`（以餘額差計算：清算合約之前送進來的剩餘抵押品不算）、把利潤代幣的全部餘額和剩餘的 WETH 或 ETH 送到 `PROFIT_RECEIVER`，並回傳淨利潤。constructor：`(atlas, weth, owner, executor, profitReceiver)`；`executor` 是 solver operation 的簽名者。
 
 | 威脅 | 防護 | 測試（`AtlasLiquidationSolver.security.t.sol`） |
 |---|---|---|
@@ -170,6 +170,7 @@ gas 基準測試在 `contracts/test/MorphoLiquidator.gas.fork.t.sol`（`forge te
 | Atlas 借出的 ETH 被拿去付出價 | 借款負債（最多到 `msg.value`）會先保留：WETH 換回足夠付出價加還款的 ETH，借款再透過 `reconcile` 還回 | `test_borrowedEthIsRepaidEvenWhenTheBidNeedsEth` |
 | 被汙染的呼叫或出價 swap | 每個呼叫目標和出價 swap 的 router 都必須在 owner 白名單裡；授權用完歸零 | `test_callAndBidSwapTargetsMustBeAllowlisted` |
 | 出價超過這個 op 賺到的 | 出價必須買得到、付得出，而且扣掉後仍要 ≥ `minProfit` | `test_aBidTheSwapCannotFundReverts`、`test_minProfitIsCheckedAfterTheBid` |
+| solver 裡原有的代幣被算成這個 op 的利潤 | `minProfit` 檢查這次呼叫的利潤代幣餘額差；原有餘額一起清走 | `test_tokensAlreadyHereDoNotCountAsProfit` |
 | 別人做管理操作 | 管理功能只限 owner | `test_adminIsOwnerOnly` |
 
 `test_runsTheLiquidationPaysTheEthBidSettlesAndKeepsTheRest` 涵蓋正常流程；`AtlasLiquidationSolver.fork.t.sol` 在 Base fork 上、在 solver op 裡跑一筆真實的清算（`test_solverLiquidatesPaysTheEthBidAndKeepsTheRest`、`test_aBidAboveTheProfitReverts`），用 `contracts/src/sim/AtlasStub.sol` 代替 Atlas escrow；並確認鏈上部署的 Atlas escrow 具備 solver 會呼叫的結算函式，語意也和 solver 的假設一致（`test_theDeployedAtlasEscrowHasTheSettlementCallsTheSolverMakes`：metacall 之外 `shortfall` 為 0、`reconcile` 以 `WrongPhase` revert、可讀到 `getAtlasSurchargeRate`）。完整的 metacall 無法重播（需要使用者和 DApp 的簽名）。

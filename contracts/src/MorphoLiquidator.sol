@@ -28,9 +28,10 @@ struct SwapStep {
 ///      - aggregator steps may only call owner-allowlisted targets, so a poisoned off-chain route
 ///        cannot make the contract call a token's `approve`/`transfer` or anything else. Route-mode
 ///        pools are NOT allowlisted (too many to curate): the contract only ever calls their
-///        `swap`/`token0`/`token1` and pays them inside their own callback, at most the hop input,
-///        and a route must spend exactly the seized collateral; with nothing held at rest, a fake
-///        pool can only make the tx revert;
+///        `swap`/`token0`/`token1` and pays them inside their own callback, in the hop's input token
+///        (read before the swap; the collateral on every source hop) and at most the hop input.
+///        Within that, a fake pool can still keep the profit above `minProfit`, so route pools must
+///        come from trusted factories (the bot finds them with the factory's `getPool`);
 ///      - the collateral actually received must match what Morpho says it seized (rejects
 ///        fee-on-transfer / rebasing / malicious collateral);
 ///      - swap-target allowances are exact and reset to zero; Morpho holds a standing allowance on
@@ -59,8 +60,10 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
     /// @dev Collateral the callback must see (= seizedAssets; the contract holds nothing at rest).
     uint256 private transient expectedCollateral;
     address private transient collateralInFlight;
-    /// @dev Pool whose swap() is running right now, and the most it may ask to be paid.
+    /// @dev Pool whose swap() is running right now, the token it is paid in, and the most it may
+    ///      ask to be paid.
     address private transient activePool;
+    address private transient activeToken;
     uint256 private transient activeMaxIn;
     /// @dev Route mode: the pooled connector token split by share across sink hops (bit2), whose
     ///      rounding remainder is swept after the liquidation.
@@ -199,10 +202,10 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
         MORPHO.liquidate(marketParams, borrower, seizedAssets, 0, data);
         inFlight = false;
 
-        // Route mode spends exactly the seized collateral, so only aggregator mode can leave
-        // collateral behind and needs the sweep.
-        bool sweep = data[0] != MODE_ROUTE;
-        profit = _settle(marketParams.loanToken, marketParams.collateralToken, minProfit, sweep);
+        // Both modes can leave collateral behind: aggregator steps by rounding or a partial exit,
+        // route hops when a pool runs out of liquidity at the price limit and takes less than its
+        // input. Swept either way, so nothing stays at rest.
+        profit = _settle(marketParams.loanToken, marketParams.collateralToken, minProfit);
         // A pooled connector (e.g. WETH between collateral and loan pools) can keep a rounding
         // remainder after the share-split sink hops: swept too, so nothing stays at rest.
         address connector = connectorInFlight;
@@ -222,8 +225,8 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
         address loanToken;
         if (data[0] == MODE_ROUTE) {
             loanToken = address(bytes20(data[1:21]));
-            // Route mode has no sweep: it must spend exactly what was seized, or collateral would
-            // sit in the contract and weaken the empty-at-rest assumptions of later checks.
+            // The source hops must plan to sell exactly what was seized. What a pool actually takes
+            // can be less (liquidity runs out); that remainder is swept after the liquidation.
             uint256 spent = _runRoute(data[21:]);
             if (spent != expectedCollateral) revert RouteSpendMismatch(spent, expectedCollateral);
         } else {
@@ -259,16 +262,21 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
             uint8 flags = uint8(route[o + 20]);
             bool zeroForOne = flags & 1 != 0;
             uint256 amountIn = uint256(uint128(bytes16(route[o + 21:o + HOP_LEN])));
+            // Read once, before the swap: the callback pays this token, not whatever the pool
+            // reports from inside its own swap.
+            address tokenIn = zeroForOne ? IV3Pool(pool).token0() : IV3Pool(pool).token1();
             if (flags & 2 != 0) {
                 amountIn = prevOut;
             } else if (flags & 4 != 0) {
-                address tokenIn = zeroForOne ? IV3Pool(pool).token0() : IV3Pool(pool).token1();
                 amountIn = IERC20Min(tokenIn).balanceOf(address(this)) * amountIn / 10_000;
                 connectorInFlight = tokenIn;
             } else {
+                // A source leg sells the seized collateral, nothing else.
+                if (tokenIn != collateralInFlight) revert BadRoute();
                 spent += amountIn;
             }
             activePool = pool;
+            activeToken = tokenIn;
             activeMaxIn = amountIn;
             (int256 a0, int256 a1) = IV3Pool(pool).swap(
                 address(this), zeroForOne, int256(amountIn), zeroForOne ? MIN_SQRT_PRICE_LIMIT : MAX_SQRT_PRICE_LIMIT, ""
@@ -290,16 +298,16 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
         _payPool(amount0, amount1);
     }
 
-    /// @dev Pays the pool its input. Only the pool we are swapping on right now, once, and never
-    ///      more than the hop exact input: a fake pool or a reentrant call gets nothing.
+    /// @dev Pays the pool its input. Only the pool we are swapping on right now, once, only in the
+    ///      hop's input token and never more than the hop exact input: a reentrant call gets
+    ///      nothing, and a pool cannot switch the token it is paid in.
     function _payPool(int256 amount0, int256 amount1) private {
         address pool = activePool;
         if (msg.sender != pool || pool == address(0)) revert Unauthorized();
         activePool = address(0);
-        (address token, uint256 owed) =
-            amount0 > 0 ? (IV3Pool(pool).token0(), uint256(amount0)) : (IV3Pool(pool).token1(), uint256(amount1));
+        uint256 owed = uint256(amount0 > 0 ? amount0 : amount1);
         if (owed > activeMaxIn) revert Unauthorized();
-        _safeTransfer(token, pool, owed);
+        _safeTransfer(activeToken, pool, owed);
     }
 
     // ---------------------------------------------------------------- admin
@@ -357,16 +365,14 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
     /// @dev The loan-token balance left after Morpho pulled its repayment is the profit (the
     ///      contract starts every tx empty). Checks it against minProfit, then sends profit and any
     ///      leftover collateral to profitReceiver.
-    function _settle(address loanToken, address collateralToken, uint256 minProfit, bool sweep) private returns (uint256 profit) {
+    function _settle(address loanToken, address collateralToken, uint256 minProfit) private returns (uint256 profit) {
         profit = IERC20Min(loanToken).balanceOf(address(this));
         if (profit < minProfit) revert InsufficientProfit(profit, minProfit);
 
         if (profit > 0) _safeTransfer(loanToken, PROFIT_RECEIVER, profit);
-        if (sweep) {
-            // Sweep any collateral the aggregator swaps did not use (rounding dust, partial exit).
-            uint256 leftover = IERC20Min(collateralToken).balanceOf(address(this));
-            if (leftover > 0) _safeTransfer(collateralToken, PROFIT_RECEIVER, leftover);
-        }
+        // Sweep any collateral the exit did not sell (rounding dust, partial exit or fill).
+        uint256 leftover = IERC20Min(collateralToken).balanceOf(address(this));
+        if (leftover > 0) _safeTransfer(collateralToken, PROFIT_RECEIVER, leftover);
     }
 
     /// @dev Handles tokens that return no bool (USDT-style) and tokens that require a zero allowance first.
