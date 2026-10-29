@@ -388,15 +388,21 @@ block the node actually simulated, because pending calls can run on a stale bloc
   (`ExecHandle::send`, answered when an endpoint accepted the tx), its state is read synchronously
   (`can_send`, `is_inflight`, `spendable`), it polls receipts on every block the loop announces,
   and settled txs come back on a channel that the loop drains each block (journal `outcome`, the
-  daily budget charged for reverts). No receipt or broadcast ever blocks planning.
+  reservation released, the daily budget charged for reverts), after waiting briefly
+  (`wait_polled`, at most `RECEIPT_WAIT`) for the new head's receipts so a tx included in it no
+  longer counts as in flight. No receipt or broadcast ever blocks planning.
 - **Signing:** only from an encrypted keystore; the password comes from an env var that is removed
   from the process environment right after reading, or from a hidden prompt.
 - **Several txs in flight.** Up to `exec.max_inflight` (default 1; set it higher for crashes, when
   many positions become liquidatable within a few blocks) with consecutive nonces. Each tx has a
   `TxKey` (group = market, id = borrower): the same position is never sent twice, and no second tx
-  goes to a market that already has one in flight (`is_group_inflight`: plans are simulated without the txs in
-  flight, and one in the same market sells the same collateral through the same pools first, so the
-  second plan's price would not hold). minProfit is patched to
+  goes to a market that already has one in flight (plans are simulated without the txs in flight,
+  and one in the same market sells the same collateral through the same pools first, so the second
+  plan's price would not hold). The block path and the flashblock events it handles while planning
+  send concurrently, so this is enforced by the executor task itself (`exclusive_group`), not only
+  by the `is_group_inflight` check before the send. Each send reserves its worst case (gas limit
+  at its max fee, plus the L1 fee) in the daily budget until it settles, so several sends at once
+  cannot each fit the cap and overrun it together. minProfit is patched to
   `sim profit x min_profit_keep`, gas limit to `sim gas x gas_limit_buffer`. The wallet must afford
   the worst-case gas: `spendable` = the balance read in the background (with the nonce, by
   `spawn_nonce_watch`) minus what the txs in flight may still burn, so the send path pays no RPC
@@ -407,7 +413,8 @@ block the node actually simulated, because pending calls can run on a stale bloc
   (e.g. its max fee fell below a rising base fee) would block every later nonce, so `cancel_stuck`
   first replaces each one still pending with a 0-value self-transfer at the same nonce and fees
   bumped past the replacement threshold (it would only revert `Expired` anyway); then the nonce is
-  resynced from the chain.
+  resynced from the chain (if that read fails, the outcomes are still reported and the next send
+  resyncs).
 - **Broadcast:** the same raw tx goes to every endpoint plus optional `extra_broadcast`; the first
   acceptance returns, the rest finish in the background. A dedicated HTTP client keeps connections
   warm (keep-alive pings), so a send never pays DNS/TLS setup.
@@ -417,7 +424,8 @@ block the node actually simulated, because pending calls can run on a stale bloc
   signing and broadcast. The lock fails closed: if the file cannot be locked, nothing is sent
   (another bot on the wallet could otherwise sign with the same nonce). The file's format is
   versioned (`v1 <next nonce> <unix ms>`); an unknown format is never trusted, so bots built on
-  incompatible `onchain-core` versions refuse to send rather than collide.
+  incompatible `onchain-core` versions refuse to send rather than collide. A stale line in the
+  unversioned format of earlier releases is treated as empty (no manual cleanup after an upgrade).
 - **Failure policy:** `max_failures_in_window` failed or dropped txs within `failure_window_secs`
   pause sending for `failure_cooldown_secs`, then it resumes.
 - **Deadline and lookahead:** `deadline_secs` converted to blocks from the measured block time;
@@ -542,8 +550,13 @@ submitted to the auction (`submit_solver_op` in `main.rs`):
   to `[atlas.solver] endpoint` (default the Chainlink SVR bid endpoint), the op in the SDK's
   `SolverOperationRaw` form (hex quantities). Tested against a local mock endpoint;
 - the rules: one op per block per EOA (Atlas keeps only one; a second auction for the same block
-  needs another EOA), the kill-switch file stops submissions, and the journal's `solver` field
-  records what was submitted (`submitted`).
+  needs another EOA), so an auction's ops are tried most profitable first (profit after the bid)
+  until the endpoint accepts one; a refused op gives the block's slot back to the next, and the
+  others are journaled with the op that was submitted; the kill-switch file stops
+  submissions; and an op is only submitted while its worst-case charge to the bond (all of its gas
+  at the auction's max fee plus the escrow surcharge) fits `exec.daily_gas_budget_usd`, counted
+  separately from the executor's budget and charged for every accepted op (whether Atlas ran it is
+  not observed). The journal's `solver` field records what was submitted (`submitted`).
 
 At start (`build_submitter`), the bot refuses to submit unless the solver and its liquidator are
 deployed (`[atlas.solver] address`, `liquidator`), the solver's `executor()` is the hot wallet,

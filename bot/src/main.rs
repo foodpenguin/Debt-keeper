@@ -706,6 +706,9 @@ struct PlannerParts {
     bids: std::sync::Mutex<WinningBids>,
     /// Signs and submits solver operations (live + `[atlas.solver] submit`).
     submitter: Option<atlas_submit::Submitter>,
+    /// Gas burned by reverted txs today, plus the worst case of the txs in flight; shared by the
+    /// block path and the flashblock events it handles while planning.
+    budget: std::sync::Mutex<risk::DailyBudget>,
 }
 
 impl PlannerParts {
@@ -801,16 +804,15 @@ async fn on_fb_event<P: Provider + Clone + 'static>(
     eth_usd: f64,
     block_time: f64,
     parts: &Arc<PlannerParts>,
-    budget: &mut risk::DailyBudget,
     exec: Option<&ExecHandle>,
     journal: &mut std::fs::File,
 ) -> Result<()> {
     match ev {
-        flashblocks::FbEvent::Oracle(u) => on_oracle_update(engine, fb, u, snaps, head, eth_usd, block_time, parts, budget, exec, journal).await?,
+        flashblocks::FbEvent::Oracle(u) => on_oracle_update(engine, fb, u, snaps, head, eth_usd, block_time, parts, exec, journal).await?,
         flashblocks::FbEvent::Opened { block, timestamp, seen } => {
             for (aggregator, answer) in fb.model.due(timestamp, engine.cfg.flashblocks.svr_cutoff_secs) {
                 let u = flashblocks::OracleUpdate { aggregator, answer, path: flashblocks::Path::Expired, block, block_ts: timestamp, index: 0, tx: alloy::primitives::B256::ZERO, seen };
-                on_oracle_update(engine, fb, u, snaps, head, eth_usd, block_time, parts, budget, exec, journal).await?;
+                on_oracle_update(engine, fb, u, snaps, head, eth_usd, block_time, parts, exec, journal).await?;
             }
         }
         flashblocks::FbEvent::Auction(a) => on_auction(engine, fb, a, snaps, head, eth_usd, parts),
@@ -901,7 +903,7 @@ async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngi
     let price = base.price * U256::from(10_000 - drop_bps) / U256::from(10_000u64);
     let m = auction_market(engine, mi, &base, price);
     let (kyber, simulator) = build_planner_parts(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: None });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: None, budget: Default::default() });
     let a = atlas::Auction {
         id: format!("replay-{market}-{at_block}"),
         aggregator: Address::ZERO,
@@ -1000,17 +1002,29 @@ fn unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// A simulated solver op that would pay: what `submit_solver_op` needs to sign and submit it.
+struct OpCandidate {
+    /// Index of its market in the auction.
+    market: usize,
+    payload: executor::Payload,
+    bid_wei: U256,
+    profit: U256,
+    gas_used: u64,
+    /// Profit after the bid, in USD: how the auction's markets are ranked for its one op.
+    profit_usd: f64,
+}
+
 /// The auction's top position as a solver operation (`[atlas.solver] simulate`): its direct-router
 /// plan, wrapped into `atlasSolverCall` with a bid of the plan's net x (1 - margin), simulated against
-/// the Atlas stand-in. With a submitter (live + `submit`), an op that succeeds with a profit after
-/// the bid is signed and submitted (unless the kill switch is on, or this EOA already bid for that
-/// block). None: solver venue off, or no direct-router plan to wrap (an aggregator route is built
-/// for the direct liquidator's address).
+/// the Atlas stand-in. Returns the journal row and, when the op succeeds with a profit after the
+/// bid, the candidate for submission (`valuation` submits the auction's best one). None: solver
+/// venue off, or no direct-router plan to wrap (an aggregator route is built for the direct
+/// liquidator's address).
 #[allow(clippy::too_many_arguments)]
 async fn solver_op<P: Provider>(
     provider: &P,
     parts: &PlannerParts,
-    a: &atlas::Auction,
+    mi: usize,
     m: &AuctionMarket,
     top: Option<&Result<planner::Plan>>,
     overrides: &StateOverride,
@@ -1019,7 +1033,7 @@ async fn solver_op<P: Provider>(
     atlas_gas_usd: f64,
     eth_usd: f64,
     margin: f64,
-) -> Option<serde_json::Value> {
+) -> Option<(serde_json::Value, Option<OpCandidate>)> {
     let (Some(solver), Venue::Callback(_), Some(Ok(plan))) = (&parts.solver, &parts.venue, top) else { return None };
     let payload = plan.payload.as_ref().filter(|_| plan.router == "direct")?;
     // Net of the op's gas as Atlas charges it (see valuation()).
@@ -1032,43 +1046,60 @@ async fn solver_op<P: Provider>(
     let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
     Some(match r {
         Ok(s) => {
-            let submitted = match &parts.submitter {
-                Some(sub) if !s.profit.is_zero() => Some(submit_solver_op(sub, parts, solver, a, m, payload, bid_wei, &s).await),
-                _ => None,
-            };
-            json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": math::units(s.profit, m.meta.loan_decimals), "gas_used": s.gas_used, "submitted": submitted })
+            let net_after_bid = math::units(s.profit, m.meta.loan_decimals);
+            let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, m.meta.params.loanToken, eth_usd).unwrap_or(0.0);
+            let cand = (!s.profit.is_zero()).then(|| OpCandidate { market: mi, payload: payload.clone(), bid_wei, profit: s.profit, gas_used: s.gas_used, profit_usd: net_after_bid * loan_usd });
+            (json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used }), cand)
         }
-        Err(e) => json!({ "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() }),
+        Err(e) => (json!({ "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() }), None),
     })
 }
 
-/// Signs and submits the simulated solver op `s` for auction `a` (see solver_op): minProfit after
+/// Signs and submits the simulated solver op `c` for auction `a` (see solver_op): minProfit after
 /// the bid = the simulated net x min_profit_keep, gas = simulated x gas_limit_buffer (within the
-/// DappControl's limit), the auction's own max fee and deadline. The journal row says what happened.
-#[allow(clippy::too_many_arguments)]
-async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, solver: &atlas_venue::AtlasSolver, a: &atlas::Auction, m: &AuctionMarket, payload: &executor::Payload, bid_wei: U256, s: &venue::SimResult) -> serde_json::Value {
+/// DappControl's limit), the auction's own max fee and deadline. Refused when the kill switch is
+/// on, when this EOA already bid for that block, or when the op's worst-case gas charge to the
+/// bond does not fit the daily budget (`Submitter::budget`). Returns whether the endpoint accepted
+/// it, and the journal row saying what happened. The block's one-op slot is held only by an
+/// accepted op: a refusal after claiming it gives it back for the auction's next candidate.
+async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, solver: &atlas_venue::AtlasSolver, a: &atlas::Auction, m: &AuctionMarket, c: &OpCandidate, eth_usd: f64) -> (bool, serde_json::Value) {
     let e = &parts.exec;
+    let refused = |why: String| (false, json!({ "ok": false, "error": why }));
     if gates::kill_switch_on(&e.kill_switch_file) {
-        return json!({ "ok": false, "error": "kill switch file present" });
+        return refused("kill switch file present".into());
+    }
+    let gas = ((c.gas_used as f64 * e.gas_limit_buffer) as u64).min(sub.gas_limit);
+    // What Atlas may take from the bond for this op: all of its gas at the auction's max fee plus
+    // the escrow's surcharge (also when the op fails).
+    let worst_usd = gas as f64 * a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    if !sub.budget.lock().unwrap().allows(now, worst_usd, e.daily_gas_budget_usd) {
+        return refused(format!("daily gas budget: the op's worst-case bond charge {worst_usd:.4} USD does not fit {}", e.daily_gas_budget_usd));
     }
     if !sub.claim(a.deadline) {
-        return json!({ "ok": false, "error": "this EOA already bid for that block (one op per block per EOA)" });
+        return refused("this EOA already bid for that block (one op per block per EOA)".into());
     }
-    let min_profit = s.profit * U256::from((e.min_profit_keep * 1e4) as u64) / U256::from(10_000u64);
-    let gas = ((s.gas_used as f64 * e.gas_limit_buffer) as u64).min(sub.gas_limit);
-    let data = solver.op_data(m.meta.params.loanToken, &payload.calldata, bid_wei, min_profit);
-    let signed = match sub.op(solver.solver, a.user_op_hash, a.deadline, a.max_fee_per_gas, gas, bid_wei, data).and_then(|op| atlas_submit::sign(op, &sub.domain, &sub.signer)) {
+    let min_profit = c.profit * U256::from((e.min_profit_keep * 1e4) as u64) / U256::from(10_000u64);
+    let data = solver.op_data(m.meta.params.loanToken, &c.payload.calldata, c.bid_wei, min_profit);
+    let signed = match sub.op(solver.solver, a.user_op_hash, a.deadline, a.max_fee_per_gas, gas, c.bid_wei, data).and_then(|op| atlas_submit::sign(op, &sub.domain, &sub.signer)) {
         Ok(x) => x,
-        Err(err) => return json!({ "ok": false, "error": err.to_string() }),
+        Err(err) => {
+            sub.unclaim(a.deadline);
+            return refused(err.to_string());
+        }
     };
     match atlas_submit::submit(&sub.http, &sub.endpoint, &a.id, &signed).await {
         Ok(r) => {
-            warn!(auction = %a.id, market = %m.meta.name, bid_eth = math::units(bid_wei, 18), gas, "ATLAS solver op SUBMITTED");
-            json!({ "ok": true, "bid_wei": bid_wei.to_string(), "gas": gas, "min_profit": min_profit.to_string(), "answer": r })
+            // Charged once accepted: whether Atlas ran it (and charged the bond) is not observed
+            // here, so every accepted op counts at its worst case.
+            sub.budget.lock().unwrap().charge(now, worst_usd);
+            warn!(auction = %a.id, market = %m.meta.name, bid_eth = math::units(c.bid_wei, 18), gas, "ATLAS solver op SUBMITTED");
+            (true, json!({ "ok": true, "bid_wei": c.bid_wei.to_string(), "gas": gas, "min_profit": min_profit.to_string(), "answer": r }))
         }
         Err(err) => {
+            sub.unclaim(a.deadline);
             warn!(auction = %a.id, error = %err, "ATLAS solver op submission failed");
-            json!({ "ok": false, "error": err.to_string() })
+            refused(err.to_string())
         }
     }
 }
@@ -1117,7 +1148,31 @@ async fn valuation<P: Provider>(
     // What Atlas charges a solver op for its gas: the metacall's gas price (the auction's
     // maxFeePerGas) plus the escrow's surcharge, per gas unit, in USD.
     let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
-    let solvers = futures::future::join_all(markets.iter().zip(&valued).map(|(m, (_, _, ov, plans))| solver_op(provider, parts, a, m, plans.first().map(|(_, p)| p), ov, head.number, sim_time, atlas_gas_usd, eth_usd, atlas.margin))).await;
+    let ops = futures::future::join_all(markets.iter().zip(&valued).enumerate().map(|(mi, (m, (_, _, ov, plans)))| solver_op(provider, parts, mi, m, plans.first().map(|(_, p)| p), ov, head.number, sim_time, atlas_gas_usd, eth_usd, atlas.margin))).await;
+    let (mut solvers, cands): (Vec<Option<serde_json::Value>>, Vec<Option<OpCandidate>>) = ops.into_iter().map(|o| o.map_or((None, None), |(row, c)| (Some(row), c))).unzip();
+    // Atlas takes one op per block from an EOA: the auction's candidates are tried most profitable
+    // first (live + `submit`), regardless of which market's simulation finished first, until one
+    // is accepted; a refused one (budget, endpoint) leaves the slot to the next.
+    if let (Some(sub), Some(solver)) = (&parts.submitter, &parts.solver) {
+        let mut order: Vec<&OpCandidate> = cands.iter().flatten().collect();
+        order.sort_by(|x, y| y.profit_usd.total_cmp(&x.profit_usd));
+        let mut accepted: Option<&str> = None;
+        for c in order {
+            let submitted = match accepted {
+                Some(name) => json!({ "ok": false, "error": format!("the op of {name} was submitted for this auction (one op per block per EOA)") }),
+                None => {
+                    let (ok, row) = submit_solver_op(sub, parts, solver, a, &markets[c.market], c, eth_usd).await;
+                    if ok {
+                        accepted = Some(&markets[c.market].meta.name);
+                    }
+                    row
+                }
+            };
+            if let Some(Some(row)) = solvers.get_mut(c.market) {
+                row["submitted"] = submitted;
+            }
+        }
+    }
 
     let (mut rows, mut positions) = (vec![], vec![]);
     let (mut n_liq, mut bonus_sum, mut net_sum, mut bundle_net, mut bundle_ms_max) = (0usize, 0.0f64, 0.0f64, 0.0f64, 0u64);
@@ -1158,7 +1213,6 @@ async fn on_oracle_update<P: Provider + Clone>(
     eth_usd: f64,
     block_time: f64,
     parts: &PlannerParts,
-    budget: &mut risk::DailyBudget,
     exec: Option<&ExecHandle>,
     journal: &mut std::fs::File,
 ) -> Result<()> {
@@ -1302,7 +1356,7 @@ async fn on_oracle_update<P: Provider + Clone>(
                 Ok(plan) => {
                     planned.insert((mi, v.user), (u.block, ready_ms, plan.net_usd));
                     let kill = std::path::Path::new(&engine.cfg.exec.kill_switch_file).exists();
-                    let decision = risk::decide(&engine.cfg.exec, budget, &plan, eth_usd, head.base_fee, head.timestamp, kill, parts.competition(&meta.name, head.timestamp));
+                    let decision = risk::decide(&engine.cfg.exec, &mut parts.budget.lock().unwrap(), &plan, eth_usd, head.base_fee, head.timestamp, kill, parts.competition(&meta.name, head.timestamp));
                     let send_ok = may_send(u.path, state);
                     info!(market = %meta.name, user = %v.user, hf = v.hf, block = u.block, flashblock = u.index, state, ready_ms, net_usd = ?plan.net_usd, error = ?plan.error, decision = ?decision, "FLASHBLOCK PLAN");
                     writeln!(
@@ -1410,14 +1464,35 @@ async fn send_approved<P: Provider>(e: &ExecHandle, parts: &PlannerParts, provid
         }
         _ => {}
     }
-    let req = executor::SendRequest { payload, min_profit, gas_limit, base_fee_wei, priority_fee_wei, key: tx_key(v), block, deadline_block };
+    // The daily budget holds this tx's worst case (all of its gas limit reverted, plus the L1 fee)
+    // while it is in flight: sends running at once cannot each fit the cap alone and overrun it
+    // together. Released in on_settled.
+    let key = tx_key(v);
+    let worst_usd = worst_wei as f64 / 1e18 * c.eth_usd + plan.l1_fee_usd.unwrap_or(0.0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    // A reservation already held for this position (the other path is sending it) is refused, not
+    // replaced.
+    let reserved = parts.budget.lock().unwrap().reserve(key, now, worst_usd, cfg.daily_gas_budget_usd);
+    if let Err(why) = reserved {
+        info!(market = %meta.name, user = %v.user, worst_usd, path, reason = %why, "not sending");
+        return None;
+    }
+    // One liquidation per market in flight, enforced by the executor task itself: the check above
+    // and this send are not atomic, and the block path and flashblock events send concurrently.
+    let req = executor::SendRequest { payload, min_profit, gas_limit, base_fee_wei, priority_fee_wei, key, exclusive_group: true, block, deadline_block };
     match e.send(req).await {
         Ok(inf) => {
             info!(hash = %inf.hash, block, deadline_block, market = %meta.name, user = %v.user, path, "LIVE tx SENT");
             Some(inf)
         }
         Err(err) => {
-            warn!(error = %err, "LIVE send failed");
+            parts.budget.lock().unwrap().release(key);
+            // The in-flight rules (the other path won the race for this market) or the cooldown:
+            // expected, not a send failure.
+            match err.downcast_ref::<executor::SendRefused>() {
+                Some(why) => info!(market = %meta.name, user = %v.user, path, reason = %why, "not sending (executor)"),
+                None => warn!(error = %err, "LIVE send failed"),
+            }
             None
         }
     }
@@ -1493,10 +1568,11 @@ where
     Ok(())
 }
 
-/// A tx the executor task settled: journaled, and a revert's real cost charged to the daily budget
-/// (a success paid for itself).
+/// A tx the executor task settled: journaled, its worst-case reservation released, and a revert's
+/// real cost charged to the daily budget (a success paid for itself).
 fn on_settled(s: actor::Settled, block: u64, now_unix: u64, eth_usd: f64, cooldown_secs: u64, budget: &mut risk::DailyBudget, journal: &mut std::fs::File) -> Result<()> {
     let actor::Settled { inflight, outcome, cooldown_started } = s;
+    budget.release(inflight.key);
     if let executor::Outcome::Included { success: false, gas_used, effective_gas_price, l1_fee_wei, .. } = &outcome {
         let cost = (*gas_used as f64 * *effective_gas_price as f64 + *l1_fee_wei as f64) / 1e18 * eth_usd;
         budget.charge(now_unix, cost);
@@ -1527,15 +1603,13 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         .with_context(|| format!("opening journal {}", engine.cfg.journal_path))?;
     let (kyber, simulator) = build_planner_parts(engine).await?;
     let v3 = build_v3(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: build_submitter(engine, live.as_ref().map(|l| &l.0)).await? });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: build_submitter(engine, live.as_ref().map(|l| &l.0)).await?, budget: Default::default() });
 
     // Watchlist rows are journaled only when a position enters it or its HF moves > 0.2%.
     let mut last_logged_hf: HashMap<(usize, Address), f64> = HashMap::new();
     // Candidate -> block it was last planned at.
     let mut last_planned: HashMap<(usize, Address), u64> = HashMap::new();
     let mut tracker = loss::LossTracker::default();
-    // Shared by the block path and the flashblock events handled while it plans (see plan_and_send).
-    let budget = std::cell::RefCell::new(risk::DailyBudget::default());
     // Live sending (None = shadow). The key never leaves the keystore decrypt. The executor runs
     // as its own task (onchain_core::actor): sends go to it as messages, it polls receipts on every
     // block announced on `blocks_tx`, and settled txs come back on `settled`.
@@ -1623,7 +1697,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                     Ev::Head(h) => break h,
                     Ev::Oracle(Some(u)) => {
                         if let (Some(f), Some(snaps), Some((h, eth_usd, bt))) = (fb.as_mut(), prev_snaps.as_ref(), last_ctx.as_ref()) {
-                            on_fb_event(engine, f, u, snaps, h, *eth_usd, *bt, &parts, &mut budget.borrow_mut(), exec.as_ref(), &mut journal).await?;
+                            on_fb_event(engine, f, u, snaps, h, *eth_usd, *bt, &parts, exec.as_ref(), &mut journal).await?;
                             drain_journal(&mut journal_rx, &mut journal)?;
                         }
                     }
@@ -1694,7 +1768,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                     r = &mut fetch => break r,
                     Some(u) = f.stream.updates.recv() => {
                         if let (Some(prev), Some((lh, eth, bt))) = (prev_snaps.as_ref(), last_ctx.as_ref()) {
-                            on_fb_event(engine, f, u, prev, lh, *eth, *bt, &parts, &mut budget.borrow_mut(), exec.as_ref(), &mut journal).await?;
+                            on_fb_event(engine, f, u, prev, lh, *eth, *bt, &parts, exec.as_ref(), &mut journal).await?;
                             drain_journal(&mut journal_rx, &mut journal)?;
                         }
                     }
@@ -1724,10 +1798,14 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         last_block = number;
         let eth_usd = engine.eth_usd(&snaps);
 
-        // Live: the txs the executor task has settled since the last block.
+        // Live: the txs the executor task has settled since the last block, including any in this
+        // block (its receipt poll ran alongside the fetch; waited for briefly if it is still going).
+        if let Some(e) = exec.as_ref() {
+            e.wait_polled(number, actor::RECEIPT_WAIT).await;
+        }
         if let Some(rx) = settled.as_mut() {
             while let Ok(s) = rx.try_recv() {
-                on_settled(s, number, h.timestamp, eth_usd, engine.cfg.exec.failure_cooldown_secs, &mut budget.borrow_mut(), &mut journal)?;
+                on_settled(s, number, h.timestamp, eth_usd, engine.cfg.exec.failure_cooldown_secs, &mut parts.budget.lock().unwrap(), &mut journal)?;
             }
         }
 
@@ -1824,7 +1902,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                 Ok(plan) => {
                     tracker.on_plan((v.market, v.user), number, plan.net_usd, plan.error.clone());
                     let kill = std::path::Path::new(&engine.cfg.exec.kill_switch_file).exists();
-                    let decision = risk::decide(&engine.cfg.exec, &mut budget.borrow_mut(), &plan, eth_usd, h.base_fee, h.timestamp, kill, parts.competition(&meta.name, h.timestamp));
+                    let decision = risk::decide(&engine.cfg.exec, &mut parts.budget.lock().unwrap(), &plan, eth_usd, h.base_fee, h.timestamp, kill, parts.competition(&meta.name, h.timestamp));
                     info!(
                         block = number, market = %meta.name, user = %v.user, hf = v.hf,
                         quoted_gross = plan.quoted_gross, net_usd = ?plan.net_usd, error = ?plan.error, decision = ?decision,
@@ -1846,12 +1924,12 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         // stream's receiver is lent to plan_and_send for the duration.
         let mut fb_events = fb.as_mut().map(|f| std::mem::replace(&mut f.stream.updates, tokio::sync::mpsc::channel(1).1));
         let batch = {
-            let (fb, budget, journal_rx) = (&mut fb, &budget, &mut journal_rx);
+            let (fb, journal_rx) = (&mut fb, &mut journal_rx);
             let (prev_snaps, last_ctx, parts, exec) = (&prev_snaps, &last_ctx, &parts, exec.as_ref());
             let engine = &*engine;
             let on_side = async move |ev: flashblocks::FbEvent, journal: &mut std::fs::File| -> Result<()> {
                 if let (Some(f), Some(prev), Some((lh, eth, bt))) = (fb.as_mut(), prev_snaps.as_ref(), last_ctx.as_ref()) {
-                    on_fb_event(engine, f, ev, prev, lh, *eth, *bt, parts, &mut budget.borrow_mut(), exec, journal).await?;
+                    on_fb_event(engine, f, ev, prev, lh, *eth, *bt, parts, exec, journal).await?;
                     drain_journal(journal_rx, journal)?;
                 }
                 Ok(())

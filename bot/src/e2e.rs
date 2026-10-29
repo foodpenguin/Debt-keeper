@@ -110,6 +110,7 @@ async fn e2e_live_send_on_anvil_fork() {
             base_fee_wei: base_fee.max(1),
             priority_fee_wei: 1_000_000,
             key: executor::TxKey::of_address(0, WETH_BORROWER),
+            exclusive_group: true,
             block,
             deadline_block: deadline,
         }
@@ -371,6 +372,7 @@ async fn e2e_stuck_tx_is_replaced_by_a_cancel() {
         base_fee_wei: base_fee.max(1),
         priority_fee_wei: 1_000_000,
         key: executor::TxKey::of_address(0, Address::ZERO),
+        exclusive_group: false,
         block: b,
         deadline_block: b + 1,
     };

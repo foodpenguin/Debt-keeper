@@ -145,13 +145,16 @@ pub struct Submitter {
     pub http: reqwest::Client,
     /// Most gas an op may declare (the DappControl's limit, read at start).
     pub gas_limit: u64,
+    /// What submitted ops may have cost the bond today, each at its worst case (all of its gas at
+    /// the auction's max fee): Atlas charges it also when an op fails, outside the executor's view.
+    pub budget: Mutex<onchain_core::gates::DailyBudget>,
     last_deadline: Mutex<u64>,
 }
 
 impl Submitter {
     #[allow(clippy::too_many_arguments)]
     pub fn new(signer: PrivateKeySigner, domain: Eip712Domain, atlas: Address, control: Address, endpoint: String, http: reqwest::Client, gas_limit: u64) -> Self {
-        Self { signer, domain, atlas, control, endpoint, http, gas_limit, last_deadline: Mutex::new(0) }
+        Self { signer, domain, atlas, control, endpoint, http, gas_limit, budget: Mutex::default(), last_deadline: Mutex::new(0) }
     }
 
     /// Claims the slot for an op landing by `deadline`; false = this EOA already has one there.
@@ -162,6 +165,14 @@ impl Submitter {
         }
         *last = deadline;
         true
+    }
+
+    /// Gives the slot for `deadline` back (the op claimed for it was not accepted).
+    pub fn unclaim(&self, deadline: u64) {
+        let mut last = self.last_deadline.lock().unwrap();
+        if *last == deadline {
+            *last = 0;
+        }
     }
 
     /// The op for an auction: `data` = the solver's `solverOpData`, `gas` = what it may use, the
@@ -268,6 +279,11 @@ mod tests {
     fn one_op_per_block_and_within_the_dapp_gas_limit() {
         let s = Submitter::new(PrivateKeySigner::random(), base_domain(), ATLAS, Address::with_last_byte(3), SVR_BID_ENDPOINT.into(), reqwest::Client::new(), 6_000_000);
         assert!(s.claim(100) && !s.claim(100) && s.claim(101));
+        // An op that was not accepted gives its slot back; an older deadline does not touch it.
+        s.unclaim(100);
+        assert!(!s.claim(101));
+        s.unclaim(101);
+        assert!(s.claim(101));
         assert!(s.op(Address::with_last_byte(2), B256::ZERO, 100, 1, 6_000_001, U256::ZERO, Bytes::new()).is_err());
         let op = s.op(Address::with_last_byte(2), B256::ZERO, 100, 1, 600_000, U256::from(5u8), Bytes::new()).unwrap();
         assert_eq!((op.from, op.to, op.bidToken, op.deadline), (s.signer.address(), ATLAS, Address::ZERO, U256::from(100u8)));
