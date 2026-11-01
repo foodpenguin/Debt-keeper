@@ -31,6 +31,7 @@ pub mod loss;
 pub mod morpho;
 pub mod oracle;
 pub mod planner;
+pub mod policy;
 pub mod protocol;
 pub mod risk;
 pub mod router;
@@ -41,5 +42,5 @@ pub mod venue;
 
 #[cfg(test)]
 mod e2e;
-#[cfg(test)]
-pub(crate) mod testkit;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;

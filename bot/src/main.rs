@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 use liquidation_framework::{
     config::Config,
-    dash, live, loss,
+    dash, live, loss, policy,
     runner::{Runner, RunnerInputs, load_signer_pre_runtime},
 };
 
@@ -113,7 +113,8 @@ async fn run(cli: Cli, cfg: Config, live_signer: Option<alloy::signers::local::P
         Cmd::Watch { from_block, .. } => from_block,
         _ => None,
     };
-    let mut runner = Runner::build(RunnerInputs { cfg, signer: live_signer, from_block }).await?;
+    let (auction, priority) = policy::defaults(&cfg);
+    let mut runner = Runner::build(RunnerInputs { cfg, signer: live_signer, from_block }, auction, priority).await?;
     match cli.cmd {
         Cmd::Scan { top } => runner.scan(top).await,
         Cmd::Watch { .. } => runner.run().await,

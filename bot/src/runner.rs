@@ -34,6 +34,7 @@ use crate::{
     morpho::{Morpho, MorphoEngine, PositionView, evaluate_position, math, onchain::MarketMeta},
     planner::{PlanCtx, Planner, PriceProbe},
     router::Kyber,
+    policy::{AuctionBidPolicy, PriorityBidPolicy},
     sim::{LiquidatorCode, Simulator},
 };
 
@@ -63,11 +64,14 @@ pub struct Runner<P> {
     live: Option<(alloy::signers::local::PrivateKeySigner, Vec<(String, String)>)>,
     fb_provider: Option<(P, rpc::RpcPool)>,
     from_block: Option<u64>,
+    auction: Arc<dyn AuctionBidPolicy>,
+    priority: Arc<dyn PriorityBidPolicy>,
 }
 
 impl Runner<()> {
-    /// Connects to the configured endpoints and loads the markets.
-    pub async fn build(inputs: RunnerInputs) -> Result<Runner<impl Provider + Clone + 'static>> {
+    /// Connects to the configured endpoints and loads the markets. `auction` and `priority` decide
+    /// the bids (`policy::defaults` for the `[atlas]` margin and the `[exec]` bid curve).
+    pub async fn build(inputs: RunnerInputs, auction: impl AuctionBidPolicy, priority: impl PriorityBidPolicy) -> Result<Runner<impl Provider + Clone + 'static>> {
         let RunnerInputs { cfg, signer, from_block } = inputs;
         let resolved = cfg.resolve_rpc()?;
         info!(
@@ -119,7 +123,7 @@ impl Runner<()> {
         // would be silently mispriced, so it is refused here.
         let unpriced: Vec<String> = engine.metas.iter().filter(|m| morpho::loan_usd_model(engine.cfg.chain_id, m.params.loanToken, 1.0).is_none()).map(|m| format!("{} (loan {})", m.name, m.loan_symbol)).collect();
         anyhow::ensure!(unpriced.is_empty(), "markets with a loan token the bot cannot price in USD (Base USD stablecoins and WETH, by address): {}", unpriced.join(", "));
-        Ok(Runner { engine, pool, ws: resolved.ws, live: signer.map(|s| (s, broadcast)), fb_provider, from_block })
+        Ok(Runner { engine, pool, ws: resolved.ws, live: signer.map(|s| (s, broadcast)), fb_provider, from_block, auction: Arc::new(auction), priority: Arc::new(priority) })
     }
 }
 
@@ -127,7 +131,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Runner<P> {
     /// The watch loop: every block (and every SVR auction) until an error. Shadow mode unless the
     /// inputs carried a signer.
     pub async fn run(mut self) -> Result<()> {
-        watch(&mut self.engine, self.from_block, self.pool, self.ws, self.live, self.fb_provider).await
+        watch(&mut self.engine, self.from_block, self.pool, self.ws, self.live, self.fb_provider, self.auction, self.priority).await
     }
 
     /// One-shot risk summary of every tracked position, checked against the Morpho API.
@@ -145,7 +149,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Runner<P> {
     /// Replays one market's Atlas auction valuation at a past block (diagnostic).
     #[doc(hidden)]
     pub async fn value_auction(&mut self, market: &str, drop_bps: u64, at_block: u64, users: &[Address], use_kyber: bool) -> Result<()> {
-        value_auction_at(&mut self.engine, market, drop_bps, at_block, users, use_kyber).await
+        value_auction_at(&mut self.engine, market, drop_bps, at_block, users, use_kyber, self.auction.clone(), self.priority.clone()).await
     }
 }
 
@@ -649,6 +653,9 @@ struct PlannerParts {
     /// Gas burned by reverted txs today, plus the worst case of the txs in flight; shared by the
     /// block path and the flashblock events it handles while planning.
     budget: std::sync::Mutex<risk::DailyBudget>,
+    /// The bidding policies (see policy.rs).
+    auction: Arc<dyn AuctionBidPolicy>,
+    priority: Arc<dyn PriorityBidPolicy>,
 }
 
 impl PlannerParts {
@@ -833,7 +840,8 @@ fn auction_market<P: Provider>(engine: &MorphoEngine<P>, mi: usize, base: &morph
     AuctionMarket { meta: engine.metas[mi].clone(), snap, old_price, liq }
 }
 
-async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngine<P>, market: &str, drop_bps: u64, at_block: u64, users: &[Address], use_kyber: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngine<P>, market: &str, drop_bps: u64, at_block: u64, users: &[Address], use_kyber: bool, auction: Arc<dyn AuctionBidPolicy>, priority: Arc<dyn PriorityBidPolicy>) -> Result<()> {
     let mi = engine.market_by_name(market).with_context(|| format!("market {market} not in config"))?;
     anyhow::ensure!(drop_bps < 10_000, "--price-drop-bps must be < 10000");
     let h = heads::http_head(&engine.provider, BlockNumberOrTag::Number(at_block)).await?;
@@ -849,7 +857,7 @@ async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngi
     let price = base.price * U256::from(10_000 - drop_bps) / U256::from(10_000u64);
     let m = auction_market(engine, mi, &base, price);
     let (kyber, simulator) = build_planner_parts(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: None, budget: Default::default() });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: None, budget: Default::default(), auction, priority });
     let a = atlas::Auction {
         id: format!("replay-{market}-{at_block}"),
         aggregator: Address::ZERO,
@@ -924,16 +932,16 @@ async fn value_auction<P: Provider>(
     }
     let queued_ms = v["queued_ms"].as_u64().unwrap_or(0);
     let bundle_net = v["bundle_net_usd"].as_f64().unwrap_or(0.0);
-    // The journaled bid: bundle net x (1 - atlas.margin); the dashboard's paper table tries the
-    // atlas.paper_margins ladder around it.
-    let bid_usd = bundle_net * (1.0 - atlas.margin);
+    // The journaled bid: the policy's bid on the bundle net (default: x (1 - atlas.margin)); the
+    // dashboard's paper table tries the atlas.paper_margins ladder around it. None = no bid.
+    let bid_usd = parts.auction.bid_usd(None, bundle_net, eth_usd);
     // From this auction's arrival to the end of the valuation proper (before any solver-op
     // simulation, see valuation()).
     let since_valued = v["valued_unix_ms"].as_u64().map_or(0, |t| gates::unix_ms().saturating_sub(t));
     let value_ms = (a.seen.elapsed().as_millis() as u64).saturating_sub(since_valued);
-    info!(auction = %a.id, aggregator = %a.aggregator, deadline = a.deadline, liquidatable = %v["liquidatable"], bonus_usd = %v["bonus_usd"], bundle_net_usd = bundle_net, net_usd = %v["net_usd"], bid_usd, bundle_ms = %v["bundle_ms"], value_ms, shared = %v["shared"], "ATLAS auction valued (observe only)");
+    info!(auction = %a.id, aggregator = %a.aggregator, deadline = a.deadline, liquidatable = %v["liquidatable"], bonus_usd = %v["bonus_usd"], bundle_net_usd = bundle_net, net_usd = %v["net_usd"], bid_usd = bid_usd.unwrap_or(0.0), bundle_ms = %v["bundle_ms"], value_ms, shared = %v["shared"], "ATLAS auction valued (observe only)");
     let mut row = json!({ "kind": "atlas_auction", "auction_id": a.id, "user_op_hash": a.user_op_hash, "aggregator": a.aggregator, "median": a.median.to_string(),
-                          "deadline": a.deadline, "head": head.number, "max_fee_gwei": a.max_fee_per_gas as f64 / 1e9, "bid_usd": bid_usd, "bid_eth": bid_usd / eth_usd.max(1.0),
+                          "deadline": a.deadline, "head": head.number, "max_fee_gwei": a.max_fee_per_gas as f64 / 1e9, "bid_usd": bid_usd, "bid_eth": bid_usd.map(|b| b / eth_usd.max(1.0)),
                           "eth_usd": eth_usd, "bid_basis": "bundle_net", "bid_margin": atlas.margin, "queued_ms": queued_ms, "value_ms": value_ms });
     for k in ["markets", "positions", "liquidatable", "bonus_usd", "bundle_net_usd", "net_usd", "bundle_ms", "shared"] {
         row[k] = v[k].clone();
@@ -974,13 +982,14 @@ async fn solver_op<P: Provider>(
     sim_time: u64,
     atlas_gas_usd: f64,
     eth_usd: f64,
-    margin: f64,
 ) -> Option<(serde_json::Value, Option<OpCandidate>)> {
     let (Some(solver), Venue::Callback(_), Some(Ok(plan))) = (&parts.solver, &parts.venue, top) else { return None };
     let payload = plan.payload.as_ref().filter(|_| plan.router == "direct")?;
     // Net of the op's gas as Atlas charges it (see valuation()).
     let net = plan.profit_usd.unwrap_or(0.0) - plan.gas_used.unwrap_or(0) as f64 * atlas_gas_usd;
-    let bid_usd = net.max(0.0) * (1.0 - margin);
+    let Some(bid_usd) = parts.auction.bid_usd(Some(&m.meta.name), net.max(0.0), eth_usd) else {
+        return Some((json!({ "ok": false, "skipped": "policy" }), None));
+    };
     let bid_wei = U256::from((bid_usd / eth_usd.max(1.0) * 1e18) as u128);
     let venue = atlas_venue::AtlasBid { solver, bid_wei };
     let calldata = solver.calldata(m.meta.params.loanToken, &payload.calldata, bid_wei, U256::ZERO);
@@ -1091,7 +1100,7 @@ async fn valuation<P: Provider>(
     // What Atlas charges a solver op for its gas: the metacall's gas price (the auction's
     // maxFeePerGas) plus the escrow's surcharge, per gas unit, in USD.
     let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
-    let ops = futures::future::join_all(markets.iter().zip(&valued).enumerate().map(|(mi, (m, (_, _, ov, plans)))| solver_op(provider, parts, mi, m, plans.first().map(|(_, p)| p), ov, head.number, sim_time, atlas_gas_usd, eth_usd, atlas.margin))).await;
+    let ops = futures::future::join_all(markets.iter().zip(&valued).enumerate().map(|(mi, (m, (_, _, ov, plans)))| solver_op(provider, parts, mi, m, plans.first().map(|(_, p)| p), ov, head.number, sim_time, atlas_gas_usd, eth_usd))).await;
     let (mut solvers, cands): (Vec<Option<serde_json::Value>>, Vec<Option<OpCandidate>>) = ops.into_iter().map(|o| o.map_or((None, None), |(row, c)| (Some(row), c))).unzip();
     // Atlas takes one op per block from an EOA: the auction's candidates are tried most profitable
     // first (live + `submit`), regardless of which market's simulation finished first, until one
@@ -1299,7 +1308,7 @@ async fn on_oracle_update<P: Provider + Clone>(
                 Ok(plan) => {
                     planned.insert((mi, v.user), (u.block, ready_ms, plan.net_usd));
                     let kill = std::path::Path::new(&engine.cfg.exec.kill_switch_file).exists();
-                    let decision = risk::decide(&engine.cfg.exec, &mut parts.budget.lock().unwrap(), &plan, eth_usd, head.base_fee, head.timestamp, kill, parts.competition(&meta.name, head.timestamp));
+                    let decision = risk::decide(&engine.cfg.exec, &mut parts.budget.lock().unwrap(), &plan, eth_usd, head.base_fee, head.timestamp, kill, parts.priority.bid(&meta.name, &plan, parts.competition(&meta.name, head.timestamp), eth_usd));
                     let send_ok = may_send(u.path, state);
                     info!(market = %meta.name, user = %v.user, hf = v.hf, block = u.block, flashblock = u.index, state, ready_ms, net_usd = ?plan.net_usd, error = ?plan.error, decision = ?decision, "FLASHBLOCK PLAN");
                     writeln!(
@@ -1528,6 +1537,7 @@ fn on_settled(s: actor::Settled, block: u64, now_unix: u64, eth_usd: f64, cooldo
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     engine: &mut MorphoEngine<P>,
     from_block: Option<u64>,
@@ -1535,6 +1545,8 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     ws_endpoints: Vec<(String, String)>,
     live: Option<(alloy::signers::local::PrivateKeySigner, Vec<(String, String)>)>,
     fb_provider: Option<(P, rpc::RpcPool)>,
+    auction: Arc<dyn AuctionBidPolicy>,
+    priority: Arc<dyn PriorityBidPolicy>,
 ) -> Result<()> {
     if let Some(dir) = std::path::Path::new(&engine.cfg.journal_path).parent() {
         std::fs::create_dir_all(dir).ok();
@@ -1546,7 +1558,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         .with_context(|| format!("opening journal {}", engine.cfg.journal_path))?;
     let (kyber, simulator) = build_planner_parts(engine).await?;
     let v3 = build_v3(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: build_submitter(engine, live.as_ref().map(|l| &l.0)).await?, budget: Default::default() });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: build_submitter(engine, live.as_ref().map(|l| &l.0)).await?, budget: Default::default(), auction, priority });
 
     // Watchlist rows are journaled only when a position enters it or its HF moves > 0.2%.
     let mut last_logged_hf: HashMap<(usize, Address), f64> = HashMap::new();
@@ -1845,7 +1857,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                 Ok(plan) => {
                     tracker.on_plan((v.market, v.user), number, plan.net_usd, plan.error.clone());
                     let kill = std::path::Path::new(&engine.cfg.exec.kill_switch_file).exists();
-                    let decision = risk::decide(&engine.cfg.exec, &mut parts.budget.lock().unwrap(), &plan, eth_usd, h.base_fee, h.timestamp, kill, parts.competition(&meta.name, h.timestamp));
+                    let decision = risk::decide(&engine.cfg.exec, &mut parts.budget.lock().unwrap(), &plan, eth_usd, h.base_fee, h.timestamp, kill, parts.priority.bid(&meta.name, &plan, parts.competition(&meta.name, h.timestamp), eth_usd));
                     info!(
                         block = number, market = %meta.name, user = %v.user, hf = v.hf,
                         quoted_gross = plan.quoted_gross, net_usd = ?plan.net_usd, error = ?plan.error, decision = ?decision,
