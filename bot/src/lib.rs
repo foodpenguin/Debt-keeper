@@ -34,6 +34,7 @@ pub mod planner;
 pub mod protocol;
 pub mod risk;
 pub mod router;
+pub mod runner;
 pub mod sim;
 pub mod v3router;
 pub mod venue;
