@@ -867,6 +867,11 @@ impl<P: Provider + Clone + 'static> AtlasState<P> {
         }
         for (aggregator, answer) in self.model.due(head.timestamp, self.svr_cutoff_secs) {
             let r = self.model.apply(aggregator, answer, oracle::Path::Expired, head.timestamp);
+            // In effect from this head on: the previous block's snapshot still has the old price, so
+            // its cross-check must wait a block like a log of this block would.
+            if matches!(&r, oracle::Applied::Moved(m) if !m.is_empty()) {
+                self.max_update_block = self.max_update_block.max(head.number);
+            }
             info!(%aggregator, block = head.number, outcome = ?r, "ORACLE SVR primary past its cutoff");
         }
         let Some((prev_block, snaps)) = prev else { return };
@@ -2142,6 +2147,56 @@ fn price_human(price: U256, meta: &MarketMeta) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An SVR primary past its cutoff is in effect from the head that applies it: the previous
+    /// block (still the old price on-chain) is not a missed update, and the next block agrees.
+    /// Found in a shadow run (2026-11-02): two false "missed" warnings and a block valued at the old
+    /// price after the resync.
+    #[tokio::test]
+    async fn an_expired_svr_primary_is_not_a_missed_update() {
+        use alloy::{primitives::address, transports::mock::Asserter};
+        let eth = address!("05c84a58FE042275b37db038bAAcD15F410c7bB0");
+        let e24 = U256::from(10u64).pow(U256::from(24u64));
+        let model = oracle::PriceModel::for_test(vec![(Address::repeat_byte(1), eth, U256::from(228_360_000_000u64), true)], vec![Some((e24, vec![0], vec![]))]);
+        let (journal_tx, _journal_rx) = tokio::sync::mpsc::unbounded_channel();
+        // No RPC answers queued: a resync (the false alarm) would fail and be counted.
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut st = AtlasState {
+            provider,
+            pool: None,
+            model,
+            logs: oracle_logs::OracleLogs::detached(),
+            block_ts: HashMap::new(),
+            held: vec![],
+            max_update_block: 0,
+            missed_streak: 0,
+            resync_all: false,
+            svr_cutoff_secs: 10,
+            journal_tx,
+            valuations: Arc::new(tokio::sync::Semaphore::new(1)),
+            auction_cache: Arc::default(),
+            dropped: Arc::default(),
+            dropped_journaled: 0,
+        };
+        let old = st.model.price(0).unwrap();
+        let new_answer = U256::from(228_747_000_000u64);
+        let new = st.model.preview(eth, new_answer)[0].1;
+        assert_ne!(old, new);
+        // The primary lands in block 95 (ts 1000): deferred for the SVR auction.
+        assert!(matches!(st.model.apply(eth, new_answer, oracle::Path::Primary, 1000), oracle::Applied::Deferred(_)));
+        st.max_update_block = 95;
+        let snap = |price| Some(morpho::onchain::MarketSnapshot { price, totals: Default::default(), raw: Default::default() });
+        let head = |number, timestamp| Head { number, timestamp, base_fee: 0, seen_at: Instant::now(), source: 0 };
+        // Head 100 (ts 1010): not past the cutoff yet; block 99 has the old price.
+        st.on_head(&head(100, 1010), Some((99, &[snap(old)]))).await;
+        assert_eq!((st.model.price(0), st.missed_streak), (Some(old), 0));
+        // Head 101 (ts 1012): past the cutoff, applied; block 100 still has the old price.
+        st.on_head(&head(101, 1012), Some((100, &[snap(old)]))).await;
+        assert_eq!((st.model.price(0), st.missed_streak), (Some(new), 0), "block 100 is not a missed update");
+        // Head 102: block 101 has the new price, as the model.
+        st.on_head(&head(102, 1014), Some((101, &[snap(new)]))).await;
+        assert_eq!((st.model.price(0), st.missed_streak), (Some(new), 0));
+    }
 
     #[test]
     fn loopback_urls_are_recognized() {

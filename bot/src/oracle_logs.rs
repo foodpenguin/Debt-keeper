@@ -114,6 +114,12 @@ impl OracleLogs {
     pub fn reconnect(&self) {
         self.reconnect.notify_one();
     }
+
+    /// A handle with no subscription behind it (tests).
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        OracleLogs { addresses: Arc::new(watch::channel(vec![]).0), reconnect: Arc::new(Notify::new()) }
+    }
 }
 
 /// Subscribes in the background (reconnecting) to the oracle events of `addresses` on `ws_url`; the
