@@ -32,6 +32,12 @@ cd contracts && forge build && forge test   # fork tests need BASE_RPC_URL; -j 1
 Changes to anything that sends transactions must also pass `cargo test e2e -- --ignored` on a local
 anvil fork.
 
+## Releases
+
+A release is a tag `vX.Y.Z` on `main`. The same commit sets `version` in `bot/Cargo.toml` to
+`X.Y.Z` and adds a `CHANGELOG.md` entry. Published tags are never moved: a fix is the next patch
+version.
+
 ## Guidelines
 
 - **Extend through the traits**, not with special cases in the core. A new protocol, DEX or venue
