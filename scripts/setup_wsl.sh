@@ -5,7 +5,8 @@
 #
 #   ./scripts/setup_wsl.sh                    # tools + build + config
 #   ./scripts/setup_wsl.sh --install-service  # also install/enable the shadow-mode systemd service (sudo)
-#     BIN=, CONFIG=, LOG= override the binary, its config and its log (default: this repo's build)
+#     BIN=, CONFIG=, LOG=, WORKDIR= override the binary, its config, its log and its working directory
+#     (default: this repo's build, working directory = the config's directory)
 #   SKIP_APT=1 ./scripts/setup_wsl.sh         # skip apt (no sudo), e.g. when packages are present
 set -euo pipefail
 
@@ -69,7 +70,7 @@ if [[ "$INSTALL_SERVICE" == "1" ]]; then
   BIN="${BIN:-$REPO/bot/target/release/bot}"
   CONFIG="${CONFIG:-$REPO/bot/config.local.toml}"
   LOG="${LOG:-$REPO/bot/data/run.log}"
-  WORKDIR="$(dirname "$CONFIG")"
+  WORKDIR="${WORKDIR:-$(dirname "$CONFIG")}"   # relative paths in the config (journal, artifacts) resolve here
   mkdir -p "$(dirname "$LOG")"
   fill() { sed -e "s#@BIN@#$BIN#g" -e "s#@CONFIG@#$CONFIG#g" -e "s#@LOG@#$LOG#g" -e "s#@WORKDIR@#$WORKDIR#g" -e "s#@USER@#$USER#g" "$1"; }
   fill deploy/debt-keeper-shadow.service | sudo tee /etc/systemd/system/debt-keeper-shadow.service >/dev/null

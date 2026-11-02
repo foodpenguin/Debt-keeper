@@ -1,5 +1,5 @@
 # Shadow-mode liquidation bot (never sends transactions). Installed by scripts/setup_wsl.sh
-# --install-service with @BIN@ / @CONFIG@ / @LOG@ / @USER@ filled in (BIN, CONFIG, LOG overridable:
+# --install-service with @BIN@ / @CONFIG@ / @LOG@ / @WORKDIR@ / @USER@ filled in (BIN, CONFIG, LOG, WORKDIR overridable:
 # e.g. a private build of the bot and a config kept outside this repository).
 #   sudo systemctl status debt-keeper-shadow     # state
 #   sudo systemctl restart debt-keeper-shadow    # after a rebuild
