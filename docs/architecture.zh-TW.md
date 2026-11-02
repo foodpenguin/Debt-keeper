@@ -6,9 +6,9 @@
 
 ## 範圍：目前哪些是通用的
 
-這個 crate 是一個函式庫（`liquidation_framework`，`bot/src/lib.rs`）加上 Morpho bot 的執行檔（`bot/src/main.rs`）。鏈的基礎管線（RPC 連線池、heads、Flashblocks 串流、`eth_simulateV1` 模擬、executor 和它的 task、送單關卡、出價、共用的設定區段）是 `onchain-core` crate（repo 為 bot-onchain-core，鎖定 tag 的 git 依賴），和 Arb-seeker 共用，並以原本的模組名稱重新匯出（`liquidation_framework::executor`、`::rpc`……）。
+這個 crate 是一個函式庫（`liquidation_framework`，`bot/src/lib.rs`）（watch 迴圈在 `runner.rs`）加上很薄的 Morpho bot 執行檔（`bot/src/main.rs`，只有 CLI）。鏈的基礎管線（RPC 連線池、heads、Flashblocks 串流、`eth_simulateV1` 模擬、executor 和它的 task、送單關卡、出價、共用的設定區段）是 `onchain-core` crate（repo 為 bot-onchain-core，鎖定 tag 的 git 依賴），和 Arb-seeker 共用，並以原本的模組名稱重新匯出（`liquidation_framework::executor`、`::rpc`……）。
 
-通用（針對 trait 撰寫，不指名任何協議）：HF 引擎（`engine.rs`）、planner（`planner.rs`）、venue / DEX / 資金來源三個接口（`venue.rs`、`dex.rs`、`funding.rs`）和它們的 venue 實作（`sim.rs`、`flash_venue.rs`、`atlas_venue.rs`）、風控閘門（`risk.rs`），以及 `onchain-core` 的所有部分。仍然綁定 Morpho 的應用層程式：`main.rs` 的 watch 迴圈（區塊路徑、同塊路徑、送單路徑、pre-flight）、預言機價格模型（`oracle.rs`，MorphoChainlinkOracleV2）、Atlas 估值、儀表板和輸單分析。新的協議可以直接沿用通用核心，但目前需要自己的應用迴圈（從 `main.rs` 改起）。
+通用（針對 trait 撰寫，不指名任何協議）：HF 引擎（`engine.rs`）、planner（`planner.rs`）、venue / DEX / 資金來源三個接口（`venue.rs`、`dex.rs`、`funding.rs`）和它們的 venue 實作（`sim.rs`、`flash_venue.rs`、`atlas_venue.rs`）、風控閘門（`risk.rs`），以及 `onchain-core` 的所有部分。仍然綁定 Morpho 的應用層程式：`runner.rs` 的 watch 迴圈（區塊路徑、Atlas 路徑、送單路徑、pre-flight）、預言機價格模型（`oracle.rs`，MorphoChainlinkOracleV2）、Atlas 估值、儀表板和輸單分析。新的協議可以直接沿用通用核心，但目前需要自己的應用迴圈（從 `runner.rs` 改起）。
 
 ## 一筆清算的完整流程
 
@@ -193,8 +193,11 @@ gas 基準測試在 `contracts/test/MorphoLiquidator.gas.fork.t.sol`（`forge te
 | `rpc`（onchain-core） | 多端點連線池（見下方） |
 | `heads`（onchain-core） | 新區塊訊號：多個端點的 WS `newHeads`，HTTP 備援 |
 | `gates`、`bid`（onchain-core） | 緊急停止、每日預算、期限；依觀察到的得標者出價 |
-| `flashblocks` | 從 Base Flashblocks 串流解出的預言機更新（串流本身在 onchain-core） |
+| `runner`、`policy` | 做成函式庫的 watch 迴圈（`Runner`）和兩個出價 policy |
+| `ledger` | 當天的失敗 gas、Atlas bond 和損益，實跑時存檔；每日虧損停機 |
+| `oracle_logs` | 從正式區塊的 log 讀 Chainlink 更新（Atlas 價格模型的來源） |
 | `oracle` | 本地的 MorphoChainlinkOracleV2 價格模型，啟動時和 `price()` 核對 |
+| `flashblocks` | Flashblocks 串流解碼：只剩 examples 在用（Denim 會移除 Flashblocks） |
 | `atlas` | Chainlink SVR / Fastlane Atlas 拍賣串流與估值 |
 | `atlas_submit` | solver operation：EIP-712 簽名、送出（實跑、需明確開啟） |
 | `loss` | 輸單分析：追蹤市場裡每一筆鏈上清算，和我們當時看到的比較 |
@@ -202,7 +205,7 @@ gas 基準測試在 `contracts/test/MorphoLiquidator.gas.fork.t.sol`（`forge te
 
 ### 模擬
 
-一次 `eth_simulateV1` 跑完整筆清算，回傳利潤和實際 gas，再加上 L1 fee（`getL1FeeUpperBound`）。計畫以規劃用的 fee 模擬（見 `Planner`）；風控閘門選出高於基本 priority 的出價後，`checked_priority`（在 `main.rs`）會在那個 priority 下重新模擬一次，淨利仍達到 `min_net_usd` 才保留出價，否則改用基本 priority；送單時的 minProfit 取兩次利潤中較低的一個。重新模擬時完全沒有利潤，這個計畫就不送。模擬是以**下一個**區塊執行（覆寫區塊高度和時間），因為候選倉位是把利息累積到下一塊來評估的。不使用 `eth_estimateGas`：有些節點實作在 estimateGas 裡會忽略 block override。拿不到真實 gas 的計畫一律視為錯誤，絕不用猜的。綁在 "pending" 狀態的計畫會檢查節點實際模擬的是哪個區塊，因為 pending 呼叫可能跑在舊的區塊上。
+一次 `eth_simulateV1` 跑完整筆清算，回傳利潤和實際 gas，再加上 L1 fee（`getL1FeeUpperBound`）。計畫以規劃用的 fee 模擬（見 `Planner`）；風控閘門選出高於基本 priority 的出價後，`checked_priority`（在 `runner.rs`）會在那個 priority 下重新模擬一次，淨利仍達到 `min_net_usd` 才保留出價，否則改用基本 priority；送單時的 minProfit 取兩次利潤中較低的一個。重新模擬時完全沒有利潤，這個計畫就不送。模擬是以**下一個**區塊執行（覆寫區塊高度和時間），因為候選倉位是把利息累積到下一塊來評估的。不使用 `eth_estimateGas`：有些節點實作在 estimateGas 裡會忽略 block override。拿不到真實 gas 的計畫一律視為錯誤，絕不用猜的。綁在 "pending" 狀態的計畫會檢查節點實際模擬的是哪個區塊，因為 pending 呼叫可能跑在舊的區塊上。
 
 ### Executor（`onchain_core::executor`、`onchain_core::actor`）
 
@@ -221,38 +224,64 @@ gas 基準測試在 `contracts/test/MorphoLiquidator.gas.fork.t.sol`（`forge te
 
 端點在 `[[rpc]]` 宣告（`http_env` 指向 `.env` 裡的變數名稱；公共端點可以直接用 `http`）。連線池依優先順序競速或備援，遵守每個端點的 `skip_methods` 和 log 範圍限制；遇到「方法不存在」、限流和容量錯誤會換端點（並進入冷卻）；節點落後時回的 "block not found / header not found" 視為*落後*：換下一個端點，但不讓落後的端點進入冷卻，除非它一再落後。容量錯誤以片語判斷（限流、方案、範圍和可用性的限制，例如 "rate limit"、"block range"、"free plan"），不用單一字詞；呼叫本身的確定性錯誤（revert、gas limit、餘額不足、nonce、fee cap……）絕不換端點，也不讓端點進入冷卻。log 只會出現端點名稱。請求帶有 `liquidation-framework/<版本>` 的 User-Agent。
 
+### Runner（`bot/src/runner.rs`）與出價 policy（`bot/src/policy.rs`）
+
+`Runner::build(RunnerInputs, auction, priority)` 連上設定的端點、建立 Morpho engine，並拒絕借款代幣無法換算成 USD 的市場；`run()` 就是 watch 迴圈，直到發生錯誤（或 `RunnerInputs::shutdown` 變成 true）。bot 這個 binary（`main.rs`）只負責解析 CLI、在 async runtime 建立之前載入簽名金鑰（`load_signer_pre_runtime`），再呼叫這兩個函式。所以私有的 binary 可以用自己的 policy 跑同一個迴圈：
+
+- `AuctionBidPolicy::bid_usd(market, net_usd, eth_usd)`：SVR 拍賣的出價（預設 `DefaultAuctionBid`：淨值 × (1 - `[atlas] margin`)）；寫進 journal 的估值和實際送出的 op 用同一個值。
+- `PriorityBidPolicy::bid(market, plan, competition, eth_usd)`：區塊路徑的 priority fee（預設 `DefaultPriorityBid`：下面的 `[exec]` 出價曲線）。
+
+花費上限由 runner 在 policy 之後套用：policy 只決定出多少價，不能決定可以花多少。
+
 ### 區塊路徑與送單時機
 
-每個新區塊，engine 更新被動到的倉位，最有價值的候選（`max_plans_per_block`）會同時開始規劃；每一筆在自己的計畫完成的那一刻就寫 journal、過風控、送出（某一筆的聚合器報價慢，不會拖累其他筆），同一批的送單也同時進行（出價的重新模擬平行執行；executor task 依序廣播），每批每個市場最多一筆。下面的同塊路徑也一樣。
+每個新區塊，engine 更新被動到的倉位，最有價值的候選（`max_plans_per_block`）會同時開始規劃；每一筆在自己的計畫完成的那一刻就寫 journal、過風控、送出（某一筆的聚合器報價慢，不會拖累其他筆），同一批的送單也同時進行（出價的重新模擬平行執行；executor task 依序廣播），每批每個市場最多一筆。
 
-兩條路徑共用迴圈的狀態，而同塊路徑對延遲最敏感，所以它從不等區塊路徑：區塊路徑在抓取或規劃一批時到達的預言機更新會立刻處理（`plan_and_send` 的 side events），用的是上一個區塊的快照，處理完再繼續那一批。同塊路徑的一批在規劃時，下一個區塊要等（只有幾百 ms；以前會再加上去的 receipt 和廣播，現在都在 executor task 裡執行）。
+SVR 拍賣和預言機 log 事件（見下方）走同一個 side-event channel。迴圈在等新區塊、抓資料、規劃一批時都會處理它（`plan_and_send` 的 side events），用的是上一個區塊的快照，所以拍賣不會排在區塊路徑後面。出塊時間取最近 50 個 head 的實測值（`BlockClock`），期限、`replan_secs` 和利息提前量都會跟著出塊時間改變（Base Denim：2 秒 -> 0.2 秒），不必切換設定。
 
 ### 出價（`bot/src/risk.rs`、`onchain_core::bid`）
 
-priority fee 依鏈上看到的競爭來決定。追蹤市場裡的每一筆清算（輸單分析本來就會逐筆查詢）都會記下得標者每單位 gas 的 priority fee 相對於它拿到的每 1 USD 毛利，依市場分開，保留 `bid_window_secs`（`WinningBids`；啟動時從 journal 載入）。我們自己的清算和 Atlas metacall（它的 priority fee 是 bundler 付的；競爭發生在拍賣裡）不計入。對一個計畫，`BidCurve::priority`：
+priority fee 依鏈上看到的競爭來決定。追蹤市場裡的每一筆清算（輸單分析本來就會逐筆查詢）都會記下得標者每單位 gas 的 priority fee 相對於它拿到的每 1 USD 毛利，依市場分開，保留 `bid_window_secs`（`WinningBids`；啟動時從 journal 裡欄位完整的清算列載入：毛利 USD、區塊時間、交易的 `to`）。我們自己的清算和 Atlas metacall（它的 priority fee 是 bundler 付的；競爭發生在拍賣裡）不計入。對一個計畫，`BidCurve::priority`：
 
 - 預測競爭對手的 priority fee：那些比值的 `bid_quantile`（預設 0.9）分位數 × 這個計畫的毛利 USD（得標者少於 `bid_min_samples` 筆的市場改用所有市場的資料）；
 - 出價比它高 `bid_outbid_bps`（預設 5%）；
-- 但絕不超過基本 priority 加上淨利的一定比例：小機會是 `priority_fee_share`，線性提高到 `bid_large_net_usd` 時的 `bid_share_large`（大筆清算可以拿出大部分利潤出價）；絕不高於 `max_priority_fee_wei`，也絕不低於 `priority_fee_wei`。
+- 但絕不超過基本 priority 加上淨利的一定比例：小機會是 `priority_fee_share`，線性提高到 `bid_large_net_usd` 時的 `bid_share_large`；絕不高於 `max_priority_fee_wei`，也絕不低於 `priority_fee_wei`。
 
-觀察資料不夠時，就出付得起的那個比例，和單純依利潤比例出價的 bot 一樣。決策會在 journal 記下它對抗的競爭對手 priority（`competitor_wei`）。高於基本 priority 的出價在送出前會在它自己的 priority 下重新模擬（見「模擬」）。
+觀察資料不夠時，就出付得起的那個比例。決策會在 journal 記下它對抗的競爭對手 priority（`competitor_wei`）。高於基本 priority 的出價在送出前會在它自己的 priority 下重新模擬（見「模擬」）：有些池子（Aero）會對 priority fee 抽稅。
 
-### 同塊路徑（`bot/src/flashblocks.rs`、`bot/src/oracle.rs`）
+### 花費上限（`bot/src/ledger.rs`）
 
-Base 會串流約 200 ms 一個的子區塊（Flashblocks）。bot 直接從串流裡的原始交易解出 Chainlink 的 transmit（OCR report -> observations 的中位數），在本地算出新的 Morpho 預言機價格，只重算那個市場。每個候選平行規劃兩次：一次在快照區塊上、用 state override 鎖定新價格；一次在正在產生的 "pending" 區塊上，**不做任何價格覆寫**，並在同一個狀態裡讀預言機（`PriceProbe`）證明更新已經生效（transmit revert，或 SVR cutoff 還差一個區塊時，讀到的會是舊價格）。狀態落後（舊區塊或舊價格）時，pending 計畫會短暫重試。新鮮且已證明的 pending 計畫勝出；否則用快照計畫。SVR feed 另外處理：公開價格要等對應的 secondary round 上鏈，或過了該 feed 的 cutoff 才生效。`may_send(path, state)`：公開的 transmit（`Primary`）兩種計畫都可以送；SVR secondary 或過了 cutoff 的 SVR primary 只能用新鮮的 pending 計畫送。`[flashblocks] send = false` 讓這條路徑只寫 journal。注意：Base 計畫中的 "Denim" 升級會移除 Flashblocks、改成 200 ms 出塊；本地價格模型和單一市場重算仍然有用，期限和利息提前量也會跟著實測的出塊時間調整，所以資料層沒有和 Flashblocks API 綁死。
+- **單筆**（`[exec] max_tx_cost_eth`，預設 0.002）：區塊路徑交易的最壞成本 `gas_limit × (2 × base fee + priority) + L1 fee` 必須放得進去。出價會被截到放得進；截完低於基本 priority，或不高於預測的對手出價，就不送（送了也是輸）。只在 `send_approved` 檢查一次，在 policy 之後。
+- **每個 UTC 日的失敗 gas**（`[exec] daily_gas_budget_usd`）：在飛的交易先預留最壞成本，revert 時扣實際成本。
+- **每個 UTC 日的 Atlas bond**（`[atlas.solver] atlas_bond_budget_usd`）：當天第一次讀到的 bond 減掉現在的 bond（每 50 個 head 讀一次，op 被接受後也讀），加上下一個 op 的最壞扣款。bond 低於 `min_bond_eth` 時不送 op。
+- **每日虧損**（`[exec] daily_loss_limit_usd`）：已實現損益 = 結算的區塊路徑交易付給 `PROFIT_RECEIVER` 的金額（receipt 裡追蹤市場借款代幣的 ERC20 轉帳）減去 gas，再減去 bond 的減少量。Atlas 的收入不計入（op 在別人的 metacall 裡執行），所以損益只是下限，停機只會提早、不會延遲。超過上限就寫入 kill switch 檔案，要由人刪掉檔案才會恢復送單。
+
+被這些上限擋下的送單會寫進 journal（`kind: "refused"`、`reason`、`worst_eth`、`cap_eth`）。實跑時，當天的失敗 gas、bond 基準和損益存在帳本檔（第一行 `v1`，第二行 JSON；`[exec] ledger_file`，預設和共用的 nonce 檔放在一起），啟動時讀回；讀不懂的檔案會讓實跑拒絕啟動。
+
+### 預言機 log 與價格模型（`bot/src/oracle_logs.rs`、`bot/src/oracle.rs`）
+
+Atlas 拍賣用拍賣的 median 估值：`PriceModel::preview` 換掉一個 aggregator 的答案，重算所有用到它的市場，所以模型必須知道每個 feed 的最新答案。模型在啟動時載入（和每個預言機的 `price()` 核對；重現不了的市場不納入），之後用被監看的 aggregator 在正式區塊上的 log 更新：
+
+- `NewTransmission(round, answer)`：公開的 transmit。一般 feed 的答案立刻生效；SVR feed 的答案連同 round 和區塊時間先暫存（Morpho 還讀不到）。
+- `SecondaryRoundIdUpdated(round)`：拍賣得標者的 Atlas metacall 寫入的 SVR secondary。它只帶 round；同一個 round 暫存的答案隨即生效。
+- 沒有被拍賣帶上的暫存 SVR 答案，超過 `[atlas] svr_cutoff_secs` 後生效（每個 head 檢查）。
+
+不讀 `AnswerUpdated`：SVR feed 在公開 transmit 時就會送出它，那時價格還沒生效（已在 XRP/USD DualAggregator 上查證，fixture 在 `tests/fixtures/oracle_logs/`）。log 的區塊時間用它的 `blockTimestamp`（Base 的節點會帶），沒有才用 head 的。每個 head 也會拿上一個區塊的快照和模型核對，不一致的市場就重新讀取（漏掉的事件、revert 的 transmit、換掉的 aggregator：訂閱也會跟著換到新地址）；連續三次不一致就重連 log 訂閱。被 reorg 移除的 log 會丟掉暫存的答案並強制核對。log 的 WebSocket 是 `[atlas] logs_ws`，沒設定就用第一個 `ws` 端點。
+
+`bot/src/flashblocks.rs`（從 Flashblocks 串流做同塊路徑）已經不在 watch 迴圈裡（Base Denim 會移除 Flashblocks）；`[flashblocks] enabled = true` 會被拒絕。
 
 ### Atlas / Chainlink SVR（`bot/src/atlas.rs`）
 
-在啟用 SVR 的 feed 上，預言機更新後的清算權會透過 Fastlane Atlas 拍賣。這個模組監聽拍賣，用同一個 planner 對每一場估值（先對整個市場 `quote_bundle`，再逐倉位規劃），把我們可以出的價寫進 journal。它從不送出任何東西。`value-auction` 可以重播過去的拍賣。出價的基礎是 solver 在 Atlas 收完 gas 費之後能留下的部分：每個市場的 `atlas_net_usd` = 這包的 `gross_usd` 減去它的 `gas_units` × 拍賣的 `maxFeePerGas` × (1 + 附加費)，加總成 `bundle_net_usd`；寫進 journal 的出價是它 × (1 - `atlas.margin`)。附加費在啟動時從 escrow 讀取（`getAtlasSurchargeRate`，基數 1e4）；讀不到時用 `[atlas] gas_surcharge`（預設 0.1）。
+在啟用 SVR 的 feed 上，預言機更新後的清算權會透過 Fastlane Atlas 拍賣。這個模組監聽拍賣（`[atlas] observe`），用同一個 planner 在上面的價格模型上對每一場估值（先對整個市場 `quote_bundle`，再逐倉位規劃），寫進 journal（`atlas_auction`，含 `queued_ms` / `bundle_ms` / `value_ms`）；只有實跑模式加上 `[atlas.solver] submit` 才會送出（見下方）。side channel 滿了而被丟掉的拍賣記為 `atlas_dropped`。`value-auction` 可以重播過去的拍賣。出價的基礎是 solver 在 Atlas 收完 gas 費之後能留下的部分：每個市場的 `atlas_net_usd` = 這包的 `gross_usd` 減去它的 `gas_units` × 拍賣的 `maxFeePerGas` × (1 + 附加費)，加總成 `bundle_net_usd`；寫進 journal 的出價是拍賣 policy 對這個淨值的出價（預設 × (1 - `atlas.margin`)）。附加費在啟動時從 escrow 讀取（`getAtlasSurchargeRate`，基數 1e4）；讀不到時用 `[atlas] gas_surcharge`（預設 0.1）。
 
-**Solver venue（`bot/src/atlas_venue.rs`，只模擬）。**設定 `[atlas.solver] simulate = true` 時，每場被估值的拍賣裡，每個市場在 journal 裡會多一個 `solver` 欄位（`main.rs` 的 `solver_op`）：把最大倉位的直接路由計畫包進 `atlasSolverCall`，出價是（`profit_usd` 減去這個 op 以上述 Atlas 費率計的 gas）× (1 - `atlas.margin`)，並像 Atlas 那樣呼叫來模擬。Atlas 地址上注入 `AtlasStub.sol`（沒有 gas 負債），solver 和它的 MorphoLiquidator 沒部署時也會注入；結果包含這次呼叫的 L1 fee。journal 會記錄出價、op 是否成功，以及扣掉出價後的淨利。`solver_op` 只包直接路由的計畫（既有計畫的聚合器 calldata 是為直接清算合約的地址產生的）；`exec.venue = "flash"` 時整個跳過。`AtlasSolver::calldata` 產生呼叫（借款代幣不是 WETH 時，在 `bid_router` 上用 `exactOutputSingle` 買出價要用的 WETH；minProfit 在 `SOLVER_MIN_PROFIT`）；`AtlasBid { solver, bid_wei }` 實作 `LiquidationVenue<Morpho>`，其 `swap_recipient()` 是 solver 的 MorphoLiquidator，所以 planner 也能直接透過它規劃，包含聚合器路線（路線會送到那個清算合約）。`e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation` 在 anvil fork 上驗證它。
+**Solver venue（`bot/src/atlas_venue.rs`，只模擬）。**設定 `[atlas.solver] simulate = true` 時，每場被估值的拍賣裡，每個市場在 journal 裡會多一個 `solver` 欄位（`runner.rs` 的 `solver_op`）：把最大倉位的直接路由計畫包進 `atlasSolverCall`，出價是（`profit_usd` 減去這個 op 以上述 Atlas 費率計的 gas）× (1 - `atlas.margin`)，並像 Atlas 那樣呼叫來模擬。Atlas 地址上注入 `AtlasStub.sol`（沒有 gas 負債），solver 和它的 MorphoLiquidator 沒部署時也會注入；結果包含這次呼叫的 L1 fee。journal 會記錄出價、op 是否成功，以及扣掉出價後的淨利。`solver_op` 只包直接路由的計畫（既有計畫的聚合器 calldata 是為直接清算合約的地址產生的）；`exec.venue = "flash"` 時整個跳過。`AtlasSolver::calldata` 產生呼叫（借款代幣不是 WETH 時，在 `bid_router` 上用 `exactOutputSingle` 買出價要用的 WETH；minProfit 在 `SOLVER_MIN_PROFIT`）；`AtlasBid { solver, bid_wei }` 實作 `LiquidationVenue<Morpho>`，其 `swap_recipient()` 是 solver 的 MorphoLiquidator，所以 planner 也能直接透過它規劃，包含聚合器路線（路線會送到那個清算合約）。`e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation` 在 anvil fork 上驗證它。
 
-**送出 solver operation（`bot/src/atlas_submit.rs`）。**在實跑模式下設定 `[atlas.solver] submit = true` 時，扣掉出價後模擬仍有利潤的 solver op 會被組出、簽名並送到拍賣（`main.rs` 的 `submit_solver_op`）：
+**送出 solver operation（`bot/src/atlas_submit.rs`）。**在實跑模式下設定 `[atlas.solver] submit = true` 時，扣掉出價後模擬仍有利潤的 solver op 會被組出、簽名並送到拍賣（`runner.rs` 的 `submit_solver_op`）：
 
 - op 本身：`from` = 熱錢包（必須是 solver 的 `executor`）、`to` = Atlas、`gas` = 模擬 gas × `gas_limit_buffer`，不超過 DappControl 的 `getSolverGasLimit()`、`maxFeePerGas` 和 `deadline` = 拍賣的值、`solver` = 已部署的 AtlasLiquidationSolver、`control` = DappControl、`userOpHash` = 拍賣的值、`bidToken` = ETH（`address(0)`）、`bidAmount` = 出價、`data` = solver 的 `solverOpData`（`AtlasSolver::op_data`），其中 minProfit = 扣掉出價後的模擬淨利 × `min_profit_keep`；
 - 簽名：對 `SolverOperation(address from,address to,uint256 value,uint256 gas,uint256 maxFeePerGas,uint256 deadline,address solver,address control,bytes32 userOpHash,address bidToken,uint256 bidAmount,bytes data)` 做 EIP-712 簽名，domain 在啟動時從已部署的 AtlasVerification 讀取（`Atlas.VERIFICATION()`、`eip712Domain()`：name `AtlasVerification`、它的 version、chain id、verifying contract）；格式是原始的 `r || s || v`，v = 27 / 28，和 Fastlane 的 atlas-sdk-go 簽法相同。digest 會和 Base 上 `AtlasVerification.getSolverPayload(op)` 的結果核對（單元測試用一個記錄下來的值，`e2e_solver_op_digest_matches_atlas_verification` 用隨機的 op）；
 - 送出：以 JSON-RPC `solver_submitSolverOperation` 把 `[{ auction_id, auction_solution }]` 送到 `[atlas.solver] endpoint`（預設是 Chainlink SVR 的出價端點），op 用 SDK 的 `SolverOperationRaw` 格式（hex 數值）。在本地的 mock 端點上測試；
-- 規則：每個 EOA 每個區塊一個 op（Atlas 只保留一個；同一個區塊的第二場拍賣需要另一個 EOA），所以一場拍賣的 op 依扣掉出價後的利潤由高到低嘗試，直到端點接受其中一個；被拒絕的 op 會把這個區塊的名額讓給下一個，其餘的在 journal 記下實際送出的是哪一個；緊急停止檔案會停止送出；op 只有在它對 bond 的最壞扣款（全部 gas 以拍賣的 max fee 加上 escrow 附加費計）放得進 `exec.daily_gas_budget_usd` 時才送出，這份預算和 executor 的分開計算，每個被接受的 op 都會計入（bot 看不到 Atlas 是否真的執行了它）。journal 的 `solver` 欄位記錄送出了什麼（`submitted`）。
+- 規則：每個 EOA 每個區塊一個 op（Atlas 只保留一個；同一個區塊的第二場拍賣需要另一個 EOA），所以一場拍賣的 op 依扣掉出價後的利潤由高到低嘗試，直到端點接受其中一個；被拒絕的 op 會把這個區塊的名額讓給下一個，其餘的在 journal 記下實際送出的是哪一個；緊急停止檔案會停止送出；op 只有在 bond 不低於 `min_bond_eth`，而且當天 bond 的減少量加上這個 op 的最壞扣款（全部 gas 以拍賣的 max fee 加上 escrow 附加費計）放得進 `[atlas.solver] atlas_bond_budget_usd` 時才送出（見「花費上限」）。journal 的 `solver` 欄位記錄送出了什麼（`submitted`）。
 
 啟動時（`build_submitter`），以下條件沒有全部成立，bot 就拒絕送出：solver 和它的清算合約已部署（`[atlas.solver] address`、`liquidator`）、solver 的 `executor()` 是熱錢包、熱錢包至少 bond 了 `min_bond_eth` 的 atlETH（`Atlas.balanceOfBonded`）、讀得到 Atlas 的 domain 和 DappControl 的 gas 上限。
 
@@ -267,7 +296,7 @@ bot 從不為 Atlas 移動資金；這些都由操作者在自己的終端機執
 3. 設定 `[atlas.solver] simulate = true`、`submit = true`、`address`、`liquidator` 和 `min_bond_eth`；以 `exec.mode = "live"` 啟動 `watch --live`。
 4. 提領：`unbond(amount)`，等 `ESCROW_DURATION()` 個區塊（查詢時 Base 上是 64），再 `redeem(amount)`。
 
-結果可以用 Fastlane 的查詢 API 追蹤（`solver_getSolverOperationResult`，見 Chainlink 的 searcher 文件）；bot 不會呼叫它。
+結果可以用 Fastlane 的查詢 API 追蹤（`solver_getSolverOperationResult`，見 Chainlink 的 searcher 文件）；bot 目前還不會呼叫它（對帳之後才會做；在那之前，bot 唯一看得到的 Atlas 成本是 bond 的減少量）。
 
 ### 儀表板和即時頁面
 
@@ -279,7 +308,7 @@ bot 從不為 Atlas 移動資金；這些都由操作者在自己的終端機執
 2. 為你的市場型別實作 `MarketInfo`（`key()` 是穩定的 `B256`，`name()`）。
 3. 從 `bot/src/testkit.rs` 開始：`Toy` 是一個完整的隔離市場協議（position = (負債, 抵押品)，snapshot = 價格），`ToyPool` 是一個完整的帳戶層級協議（每個帳戶兩種抵押品和兩種負債 reserve，每個組合一個選項），engine 和 planner 的測試都用它們跑。照它們的形狀為自己的實作寫單元測試。
 4. 實作 `loan_usd`：你允許的每一種負債代幣都要有 USD 價格模型（否則它的清算會被拒絕）。
-5. 接上應用層：目前 `main.rs`（watch 迴圈、預言機模型、Atlas 估值、儀表板）綁定 Morpho，使用 `morpho::MorphoEngine`；為你的協議加同樣的別名、一個像 `[morpho]` 的設定區段，以及你自己的迴圈（見上方「範圍」）。
+5. 接上應用層：目前 `runner.rs`（watch 迴圈、預言機模型、Atlas 估值）和儀表板綁定 Morpho，使用 `morpho::MorphoEngine`；為你的協議加同樣的別名、一個像 `[morpho]` 的設定區段，以及你自己的迴圈（見上方「範圍」）。
 6. 協議沒有清算 callback（清算時先拉走還款）的話，實作 `DirectLiquidation`（`liquidation_call`），並搭配 0 手續費的 `FlashSource`（`MorphoBlue` 或 `UniswapV4`；新的來源還需要在 FlashLiquidator.sol 加分支）使用 `flash_venue::FlashLiquidatorVenue`：planner、模擬和 FlashLiquidator.sol 都能直接沿用。`testkit::Toy` 實作了 `DirectLiquidation`；參考 `flash_venue` 和 `planner` 的測試。
 
 ## 加入一個 DEX（聚合器）

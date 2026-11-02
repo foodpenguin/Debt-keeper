@@ -23,6 +23,7 @@ pub mod contracts;
 pub mod dash;
 pub mod dex;
 pub mod engine;
+pub mod ledger;
 pub mod flash_venue;
 pub mod flashblocks;
 pub mod funding;
@@ -30,10 +31,13 @@ pub mod live;
 pub mod loss;
 pub mod morpho;
 pub mod oracle;
+pub mod oracle_logs;
 pub mod planner;
+pub mod policy;
 pub mod protocol;
 pub mod risk;
 pub mod router;
+pub mod runner;
 pub mod sim;
 pub mod v3router;
 pub mod venue;
@@ -41,4 +45,6 @@ pub mod venue;
 #[cfg(test)]
 mod e2e;
 #[cfg(test)]
-pub(crate) mod testkit;
+mod e2e_runner;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;

@@ -115,7 +115,7 @@ fn default_dash_html() -> String {
     "data/dashboard.html".into()
 }
 fn default_dash_log() -> String {
-    "data/live_run.log".into()
+    "data/run.log".into()
 }
 fn default_dash_raw_days() -> u64 {
     14
@@ -130,15 +130,30 @@ fn default_live_port() -> u16 {
     8787
 }
 
-/// Chainlink SVR / Atlas solver auctions. Phase 0 = observe only: every Base auction for our
-/// DappControl is valued (what we could have bid) and journaled; nothing is ever submitted.
-/// Needs [flashblocks] enabled (it shares its price model and event loop).
+/// Chainlink SVR / Atlas solver auctions: with `observe`, every Base auction for our DappControl is
+/// valued and journaled; `[atlas.solver] submit` (live) also bids. The price model the auctions are
+/// valued with follows the oracle logs (oracle_logs.rs), not Flashblocks.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AtlasConfig {
     #[serde(default)]
     pub observe: bool,
     #[serde(default = "default_atlas_ws")]
     pub ws: String,
+    /// The Atlas contract (its metacalls carry the SVR secondary that moves an SVR feed as Morpho
+    /// reads it). Was `[flashblocks] atlas`.
+    #[serde(default = "default_fb_atlas")]
+    pub address: Address,
+    /// SVR primary with no auction: the proxy serves it once older than this (strictly). 10 s on
+    /// the Base SVR feeds checked (an unauctioned update took effect ~12 s = 6 blocks later). Was
+    /// `[flashblocks] svr_cutoff_secs`.
+    #[serde(default = "default_svr_cutoff")]
+    pub svr_cutoff_secs: u64,
+    /// `[[rpc]]` names for auction valuations, in preference order (empty = the main pool).
+    #[serde(default)]
+    pub rpc: Vec<String>,
+    /// `[[rpc]]` name whose WebSocket serves the oracle logs (empty = the first `ws` endpoint).
+    #[serde(default)]
+    pub logs_ws: String,
     /// Base DappControl of the Chainlink OEV auctions.
     #[serde(default = "default_atlas_control")]
     pub control: Address,
@@ -152,8 +167,8 @@ pub struct AtlasConfig {
     /// must fit what its liquidations leave of it.
     #[serde(default = "default_solver_gas")]
     pub solver_gas_limit: u64,
-    /// Auction valuations running at once. They share the same-block path's RPC pool: a crash
-    /// brings dozens of auctions within seconds, and unbounded valuations would starve it.
+    /// Auction valuations running at once. They share an RPC pool: a crash brings dozens of
+    /// auctions within seconds, and unbounded valuations would starve it.
     #[serde(default = "default_atlas_concurrent")]
     pub max_concurrent: usize,
     /// Paper trading (dashboard): for every auction a winner was decoded for, what bidding the
@@ -173,7 +188,7 @@ pub struct AtlasConfig {
 
 impl Default for AtlasConfig {
     fn default() -> Self {
-        Self { observe: false, ws: default_atlas_ws(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
+        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
     }
 }
 
@@ -216,6 +231,10 @@ pub struct SolverConfig {
     pub endpoint: String,
     #[serde(default = "default_min_bond")]
     pub min_bond_eth: f64,
+    /// Most the bond may shrink in a UTC day (gas charged for our solver ops, in USD at the ETH
+    /// price of the check): past it no op is submitted until the next day.
+    #[serde(default = "default_bond_budget")]
+    pub atlas_bond_budget_usd: f64,
 }
 
 impl Default for SolverConfig {
@@ -233,6 +252,7 @@ impl Default for SolverConfig {
             submit: false,
             endpoint: default_bid_endpoint(),
             min_bond_eth: default_min_bond(),
+            atlas_bond_budget_usd: default_bond_budget(),
         }
     }
 }
@@ -242,6 +262,9 @@ fn default_bid_endpoint() -> String {
 }
 fn default_min_bond() -> f64 {
     0.01
+}
+fn default_bond_budget() -> f64 {
+    2.0
 }
 fn default_atlas_surcharge() -> f64 {
     0.1
@@ -314,19 +337,11 @@ pub struct FlashblocksConfig {
     /// ~0.5-1 s, several flashblocks).
     #[serde(default = "default_fb_router")]
     pub router: String,
-    /// Atlas (Chainlink SVR auctions on Base): its metacalls carry the `transmitSecondary` that
-    /// actually moves an SVR feed as Morpho reads it.
-    #[serde(default = "default_fb_atlas")]
-    pub atlas: Address,
-    /// SVR primary with no auction: the proxy serves it once older than this (strictly). 10 s on
-    /// the Base SVR feeds checked (an unauctioned update took effect ~12 s = 6 blocks later).
-    #[serde(default = "default_svr_cutoff")]
-    pub svr_cutoff_secs: u64,
 }
 
 impl Default for FlashblocksConfig {
     fn default() -> Self {
-        Self { enabled: false, ws: default_fb_ws(), pending_rpc: vec![], send: false, max_plans: default_fb_plans(), router: default_fb_router(), atlas: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff() }
+        Self { enabled: false, ws: default_fb_ws(), pending_rpc: vec![], send: false, max_plans: default_fb_plans(), router: default_fb_router() }
     }
 }
 
@@ -335,6 +350,12 @@ fn default_fb_ws() -> String {
 }
 fn default_svr_cutoff() -> u64 {
     10
+}
+fn default_max_tx_cost() -> f64 {
+    0.002
+}
+fn default_daily_loss_limit() -> f64 {
+    5.0
 }
 fn default_fb_atlas() -> Address {
     "0x583dcFef0D240DC80753F0F0B26513feE27D9B77".parse().unwrap() // Atlas v1.6.4 on Base
@@ -412,6 +433,26 @@ mod tests {
         assert!(err.contains("moved into [morpho]") && err.contains("morpho_api") && err.contains("\"morpho\""), "{err}");
         let current: toml::Table = std::fs::read_to_string("config.example.toml").unwrap().parse().unwrap();
         assert!(Config::reject_legacy_layout_of(&current).is_ok());
+    }
+
+    #[test]
+    fn moved_flashblocks_keys_get_a_migration_message() {
+        for (key, new) in [("atlas = \"0x583dcFef0D240DC80753F0F0B26513feE27D9B77\"", "[atlas] address"), ("svr_cutoff_secs = 10", "[atlas] svr_cutoff_secs")] {
+            let legacy: toml::Table = format!("[flashblocks]\nenabled = false\n{key}\n").parse().unwrap();
+            let err = Config::reject_legacy_layout_of(&legacy).unwrap_err().to_string();
+            assert!(err.contains(new), "{err}");
+        }
+    }
+
+    #[test]
+    fn new_settings_have_their_defaults() {
+        let cfg = Config::load("config.example.toml").unwrap();
+        assert_eq!(cfg.atlas.address, "0x583dcFef0D240DC80753F0F0B26513feE27D9B77".parse::<Address>().unwrap());
+        assert_eq!(cfg.atlas.svr_cutoff_secs, 10);
+        assert!(cfg.atlas.rpc.is_empty() && cfg.atlas.logs_ws.is_empty());
+        assert_eq!(cfg.atlas.solver.atlas_bond_budget_usd, 2.0);
+        assert_eq!((cfg.exec.max_tx_cost_eth, cfg.exec.daily_loss_limit_usd), (0.002, 5.0));
+        assert!(cfg.exec.ledger_file.is_empty() && cfg.exec.replan_secs.is_none());
     }
 
     #[test]
@@ -585,6 +626,21 @@ pub struct ExecConfig {
     pub gas_limit_buffer: f64,
     /// Plan a given candidate at most once per this many blocks.
     pub replan_blocks: u64,
+    /// The same in seconds (converted with the measured block time); overrides replan_blocks.
+    #[serde(default)]
+    pub replan_secs: Option<f64>,
+    /// Most one block-path tx may cost if it reverts at its whole gas limit: gas_limit x (2 x base
+    /// fee + priority) + L1 fee. The bid is cut to fit, and the tx is not sent if it no longer can.
+    #[serde(default = "default_max_tx_cost")]
+    pub max_tx_cost_eth: f64,
+    /// A UTC day's realized loss (block path receipts, Atlas bond shrinkage) past which the kill
+    /// switch file is written: sending stops until a person removes it.
+    #[serde(default = "default_daily_loss_limit")]
+    pub daily_loss_limit_usd: f64,
+    /// Where the day's failed-gas spend, bond and PnL survive restarts (ledger.rs). Empty =
+    /// ~/.local/state/onchain-bots/ledger-<wallet>; relative = from the config file's directory.
+    #[serde(default)]
+    pub ledger_file: String,
     /// Max candidates planned per block (largest bonus first).
     pub max_plans_per_block: usize,
     /// Plans needing more gas than this are rejected (Base per-tx cap is ~16.7M).
@@ -739,6 +795,10 @@ impl Config {
         }
         let mut cfg: Self = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
         cfg.exec.send.anchor(path);
+        // A relative ledger file is relative to the config file, like the kill switch.
+        if !cfg.exec.ledger_file.is_empty() && std::path::Path::new(&cfg.exec.ledger_file).is_relative() {
+            cfg.exec.ledger_file = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(".")).join(&cfg.exec.ledger_file).to_string_lossy().into_owned();
+        }
         cfg.rpc.anchor(path);
         cfg.validate().with_context(|| format!("checking {path}"))?;
         Ok(cfg)
@@ -755,6 +815,11 @@ impl Config {
             legacy.is_empty(),
             "top-level {legacy:?} moved into [morpho]: morpho -> [morpho] address, morpho_api -> [morpho] api, [[markets]] -> [[morpho.markets]] (see config.example.toml)"
         );
+        if let Some(fb) = t.get("flashblocks").and_then(|v| v.as_table()) {
+            for (old, new) in [("atlas", "[atlas] address"), ("svr_cutoff_secs", "[atlas] svr_cutoff_secs")] {
+                anyhow::ensure!(!fb.contains_key(old), "[flashblocks] {old} moved to {new} (see config.example.toml)");
+            }
+        }
         Ok(())
     }
 

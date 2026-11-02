@@ -1,3 +1,6 @@
+//! NOT USED BY THE WATCH LOOP (Base Denim removes Flashblocks; the Atlas path reads oracle logs,
+//! oracle_logs.rs). Kept for the fb_* examples until Denim, then deleted.
+//!
 //! Oracle updates from the Flashblocks stream (Base, until Denim; the reconnecting reader and the
 //! message decoding are `onchain_core::flashblocks`). There are no receipts in the stream, so oracle
 //! updates are recognised from the transactions themselves: a Chainlink transmitter calls
@@ -8,8 +11,8 @@
 //! can be placed in its flashblock and compared with when we would have been ready.
 
 use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, RwLock},
+    collections::HashMap,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -25,6 +28,8 @@ use onchain_core::flashblocks::run_stream;
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
+pub use crate::oracle::{Authorized, Path, Watched};
+
 sol! {
     function forward(address target, bytes data);
     function transmit(bytes32[3] reportContext, bytes report, bytes32[] rs, bytes32[] ss, bytes32 rawVs);
@@ -38,19 +43,6 @@ sol! {
     function metacall(UserOperation userOp, SolverOperation[] solverOps, DAppOperation dAppOp, address gasRefundBeneficiary);
     // OCR2 median report layout (decoded without a selector).
     function report(uint32 observationsTimestamp, bytes32 rawObservers, int192[] observations, int192 juelsPerFeeCoin);
-}
-
-/// Which copy of a Chainlink report a transaction carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Path {
-    /// The public `transmit`. On an SVR feed it does not move what Morpho reads yet.
-    Primary,
-    /// `transmitSecondary` inside an Atlas metacall: what an SVR proxy (and so Morpho) reads.
-    Secondary,
-    /// An SVR primary that no auction carried: the proxy serves it once it is older than the
-    /// aggregator's cutoff (10 s on the Base SVR feeds checked).
-    Expired,
 }
 
 /// A new Chainlink answer seen in a flashblock.
@@ -83,14 +75,10 @@ pub enum FbEvent {
     Oracle(OracleUpdate),
     /// Index 0 of a block arrived: its number and timestamp (SVR cutoffs are timed on it).
     Opened { block: u64, timestamp: u64, seen: Instant },
-    /// A Chainlink SVR auction on our chain (observe-only solver phase 0; see atlas.rs).
-    Auction(crate::atlas::Auction),
 }
 
 pub struct Stream {
     pub updates: mpsc::Receiver<FbEvent>,
-    /// For other feeds (the Atlas auctions) to share the same event loop.
-    pub sender: mpsc::Sender<FbEvent>,
     pub seen: SeenTxs,
     /// Last message time (stream health).
     pub last_msg: Arc<Mutex<Option<Instant>>>,
@@ -101,20 +89,6 @@ pub struct Stream {
 }
 
 const KEEP_BLOCKS: u64 = 60;
-
-/// Who may move an aggregator's answer: `aggregator.getTransmitters()` are forwarder contracts
-/// (each with `getAuthorizedSenders()` EOAs) or, for direct transmits, the EOAs themselves.
-#[derive(Debug, Clone, Default)]
-pub struct Authorized {
-    /// forwarder -> EOAs allowed to call it
-    pub forwarders: HashMap<Address, HashSet<Address>>,
-    /// EOAs allowed to call `transmit` on the aggregator directly
-    pub direct: HashSet<Address>,
-}
-
-/// aggregator -> its authorized transmitters. Shared with the price model, which refreshes it
-/// when a feed's aggregator or transmitter set changes.
-pub type Watched = Arc<RwLock<HashMap<Address, Authorized>>>;
 
 /// New answer if `raw` carries a Chainlink report for a watched aggregator, from an authorized
 /// party. Anyone can put a lookalike in a block (even a reverting tx still shows up in the
@@ -181,7 +155,6 @@ fn median(report: &[u8]) -> Option<U256> {
 /// Connects (and reconnects) to the stream in the background.
 pub fn spawn(url: String, watched: Watched, atlas: Address) -> Stream {
     let (tx, rx) = mpsc::channel(256);
-    let sender = tx.clone();
     let seen: SeenTxs = Arc::default();
     let last_msg: Arc<Mutex<Option<Instant>>> = Arc::default();
     let (seen2, last2) = (seen.clone(), last_msg.clone());
@@ -227,14 +200,14 @@ pub fn spawn(url: String, watched: Watched, atlas: Address) -> Stream {
             }
         }
     });
-    Stream { updates: rx, sender, seen, last_msg, sealed }
+    Stream { updates: rx, seen, last_msg, sealed }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::address;
-    use std::io::Write;
+    use std::{collections::HashSet, io::Write};
 
     const ETH_USD_AGGREGATOR: Address = address!("05c84a58FE042275b37db038bAAcD15F410c7bB0");
     const ATLAS: Address = address!("583dcFef0D240DC80753F0F0B26513feE27D9B77");

@@ -5,6 +5,8 @@
 #
 #   ./scripts/setup_wsl.sh                    # tools + build + config
 #   ./scripts/setup_wsl.sh --install-service  # also install/enable the shadow-mode systemd service (sudo)
+#     BIN=, CONFIG=, LOG=, WORKDIR= override the binary, its config, its log and its working directory
+#     (default: this repo's build, working directory = the config's directory)
 #   SKIP_APT=1 ./scripts/setup_wsl.sh         # skip apt (no sudo), e.g. when packages are present
 set -euo pipefail
 
@@ -65,15 +67,21 @@ if [[ "$INSTALL_SERVICE" == "1" ]]; then
     echo "ERROR: systemd is not running. Add '[boot]\nsystemd=true' to /etc/wsl.conf, run 'wsl --shutdown' in Windows, reopen Ubuntu." >&2
     exit 1
   fi
-  sed -e "s#@REPO@#$REPO#g" -e "s#@USER@#$USER#g" deploy/liqbot-shadow.service | sudo tee /etc/systemd/system/liqbot-shadow.service >/dev/null
-  sed -e "s#@REPO@#$REPO#g" -e "s#@USER@#$USER#g" deploy/liqbot.logrotate | sudo tee /etc/logrotate.d/liqbot >/dev/null
+  BIN="${BIN:-$REPO/bot/target/release/bot}"
+  CONFIG="${CONFIG:-$REPO/bot/config.local.toml}"
+  LOG="${LOG:-$REPO/bot/data/run.log}"
+  WORKDIR="${WORKDIR:-$(dirname "$CONFIG")}"   # relative paths in the config (journal, artifacts) resolve here
+  mkdir -p "$(dirname "$LOG")"
+  fill() { sed -e "s#@BIN@#$BIN#g" -e "s#@CONFIG@#$CONFIG#g" -e "s#@LOG@#$LOG#g" -e "s#@WORKDIR@#$WORKDIR#g" -e "s#@USER@#$USER#g" "$1"; }
+  fill deploy/debt-keeper-shadow.service | sudo tee /etc/systemd/system/debt-keeper-shadow.service >/dev/null
+  fill deploy/debt-keeper.logrotate | sudo tee /etc/logrotate.d/debt-keeper >/dev/null
   sudo systemctl daemon-reload
-  sudo systemctl enable --now liqbot-shadow.service
+  sudo systemctl enable --now debt-keeper-shadow.service
   sudo systemctl enable --now chrony
-  systemctl --no-pager status liqbot-shadow.service | head -5
+  systemctl --no-pager status debt-keeper-shadow.service | head -5
 fi
 
 say "done"
 echo "shadow run by hand : cd $REPO/bot && ./target/release/bot -c config.local.toml watch"
-echo "service logs       : tail -f $REPO/bot/data/shadow_run.log"
+echo "service logs       : tail -f ${LOG:-$REPO/bot/data/run.log}"
 echo "loss report        : cd $REPO/bot && ./target/release/bot -c config.local.toml report"

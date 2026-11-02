@@ -15,7 +15,7 @@
 
 **目前的範圍。**通用的部分（`liquidation_framework` 函式庫）：HF 引擎、planner、venue / DEX / 資金
 來源三個接口和它們的 venue 實作、風控閘門和出價；再加上 `onchain-core` 的 executor 和 RPC 管線。
-仍然綁定 Morpho 的部分：`main.rs` 的應用迴圈（區塊與同區塊路徑、送單路徑、pre-flight）、預言機
+仍然綁定 Morpho 的部分：`runner.rs` 的應用迴圈（區塊與 Atlas 路徑、送單路徑、pre-flight；執行檔可以帶自己的出價 policy 來跑）、預言機
 價格模型、Atlas 估值、dashboard 和輸單分析。新的協議可以沿用通用核心，但目前需要自己的應用迴圈
 （見 [docs/architecture.zh-TW.md](docs/architecture.zh-TW.md#範圍目前哪些是通用的)）。
 
@@ -53,7 +53,10 @@
 
 ```
 bot/src/
-  lib.rs        函式庫；main.rs 是建立在它之上的 Morpho bot
+  lib.rs        函式庫；main.rs 是建立在它之上的 Morpho bot CLI
+  runner.rs     watch 迴圈（Runner::build / run）和診斷指令
+  policy.rs     AuctionBidPolicy / PriorityBidPolicy：執行檔接入出價策略的地方
+  ledger.rs     當天的失敗 gas、Atlas bond 和損益（實跑時存檔）、每日虧損停機
   protocol.rs   LendingProtocol：借貸協議要實作的介面
   engine.rs     通用健康因子引擎
   venue.rs      LiquidationVenue：清算交易如何編碼與模擬
@@ -67,7 +70,8 @@ bot/src/
   atlas_submit.rs  solver operation：EIP-712 簽名、送到 SVR 出價端點
   router.rs     KyberSwap（第一個 Dex）
   v3router.rs   自建直連 V3/CL 路由（以 GridQuoter 報價）
-  flashblocks.rs  從 Flashblocks 串流解出的預言機更新
+  oracle_logs.rs  從正式區塊的 log 讀 Chainlink 更新（Atlas 價格模型）
+  flashblocks.rs  Flashblocks 串流解碼（只剩 examples 使用；Denim 會移除 Flashblocks）
   oracle.rs risk.rs atlas.rs   預言機模型、風控閘門（出價曲線）、SVR 拍賣
   dash/ live.rs loss.rs        dashboard、即時頁面、錯過的清算的事後分析
   testkit.rs    測試替身（玩具協議、mock venue、mock DEX）
@@ -107,7 +111,7 @@ cargo build --release
 
 - **其他借貸協議**：實作 `LendingProtocol`（市場、批次讀取倉位與快照、事件、評估出可清算的選項，以及
   依組合規劃用的 hook：`token_decimals` / `repay_for_seize` / `collateral_value` / `loan_usd` /
-  `pairs`），再寫它的應用迴圈（目前 `main.rs` 綁定 Morpho）。帳戶層級的協議，市場就是池子，倉位
+  `pairs`），再寫它的應用迴圈（目前 `runner.rs` 綁定 Morpho）。帳戶層級的協議，市場就是池子，倉位
   就是整個帳戶（見 `ToyPool`）。
 - **其他聚合器**：實作 `Dex`（在 gas 預算內 `quote_within`、`amount_out`、`swap_gas`、`build`）。
 - **沒有清算 callback 的協議**：實作 `DirectLiquidation`（`liquidation_call`），並搭配 0 手續費的

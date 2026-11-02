@@ -12,7 +12,10 @@
 #   - LIVE tx SENT / LIVE tx outcome / LIVE send failed / HALTED / "sending paused" / "cannot cover worst-case gas"
 #   - hot wallet below MIN_HOT_ETH (checked hourly)
 #   - blocks reaching the bot late: median head_age_ms above HEAD_LAG_MS for LAG_CHECKS checks in a
-#     row (NTP-synced healthy baseline: about +680 ms), or "flashblocks stream silent" in the log
+#     row (re-measure the baseline on each host; about +680 ms on the old WSL host)
+#   - "crash with no send": CRASH_LIQS+ liquidations in our markets within a clock hour and none of
+#     our txs or Atlas ops; kill switch written, Atlas drops, missed oracle logs
+# It only alerts: it never starts, stops or switches the bot (live needs the keystore password).
 # Plus a daily summary at SUMMARY_HOUR ($WATCH_TZ) so you know the watchdog itself is alive.
 # Other liquidators' liquidations ("LIQUIDATION observed") only go into the daily summary.
 #
@@ -22,8 +25,18 @@
 # The app password is read by curl from the netrc file, so it never appears in argv or logs.
 set -uo pipefail
 
+# Settings for this host (LOG, HOT, KILL, BOT_NAME, CRASH_LIQS, MIN_HOT_ETH, HEAD_LAG_MS, ...), e.g. on
+# a VM where the config lives outside the repo. Variables already set in the environment win.
+WATCHDOG_ENV="${WATCHDOG_ENV:-$HOME/.config/liqbot/watchdog.env}"
+if [[ -r "$WATCHDOG_ENV" ]]; then
+  while IFS== read -r k v; do
+    [[ "$k" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+    [[ -n "${!k:-}" ]] || export "$k=${v//\"/}"
+  done < "$WATCHDOG_ENV"
+fi
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG="${LOG:-$REPO/bot/data/live_run.log}"
+LOG="${LOG:-$REPO/bot/data/run.log}"   # live (tmux) and shadow (systemd) both append here
 STATE="${STATE:-$REPO/bot/data/watchdog}"
 CONF="${CONF:-$HOME/.config/liqbot}"
 # Hot wallet to watch: from the git-ignored local config (exec.executor), unless HOT is set.
@@ -31,7 +44,11 @@ HOT="${HOT:-$(grep -m1 "^executor = " "$REPO/bot/config.local.toml" 2>/dev/null 
 RPC="${RPC:-https://mainnet.base.org}"
 CHECK_SECS="${CHECK_SECS:-60}"
 STALE_SECS="${STALE_SECS:-300}"
-MIN_HOT_ETH="${MIN_HOT_ETH:-0.0002}"
+MIN_HOT_ETH="${MIN_HOT_ETH:-0.005}"
+KILL="${KILL:-$REPO/bot/data/KILL}"
+# "Crash with no send": at least this many liquidations in our markets within an hour and none of
+# our txs or Atlas ops.
+CRASH_LIQS="${CRASH_LIQS:-20}"
 SUMMARY_HOUR="${SUMMARY_HOUR:-09}"
 WATCH_TZ="${WATCH_TZ:-UTC}"   # time zone of SUMMARY_HOUR and of the timestamps in mails
 MAX_MAILS_PER_HOUR="${MAX_MAILS_PER_HOUR:-6}"
@@ -41,7 +58,7 @@ MAX_MAILS_PER_HOUR="${MAX_MAILS_PER_HOUR:-6}"
 HEAD_LAG_MS="${HEAD_LAG_MS:-1100}"
 LAG_CHECKS="${LAG_CHECKS:-5}"
 DRY_RUN="${DRY_RUN:-0}"
-BOT_NAME="${BOT_NAME:-bot}"   # process name (comm) of the bot binary
+BOT_NAME="${BOT_NAME:-bot}"   # process name (comm) of the bot binary (the private build: keeper)
 export PATH="$PATH:$HOME/.foundry/bin"
 mkdir -p "$STATE"
 
@@ -83,7 +100,15 @@ mail_budget_ok() {
 mail_counted() { put mail_count $(( $(get mail_count 0) + 1 )); }
 
 # Exact process name, then its own argv: a shell whose command line merely mentions the bot cannot match.
+# Any watch loop counts (live or shadow); live_running tells them apart for the summary.
 bot_running() {
+  local p
+  for p in $(pgrep -x "$BOT_NAME"); do
+    tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- ' watch' && return 0
+  done
+  return 1
+}
+live_running() {
   local p
   for p in $(pgrep -x "$BOT_NAME"); do
     tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- 'watch --live' && return 0
@@ -112,17 +137,28 @@ check() {
   fi
   if [[ -n "$new" ]]; then
     local ev
-    ev=$(grep -E 'LIVE tx SENT|LIVE tx outcome|LIVE send failed|HALTED|sending paused|cannot cover worst-case gas|balance check failed|fell behind|flashblocks stream silent' <<<"$new" | cut -c1-400 || true)
+    ev=$(grep -E 'LIVE tx SENT|LIVE tx outcome|LIVE send failed|HALTED|sending paused|cannot cover worst-case gas|balance check failed|fell behind|kill switch written|atlas_dropped|oracle logs missed an update|ATLAS solver op SUBMITTED' <<<"$new" | cut -c1-400 || true)
     [[ -n "$ev" ]] && alerts+=("log events:"$'\n'"$ev")
     # counters for the daily summary
-    put n_blocks $(( $(get n_blocks 0) + $(grep -c 'INFO bot: block ' <<<"$new" || true) ))
-    put n_plans $(( $(get n_plans 0) + $(grep -c 'INFO bot: PLAN ' <<<"$new" || true) ))
-    put n_sent $(( $(get n_sent 0) + $(grep -c 'LIVE tx SENT' <<<"$new" || true) ))
+    put n_blocks $(( $(get n_blocks 0) + $(grep -c 'runner: block ' <<<"$new" || true) ))
+    put n_plans $(( $(get n_plans 0) + $(grep -c 'runner: PLAN ' <<<"$new" || true) ))
+    local sent_now liq_now
+    sent_now=$(grep -cE 'LIVE tx SENT|ATLAS solver op SUBMITTED' <<<"$new" || true)
+    liq_now=$(grep -c 'LIQUIDATION observed' <<<"$new" || true)
+    put n_sent $(( $(get n_sent 0) + sent_now ))
+    # crash with no send: this clock hour's liquidations vs our sends
+    local hr; hr=$(date +%Y%m%d%H)
+    [[ "$(get crash_hour)" == "$hr" ]] || { put crash_hour "$hr"; put hr_liq 0; put hr_sent 0; put crash_alerted 0; }
+    put hr_liq $(( $(get hr_liq 0) + liq_now )); put hr_sent $(( $(get hr_sent 0) + sent_now ))
+    if (( $(get hr_liq 0) >= CRASH_LIQS && $(get hr_sent 0) == 0 )) && [[ "$(get crash_alerted 0)" == 0 ]] && bot_running; then
+      alerts+=("$(get hr_liq 0) liquidations in our markets this hour and none of our txs or Atlas ops: is the bot blind or refused by its limits? (see refused rows in the journal)")
+      put crash_alerted 1
+    fi
     put n_liq $(( $(get n_liq 0) + $(grep -c 'LIQUIDATION observed' <<<"$new" || true) ))
     grep 'LIQUIDATION observed' <<<"$new" | cut -c1-300 >> "$STATE/liq_today" || true
     # head latency: median head_age_ms of this check's blocks
     local lag
-    lag=$(grep -o 'INFO bot: block .*head_age_ms=-\?[0-9]*' <<<"$new" | grep -o 'head_age_ms=-\?[0-9]*' | cut -d= -f2 | sort -n | awk '{v[NR]=$1} END{if (NR) print v[int((NR+1)/2)]}' || true)
+    lag=$(grep -o 'runner: block .*head_age_ms=-\?[0-9]*' <<<"$new" | grep -o 'head_age_ms=-\?[0-9]*' | cut -d= -f2 | sort -n | awk '{v[NR]=$1} END{if (NR) print v[int((NR+1)/2)]}' || true)
     if [[ -n "$lag" ]]; then
       echo "$lag" >> "$STATE/lag_today"
       if (( lag > HEAD_LAG_MS )); then
@@ -141,7 +177,7 @@ check() {
   # 3. stale: no block processed recently (only meaningful while the process runs)
   if bot_running; then
     local last ts age
-    last=$(tac "$LOG" 2>/dev/null | strip_ansi | grep -m1 'INFO bot: block ' | cut -c1-19)
+    last=$(tac "$LOG" 2>/dev/null | strip_ansi | grep -m1 'runner: block ' | cut -c1-19)
     if [[ -n "$last" ]]; then
       ts=$(date -u -d "${last/T/ } UTC" +%s 2>/dev/null || echo "$t"); age=$(( t - ts ))
       if (( age > STALE_SECS )); then
@@ -183,13 +219,13 @@ check() {
     put summary_day "$today"
     local body
     body="Daily summary $(tw) ($WATCH_TZ), since the previous summary:
-  bot running        : $(bot_running && echo yes || echo NO)
+  bot running        : $(bot_running && { live_running && echo "yes (live)" || echo "yes (shadow)"; } || echo NO)
   blocks processed   : $(get n_blocks 0)
   plans simulated    : $(get n_plans 0)
   our txs sent       : $(get n_sent 0)
   liquidations seen  : $(get n_liq 0)   (by anyone, in our markets)
   hot wallet ETH     : $(get hot_bal ?)
-  kill switch        : $([[ -e "$REPO/bot/data/KILL" ]] && echo 'PRESENT (sending disabled)' || echo absent)
+  kill switch        : $([[ -e "$KILL" ]] && echo 'PRESENT (sending disabled)' || echo absent)
   head_age_ms median : $(sort -n "$STATE/lag_today" 2>/dev/null | awk '{v[NR]=$1} END{if (NR) printf "%d ms (p90 %d ms, healthy WS ~ -500)", v[int((NR+1)/2)], v[int(NR*0.9+0.5)]; else print "?"}')
 
 $( [[ -s "$STATE/liq_today" ]] && { echo 'liquidations observed:'; tail -n 20 "$STATE/liq_today"; } )

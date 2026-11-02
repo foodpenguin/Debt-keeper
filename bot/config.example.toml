@@ -58,6 +58,14 @@ slippage_bps = 50
 priority_fee_wei = 1000000     # 0.001 gwei
 deadline_secs = 4.0            # tx valid this long; converted to blocks with the observed block time
 replan_blocks = 5
+# replan_secs = 10.0           # the same in seconds (overrides replan_blocks; follows the measured block time)
+# Spending limits (ledger.rs). A block-path tx is held to max_tx_cost_eth on its worst case
+# (gas_limit x (2 x base fee + priority) + L1 fee): the bid is cut to fit, and not sent if the cut bid
+# no longer beats the predicted competitor. Past daily_loss_limit_usd (realized: block path receipts
+# minus the Atlas bond's shrinkage) the kill switch file is written.
+# max_tx_cost_eth = 0.002
+# daily_loss_limit_usd = 5.0
+# ledger_file = ""             # empty = ~/.local/state/onchain-bots/ledger-<wallet> (next to the nonce files)
 max_plans_per_block = 3
 eth_usd_fallback = 2400.0      # until an on-chain ETH price is read
 # Bidding (risk.rs, onchain_core::bid): just above what past winners paid per USD of gross, up to a
@@ -89,10 +97,25 @@ kind = "fee"
 params = [100, 500, 2500, 10000]
 
 [[router.factories]]
-name = "slipstream"            # Aerodrome Slipstream (CL)
+name = "slipstream"            # legacy Aerodrome Slipstream (CL), before the Aero merger
 address = "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"
 kind = "tick_spacing"
 params = [1, 50, 100, 200, 2000]
+
+# Aero CL (Aerodrome + Velodrome merger, 2026-10-21; Slipstream interface). Checked on-chain
+# 2026-11-02 (block 53367000): tickSpacings() = [1, 10, 50, 100, 150, 200, 250]. Aero pools may tax
+# the priority fee: plans are simulated again at the bid before sending (runner::checked_priority).
+[[router.factories]]
+name = "aero-cl"
+address = "0x9CB220581b91b0C83223012FE69688b92aD07a76"
+kind = "tick_spacing"
+params = [1, 10, 50, 100, 200]
+
+[[router.factories]]
+name = "aero-cl2"
+address = "0xC6bdE6e9F0CD71013E5FcF2dAAE2fA1c71Bb2F25"
+kind = "tick_spacing"
+params = [1, 10, 50, 100, 200]
 
 # The lending protocol (Morpho Blue, the first LendingProtocol impl).
 [morpho]
@@ -105,21 +128,22 @@ api = "https://blue-api.morpho.org/graphql"
 name = "WETH/USDC"
 id = "0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda"
 
-# Same-block mode (Base Flashblocks): react to oracle updates inside the block being built.
-# send = false: plans are only journaled (kind fb_oracle / fb_plan / fb_race).
+# Base Flashblocks (removed by Denim). The watch loop has no same-block path: enabled = true is
+# refused. The stream is read by the fb_* examples only.
 [flashblocks]
 enabled = false
 ws = "wss://mainnet.flashblocks.base.org/ws"
-pending_rpc = ["primary"]      # endpoints for same-block quotes/simulations and pending receipts
-send = false
-max_plans = 3
-router = "direct"              # same-block exit: "direct" (fast) or "best" (+ aggregator, slower)
 
-# Chainlink SVR / Atlas solver auctions, OBSERVE ONLY: value every auction for the DappControl
-# (what could have been bid) and journal it as kind atlas_auction. Never submits anything.
+# Chainlink SVR / Atlas solver auctions: value every auction for the DappControl and journal it as
+# kind atlas_auction; [atlas.solver] submit (live) also bids. The price model the auctions are
+# valued with follows the aggregators' logs on a WebSocket endpoint (oracle_logs.rs).
 [atlas]
 observe = false
 ws = "wss://svr-bid-endpoint.chain.link/ws/solver"
+address = "0x583dcFef0D240DC80753F0F0B26513feE27D9B77"   # Atlas (Base)
+svr_cutoff_secs = 10           # an unauctioned SVR update takes effect once older than this
+# rpc = ["secondary"]          # [[rpc]] names for auction valuations, in order (empty = the main pool)
+# logs_ws = "primary"          # [[rpc]] name whose ws serves the oracle logs (empty = the first ws)
 control = "0xa5E1a36938769cbd5a26f5e19D8FCB379f597c83"   # Base DappControl (Chainlink searcher docs)
 margin = 0.05                  # journaled bid = bundle net (all positions sold as one exit) x (1 - margin)
 max_plans = 5                  # largest positions also planned + simulated one by one
@@ -128,16 +152,20 @@ max_concurrent = 1             # valuations at once (they share the RPC pool)
 paper_margins = [0.01, 0.05, 0.1]   # dashboard paper trading: bid = bundle net x (1 - m) vs the decoded winning bid
 paper_deadline_ms = 2000       # a valuation later than this after the auction could not have bid in time
 
-# The AtlasLiquidationSolver venue, SIMULATION ONLY: the top position of each valued auction is also
-# wrapped into a solver operation (bid = its net x (1 - margin)) and simulated against an Atlas
-# stand-in; the net after the bid is journaled. Nothing is signed or submitted.
+# The AtlasLiquidationSolver venue. simulate: the top position of each valued auction is also wrapped
+# into a solver operation (bid from the auction policy, default its net x (1 - margin)) and simulated
+# against an Atlas stand-in; the net after the bid is journaled. submit (live only, `watch --live`):
+# the op is also signed and sent to the SVR bid endpoint (needs the deployed solver and a bond).
 [atlas.solver]
 simulate = false
+# submit = false
 # address = "0x..."            # deployed AtlasLiquidationSolver; unset = injected bytecode
 # liquidator = "0x..."         # deployed MorphoLiquidator owned by the solver (executor = receiver = solver)
 # signer = "0x..."             # the solver operation signer; default: exec.executor
 # bid_router = "0x2626664c2603336E57B271c5C0b26F421741e481"   # Uniswap V3 SwapRouter02 (exactOutputSingle) for the ETH bid
 # bid_fee = 500                # fee tier of the loan token / WETH pool the bid is bought in
+# min_bond_eth = 0.01          # below this atlETH bond no op is submitted (checked at start and every 50 heads)
+# atlas_bond_budget_usd = 2.0  # most the bond may shrink in a UTC day before ops stop until the next day
 
 # `bot dashboard`: durable SQLite history + data/dashboard.html.
 [dashboard]
@@ -145,7 +173,7 @@ simulate = false
 # backup_dir = "/path/to/backup"   # daily copy of metrics.db + journal
 # db_path = "data/metrics.db"
 # html_path = "data/dashboard.html"
-# log_path = "data/live_run.log"
+# log_path = "data/run.log"
 # raw_block_days = 14          # per-block rows; everything else is kept forever
 
 # Labels for other liquidators' exit paths (dashboard only), beyond the built-in aggregators.

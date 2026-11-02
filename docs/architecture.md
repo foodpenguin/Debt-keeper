@@ -9,8 +9,9 @@ implementation and the reference for new ones.
 
 ## Scope: what is generic today
 
-The crate is a library (`liquidation_framework`, `bot/src/lib.rs`) plus the Morpho bot binary
-(`bot/src/main.rs`). The chain plumbing (RPC pool, heads, Flashblocks stream, `eth_simulateV1`
+The crate is a library (`liquidation_framework`, `bot/src/lib.rs`, with the watch loop in
+`runner.rs`) plus a thin Morpho bot binary (`bot/src/main.rs`, its CLI). The chain plumbing (RPC
+pool, heads, Flashblocks stream, `eth_simulateV1`
 simulation, executor and its task, send gates, bidding, the shared config sections) is the
 `onchain-core` crate (repository bot-onchain-core, a git dependency pinned to a tag), shared with
 Arb-seeker and re-exported under its usual module names (`liquidation_framework::executor`,
@@ -19,10 +20,10 @@ Arb-seeker and re-exported under its usual module names (`liquidation_framework:
 Generic (written against the traits, no protocol named): the HF engine (`engine.rs`), the planner
 (`planner.rs`), the venue / DEX / funding seams (`venue.rs`, `dex.rs`, `funding.rs`) and their
 venues (`sim.rs`, `flash_venue.rs`, `atlas_venue.rs`), the risk gate (`risk.rs`) and everything
-from `onchain-core`. Still Morpho-bound application code: the `main.rs` watch loop (block path,
-same-block path, send path, pre-flight), the oracle price model (`oracle.rs`, MorphoChainlinkOracleV2),
+from `onchain-core`. Still Morpho-bound application code: the `runner.rs` watch loop (block path,
+Atlas path, send path, pre-flight), the oracle price model (`oracle.rs`, MorphoChainlinkOracleV2),
 the Atlas valuation, the dashboard and the loss analysis. A new protocol reuses the generic core
-as it is, but today it needs its own application loop (start from `main.rs`).
+as it is, but today it needs its own application loop (start from `runner.rs`).
 
 ## One liquidation, end to end
 
@@ -366,8 +367,11 @@ metacall cannot be replayed (it needs the user's and the DApp's signatures).
 | `rpc` (onchain-core) | multi-endpoint pool (below) |
 | `heads` (onchain-core) | new-head signal: WS `newHeads` on several endpoints, HTTP fallback |
 | `gates`, `bid` (onchain-core) | kill switch, daily budget, deadlines; bidding against observed winners |
-| `flashblocks` | oracle updates decoded from the Base Flashblocks stream (the stream itself: onchain-core) |
+| `runner`, `policy` | the watch loop as a library (`Runner`), the two bidding policies |
+| `ledger` | the day's failed-gas spend, Atlas bond and PnL, persisted in live mode; the loss stop |
+| `oracle_logs` | Chainlink updates from canonical-block logs (the Atlas price model's feed) |
 | `oracle` | local MorphoChainlinkOracleV2 price model, verified against `price()` at start |
+| `flashblocks` | Flashblocks stream decoding: examples only (Denim removes Flashblocks) |
 | `atlas` | Chainlink SVR / Fastlane Atlas auction feed and valuation |
 | `atlas_submit` | solver operations: EIP-712 signing, submission (live, opt-in) |
 | `loss` | loss analysis: every on-chain liquidation in tracked markets vs what we saw |
@@ -377,7 +381,7 @@ metacall cannot be replayed (it needs the user's and the DApp's signatures).
 
 One `eth_simulateV1` call runs the whole liquidation and returns profit and real gas; the L1 fee
 is added (`getL1FeeUpperBound`). Plans are simulated at the planning fee (see `Planner`); once the
-risk gate has picked a bid above the base priority, `checked_priority` (in `main.rs`) simulates the
+risk gate has picked a bid above the base priority, `checked_priority` (in `runner.rs`) simulates the
 plan again at that priority and keeps the bid only if the net still clears `min_net_usd` there,
 else the base priority goes; the send's minProfit uses the lower of the two profits. A
 re-simulation that shows no profit at all means the plan is not sent. Simulations run as the
@@ -457,27 +461,45 @@ range", "free plan"), never by single words; deterministic errors of the call it
 limit, insufficient funds, nonce, fee cap...) never fail over or cool an endpoint down. Logs only
 ever show the endpoint name. Requests carry a `liquidation-framework/<version>` User-Agent.
 
+### The runner (`bot/src/runner.rs`) and bidding policies (`bot/src/policy.rs`)
+
+`Runner::build(RunnerInputs, auction, priority)` connects to the configured endpoints, builds the
+Morpho engine and refuses markets whose loan token it cannot price; `run()` is the watch loop until
+an error (or `RunnerInputs::shutdown`). The bot binary (`runner.rs`) only parses the CLI, loads the
+signer before the async runtime exists (`load_signer_pre_runtime`) and calls them, so a private
+binary can run the same loop with its own policies:
+
+- `AuctionBidPolicy::bid_usd(market, net_usd, eth_usd)`: the bid in an SVR auction (default
+  `DefaultAuctionBid`: net x (1 - `[atlas] margin`)); used for the journaled valuation and the
+  submitted op alike;
+- `PriorityBidPolicy::bid(market, plan, competition, eth_usd)`: the block path's priority fee
+  (default `DefaultPriorityBid`: the `[exec]` bid curve below).
+
+The spending limits are applied by the runner after the policy, so a policy decides how much to
+bid, never how much may be spent.
+
 ### Block path and send timing
 
 On each head the engine refreshes the touched positions, and the most valuable candidates
 (`max_plans_per_block`) are planned all at once; each one is journaled, gated and sent the moment
 its own plan is ready (a slow aggregator quote of one never delays another), and the sends of a
 batch run concurrently (their bid re-simulations in parallel; the executor task broadcasts them in
-turn), at most one per market per batch. The same holds for the same-block path below.
+turn), at most one per market per batch.
 
-The two paths share the loop's state, and the same-block path is the latency-critical one, so it
-never waits for the block path: oracle updates that arrive while the block path fetches or plans a
-batch are handled at once (`plan_and_send`'s side events), on the previous block's snapshots, and
-the batch resumes afterwards. While a same-block batch plans, the next head waits (it is a few
-hundred ms; the receipts and broadcasts that used to add to it now run in the executor task).
+SVR auctions and oracle log events (below) arrive on one side-event channel that the loop serves
+while waiting for a head, while fetching, and while a batch plans (`plan_and_send`'s side events),
+on the previous block's snapshots: an auction never waits behind the block path. The block time
+is measured over the last 50 heads (`BlockClock`), so deadlines, `replan_secs` and the accrual
+lookahead follow a block-time change (Base Denim: 2 s -> 0.2 s) without a setting to switch.
 
 ### Bidding (`bot/src/risk.rs`, `onchain_core::bid`)
 
 The priority fee is set against the competition seen on-chain. Every liquidation in a tracked
 market (the loss analysis already looks each one up) records what its winner paid as priority fee
-per gas per USD of gross it took, per market, for `bid_window_secs` (`WinningBids`; seeded from the
-journal at start). Our own liquidations and Atlas metacalls (whose priority fee is the bundler's;
-the race was the auction) are left out. For a plan, `BidCurve::priority`:
+per gas per USD of gross it took, per market, for `bid_window_secs` (`WinningBids`; seeded at start
+from the journal's complete liquidation rows: gross USD, block time and the tx's `to`). Our own
+liquidations and Atlas metacalls (whose priority fee is the bundler's; the race was the auction)
+are left out. For a plan, `BidCurve::priority`:
 
 - predicts the competitor's priority fee: the `bid_quantile` (default 0.9) of those ratios x this
   plan's gross USD (a market with fewer than `bid_min_samples` winners uses all markets');
@@ -488,40 +510,72 @@ the race was the auction) are left out. For a plan, `BidCurve::priority`:
 
 Without enough observations it bids the affordable share, like a plain share-of-profit bidder.
 The decision journals the competitor priority it bid against (`competitor_wei`). A bid above the
-base priority is then simulated again at its own priority before it is sent (see Simulation).
+base priority is then simulated again at its own priority before it is sent (see Simulation):
+some pools (Aero) tax the priority fee.
 
-### Same-block path (`bot/src/flashblocks.rs`, `bot/src/oracle.rs`)
+### Spending limits (`bot/src/ledger.rs`)
 
-Base streams ~200 ms sub-blocks (Flashblocks). The bot decodes Chainlink transmissions straight
-from the raw txs in the stream (OCR report -> median observation), computes the new Morpho oracle
-price locally and re-evaluates only that market. Each candidate is planned twice, in parallel:
-on the snapshot block with the new price pinned by state override, and on the "pending" block
-being built WITHOUT any price override, with the oracle read in that same state (`PriceProbe`) to
-prove the update is in effect (a transmit that reverted, or an SVR cutoff one block away, shows up
-as the old price). Behind (stale block or old price), the pending plan is retried briefly. A fresh,
-proven pending plan wins; else the snapshot plan. SVR feeds are handled separately: the public
-price only takes effect once the matching secondary round lands, or after the feed's cutoff.
-`may_send(path, state)`: a public transmit (`Primary`) may send from either plan; an SVR secondary
-or an expired SVR primary only from the fresh pending plan. `[flashblocks] send = false` keeps this
-path journal-only. Note: the planned Base "Denim" upgrade removes Flashblocks and moves to 200 ms
-blocks; the local price model and single-market re-evaluation stay useful, and deadlines and the
-interest lookahead follow the measured block time, so the data layer is not tied to the Flashblocks
-API.
+- **Per tx** (`[exec] max_tx_cost_eth`, default 0.002): a block-path tx's worst case, `gas_limit x
+  (2 x base fee + priority) + L1 fee`, must fit. The bid is cut to fit; if the cut bid falls below
+  the base priority or at/below the predicted competitor, the tx is not sent (it would be sent to
+  lose). Checked once, in `send_approved`, after the policy.
+- **Failed gas per UTC day** (`[exec] daily_gas_budget_usd`): a tx in flight holds its worst case;
+  a revert charges its real cost.
+- **Atlas bond per UTC day** (`[atlas.solver] atlas_bond_budget_usd`): the bond's shrinkage since
+  the day's first reading (read every 50 heads and after an accepted op), plus the next op's worst
+  case. Below `min_bond_eth` no op is submitted.
+- **Daily loss** (`[exec] daily_loss_limit_usd`): realized PnL = what settled block-path txs paid
+  `PROFIT_RECEIVER` (their receipts' ERC20 transfers of the tracked loan tokens) minus their gas,
+  minus the bond's shrinkage. Atlas income is not counted (an op runs inside someone else's
+  metacall), so the PnL is a lower bound and the stop can only fire early. Past the limit the kill
+  switch file is written; sending stops until a person removes it.
+
+Refusals by these limits are journaled (`kind: "refused"`, `reason`, `worst_eth`, `cap_eth`). In
+live mode the day's failed-gas spend, bond baseline and PnL are kept in a ledger file (`v1` line +
+JSON; `[exec] ledger_file`, default next to the shared nonce files) and read back at start; a file
+the bot cannot read refuses live mode.
+
+### Oracle logs and the price model (`bot/src/oracle_logs.rs`, `bot/src/oracle.rs`)
+
+Atlas auctions are valued at the auction's median: `PriceModel::preview` replaces one aggregator's
+answer and recomputes every market using it, so the model must know every feed's current answer.
+It is loaded at start (verified against each oracle's `price()`; markets it cannot reproduce are
+left out) and kept current from canonical-block logs of the watched aggregators:
+
+- `NewTransmission(round, answer)`: a public transmit. A plain feed's answer is in effect at once;
+  an SVR feed's is kept pending with its round and block time (Morpho does not read it yet).
+- `SecondaryRoundIdUpdated(round)`: the SVR secondary written by the auction winner's Atlas
+  metacall. It carries the round only; the pending answer of that round takes effect.
+- A pending SVR answer no auction carried takes effect once older than `[atlas] svr_cutoff_secs`
+  (checked on each head).
+
+`AnswerUpdated` is not read: an SVR feed emits it at the public transmit, before the price is in
+effect (checked on the XRP/USD DualAggregator, fixture `tests/fixtures/oracle_logs/`). The block
+time of a log is its `blockTimestamp` (Base nodes include it), else the head's. Each head also
+cross-checks the previous block's snapshot against the model and resyncs a market that differs
+(a missed event, a reverted transmit, a swapped aggregator: then the subscription follows the new
+address); three misses in a row reconnect the logs. A log removed by a reorg drops the pending
+answer and forces the check. The logs WebSocket is `[atlas] logs_ws`, else the first `ws` endpoint.
+
+`bot/src/flashblocks.rs` (the same-block path from the Flashblocks stream) is not used by the
+watch loop any more (Base Denim removes Flashblocks); `[flashblocks] enabled = true` is refused.
 
 ### Atlas / Chainlink SVR (`bot/src/atlas.rs`)
 
 On SVR-enabled feeds, the right to liquidate after an oracle update is auctioned through Fastlane
-Atlas. The module listens for auctions, values each one with the same planner (`quote_bundle` for
-the whole market, then per-position plans), and journals what we could have bid. It never
-submits anything. `value-auction` replays a past auction. The bid basis is what the solver would
+Atlas. The module listens for auctions (`[atlas] observe`), values each one with the same planner
+(`quote_bundle` for the whole market, then per-position plans) on the price model above, and
+journals it (`atlas_auction`, with `queued_ms` / `bundle_ms` / `value_ms`); it submits only with
+`[atlas.solver] submit` in live mode (below). `value-auction` replays a past auction. Auctions the
+feed drops on a full side channel are journaled as `atlas_dropped`. The bid basis is what the solver would
 keep after Atlas charges it for gas: per market `atlas_net_usd` = the bundle's `gross_usd` minus its
 `gas_units` at the auction's `maxFeePerGas` x (1 + surcharge), summed into `bundle_net_usd`; the
-journaled bid is that x (1 - `atlas.margin`). The surcharge is read from the escrow at start
+journaled bid is the auction policy's on that net (default x (1 - `atlas.margin`)). The surcharge is read from the escrow at start
 (`getAtlasSurchargeRate`, scale 1e4); `[atlas] gas_surcharge` (default 0.1) is the fallback.
 
 **Solver venue (`bot/src/atlas_venue.rs`, simulation only).** With `[atlas.solver] simulate = true`,
 each market of a valued auction also gets a `solver` field in the journal (`solver_op` in
-`main.rs`): the top position's direct-router plan is wrapped into `atlasSolverCall` with a bid of
+`runner.rs`): the top position's direct-router plan is wrapped into `atlasSolverCall` with a bid of
 (`profit_usd` minus the op's gas at the Atlas rate above) x (1 - `atlas.margin`), and simulated as
 Atlas would call it, against `AtlasStub.sol` injected at the Atlas address (no gas liability), with
 the solver and its MorphoLiquidator injected unless deployed; the result includes the L1 fee of the
@@ -536,7 +590,7 @@ checks it on an anvil fork.
 
 **Submitting solver operations (`bot/src/atlas_submit.rs`).** With `[atlas.solver] submit = true`
 in live mode, a solver op that simulates with a profit after its bid is built, signed and
-submitted to the auction (`submit_solver_op` in `main.rs`):
+submitted to the auction (`submit_solver_op` in `runner.rs`):
 
 - the op: `from` = the hot wallet (it must be the solver's `executor`), `to` = Atlas, `gas` = the
   simulated gas x `gas_limit_buffer` within the DappControl's `getSolverGasLimit()`, `maxFeePerGas`
@@ -558,10 +612,10 @@ submitted to the auction (`submit_solver_op` in `main.rs`):
   needs another EOA), so an auction's ops are tried most profitable first (profit after the bid)
   until the endpoint accepts one; a refused op gives the block's slot back to the next, and the
   others are journaled with the op that was submitted; the kill-switch file stops
-  submissions; and an op is only submitted while its worst-case charge to the bond (all of its gas
-  at the auction's max fee plus the escrow surcharge) fits `exec.daily_gas_budget_usd`, counted
-  separately from the executor's budget and charged for every accepted op (whether Atlas ran it is
-  not observed). The journal's `solver` field records what was submitted (`submitted`).
+  submissions; and an op is only submitted while the bond is at least `min_bond_eth` and today's
+  bond shrinkage plus the op's worst-case charge (all of its gas at the auction's max fee plus the
+  escrow surcharge) fits `[atlas.solver] atlas_bond_budget_usd` (see Spending limits). The
+  journal's `solver` field records what was submitted (`submitted`).
 
 At start (`build_submitter`), the bot refuses to submit unless the solver and its liquidator are
 deployed (`[atlas.solver] address`, `liquidator`), the solver's `executor()` is the hot wallet,
@@ -587,7 +641,8 @@ The bot never moves funds for Atlas; the operator does, from their own terminal:
    `redeem(amount)`.
 
 Results can be traced with Fastlane's query API (`solver_getSolverOperationResult`, see the
-Chainlink searcher docs); the bot does not call it.
+Chainlink searcher docs); the bot does not call it yet (reconciliation is planned: until then the
+bond's shrinkage is the only Atlas cost the bot sees).
 
 ### Dashboard and live page
 
@@ -608,8 +663,8 @@ snapshot `watch` writes every block.
    on. Copy their shape for unit tests of your own impl.
 4. Implement `loan_usd`: every debt token you allow needs a USD price model (or its liquidations
    are refused).
-5. Bind the application layer: today `main.rs` (the watch loop, oracle model, Atlas valuation,
-   dashboard) is Morpho-bound and uses `morpho::MorphoEngine`; add the same alias for yours, a
+5. Bind the application layer: today `runner.rs` (the watch loop, oracle model, Atlas valuation)
+   and the dashboard are Morpho-bound and uses `morpho::MorphoEngine`; add the same alias for yours, a
    config section like `[morpho]`, and your own loop (see "Scope" above).
 6. If the protocol has no liquidate callback (its liquidation pulls the repayment up front),
    implement `DirectLiquidation` (`liquidation_call`) and use `flash_venue::FlashLiquidatorVenue`

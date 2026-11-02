@@ -145,16 +145,13 @@ pub struct Submitter {
     pub http: reqwest::Client,
     /// Most gas an op may declare (the DappControl's limit, read at start).
     pub gas_limit: u64,
-    /// What submitted ops may have cost the bond today, each at its worst case (all of its gas at
-    /// the auction's max fee): Atlas charges it also when an op fails, outside the executor's view.
-    pub budget: Mutex<onchain_core::gates::DailyBudget>,
     last_deadline: Mutex<u64>,
 }
 
 impl Submitter {
     #[allow(clippy::too_many_arguments)]
     pub fn new(signer: PrivateKeySigner, domain: Eip712Domain, atlas: Address, control: Address, endpoint: String, http: reqwest::Client, gas_limit: u64) -> Self {
-        Self { signer, domain, atlas, control, endpoint, http, gas_limit, budget: Mutex::default(), last_deadline: Mutex::new(0) }
+        Self { signer, domain, atlas, control, endpoint, http, gas_limit, last_deadline: Mutex::new(0) }
     }
 
     /// Claims the slot for an op landing by `deadline`; false = this EOA already has one there.
