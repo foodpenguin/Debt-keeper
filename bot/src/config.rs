@@ -795,6 +795,10 @@ impl Config {
         }
         let mut cfg: Self = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
         cfg.exec.send.anchor(path);
+        // A relative ledger file is relative to the config file, like the kill switch.
+        if !cfg.exec.ledger_file.is_empty() && std::path::Path::new(&cfg.exec.ledger_file).is_relative() {
+            cfg.exec.ledger_file = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(".")).join(&cfg.exec.ledger_file).to_string_lossy().into_owned();
+        }
         cfg.rpc.anchor(path);
         cfg.validate().with_context(|| format!("checking {path}"))?;
         Ok(cfg)

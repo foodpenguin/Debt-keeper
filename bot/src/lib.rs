@@ -23,6 +23,7 @@ pub mod contracts;
 pub mod dash;
 pub mod dex;
 pub mod engine;
+pub mod ledger;
 pub mod flash_venue;
 pub mod flashblocks;
 pub mod funding;
