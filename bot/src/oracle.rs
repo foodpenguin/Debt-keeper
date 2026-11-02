@@ -10,7 +10,10 @@
 //! shared with the stream so that a swapped aggregator or transmitter set is picked up live.
 
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, RwLock},
+};
 
 use alloy::{
     eips::BlockId,
@@ -23,10 +26,34 @@ use alloy::{
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::{
-    flashblocks::{Authorized, Path, Watched},
-    morpho::onchain::MarketMeta,
-};
+use crate::morpho::onchain::MarketMeta;
+
+/// Which copy of a Chainlink report a transaction carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Path {
+    /// The public `transmit`. On an SVR feed it does not move what Morpho reads yet.
+    Primary,
+    /// `transmitSecondary` inside an Atlas metacall: what an SVR proxy (and so Morpho) reads.
+    Secondary,
+    /// An SVR primary that no auction carried: the proxy serves it once it is older than the
+    /// aggregator's cutoff (10 s on the Base SVR feeds checked).
+    Expired,
+}
+
+/// Who may move an aggregator's answer: `aggregator.getTransmitters()` are forwarder contracts
+/// (each with `getAuthorizedSenders()` EOAs) or, for direct transmits, the EOAs themselves.
+#[derive(Debug, Clone, Default)]
+pub struct Authorized {
+    /// forwarder -> EOAs allowed to call it
+    pub forwarders: HashMap<Address, HashSet<Address>>,
+    /// EOAs allowed to call `transmit` on the aggregator directly
+    pub direct: HashSet<Address>,
+}
+
+/// aggregator -> its authorized transmitters. Shared with the price model, which refreshes it
+/// when a feed's aggregator or transmitter set changes.
+pub type Watched = Arc<RwLock<HashMap<Address, Authorized>>>;
 
 sol! {
     interface IMorphoChainlinkOracleV2 {
@@ -113,6 +140,9 @@ pub struct PriceModel {
     watched: Watched,
     /// SVR aggregator -> (public answer seen but not yet in effect, timestamp of its block).
     pending: HashMap<Address, (U256, u64)>,
+    /// SVR aggregator -> the round of its pending answer, when known (oracle logs carry it; the
+    /// Flashblocks decoder does not).
+    pending_round: HashMap<Address, u32>,
 }
 
 impl PriceModel {
@@ -249,6 +279,7 @@ impl PriceModel {
             (true, Path::Secondary | Path::Expired) => match self.pending.get(&aggregator) {
                 Some((p, _)) if *p == answer => {
                     self.pending.remove(&aggregator);
+                    self.pending_round.remove(&aggregator);
                 }
                 _ if touched.iter().all(|&i| self.feeds[i].answer == answer) => return Applied::Moved(vec![]),
                 _ => return Applied::Rejected("secondary answer does not match the pending primary"),
@@ -259,6 +290,45 @@ impl PriceModel {
             self.feeds[i].answer = answer;
         }
         Applied::Moved(self.affected(&touched, None))
+    }
+
+    /// A public transmit of `answer` for `round` (oracle logs): `apply` as Primary, remembering the
+    /// round of a deferred SVR answer for its secondary.
+    pub fn apply_transmission(&mut self, aggregator: Address, round: u32, answer: U256, block_ts: u64) -> Applied {
+        let r = self.apply(aggregator, answer, Path::Primary, block_ts);
+        if matches!(r, Applied::Deferred(_)) {
+            self.pending_round.insert(aggregator, round);
+        }
+        r
+    }
+
+    /// The SVR secondary of `round` (oracle logs: the round only): the pending answer of that round
+    /// takes effect. None when there is no pending answer of that round (a missed transmit; the
+    /// block path's resync catches up).
+    pub fn apply_secondary_round(&mut self, aggregator: Address, round: u32, block_ts: u64) -> Option<Applied> {
+        let (answer, _) = *self.pending.get(&aggregator)?;
+        if self.pending_round.get(&aggregator).is_some_and(|r| *r != round) {
+            return None;
+        }
+        let r = self.apply(aggregator, answer, Path::Secondary, block_ts);
+        if matches!(r, Applied::Moved(_)) {
+            self.pending_round.remove(&aggregator);
+        }
+        Some(r)
+    }
+
+    /// Forgets the pending answer of `aggregator` (a log it came from was removed by a reorg).
+    pub fn invalidate(&mut self, aggregator: Address) {
+        self.pending.remove(&aggregator);
+        self.pending_round.remove(&aggregator);
+    }
+
+    /// The aggregators behind the modelled feeds, sorted (the oracle logs filter).
+    pub fn aggregators(&self) -> Vec<Address> {
+        let mut a: Vec<Address> = self.feeds.iter().map(|f| f.aggregator).collect();
+        a.sort();
+        a.dedup();
+        a
     }
 
     /// Pending SVR primaries no auction carried, now old enough to be what the proxy serves in a
@@ -306,6 +376,7 @@ impl PriceModel {
             // The chain caught up with a pending SVR answer (its Atlas metacall, or the cutoff).
             if self.pending.get(&feed.aggregator).is_some_and(|(a, _)| *a == feed.answer) {
                 self.pending.remove(&feed.aggregator);
+                self.pending_round.remove(&feed.aggregator);
             }
             self.feeds[i] = feed;
         }
@@ -323,6 +394,7 @@ impl PriceModel {
             markets: markets.into_iter().map(|m| m.map(|(scale, base, quote)| MarketFeeds { scale, base, quote })).collect(),
             watched: Watched::default(),
             pending: HashMap::new(),
+            pending_round: HashMap::new(),
         }
     }
 }
@@ -356,6 +428,34 @@ mod tests {
         assert_eq!(m.price(2), None);
         // A "secondary" for a plain feed is not a thing.
         assert!(matches!(m.apply(ETH, U256::from(1u64), Path::Secondary, 1002), Applied::Rejected(_)));
+    }
+
+    #[test]
+    fn svr_secondary_round_takes_the_pending_answer_of_that_round() {
+        // Oracle logs: NewTransmission(round, answer), then SecondaryRoundIdUpdated(round) with no answer.
+        let mut m = model(true);
+        let old = m.price(1).unwrap();
+        let new = U256::from(127_840_411u64);
+        assert_eq!(m.apply_transmission(XRP, 0x735, new, 1000), Applied::Deferred(vec![(1, new * e(28))]));
+        assert_eq!(m.price(1), Some(old));
+        // Another round's secondary does not put this answer in effect.
+        assert_eq!(m.apply_secondary_round(XRP, 0x734, 1002), None);
+        assert_eq!(m.price(1), Some(old));
+        assert_eq!(m.apply_secondary_round(XRP, 0x735, 1002), Some(Applied::Moved(vec![(1, new * e(28))])));
+        assert_eq!(m.price(1), Some(new * e(28)));
+        // Nothing pending any more.
+        assert_eq!(m.apply_secondary_round(XRP, 0x735, 1004), None);
+        assert!(m.due(10_000, 10).is_empty());
+    }
+
+    #[test]
+    fn invalidate_forgets_the_pending_answer() {
+        let mut m = model(true);
+        m.apply_transmission(XRP, 7, U256::from(127_840_411u64), 1000);
+        m.invalidate(XRP);
+        assert_eq!(m.apply_secondary_round(XRP, 7, 1002), None);
+        assert!(m.due(10_000, 10).is_empty());
+        assert_eq!(m.aggregators(), { let mut a = vec![ETH, USDC, XRP]; a.sort(); a });
     }
 
     #[test]

@@ -1,14 +1,19 @@
-//! Chainlink SVR / Atlas solver auctions, OBSERVE ONLY (solver phase 0): subscribes to the public
-//! solver feed and forwards Base auctions for our DappControl into the flashblock event channel.
-//! Nothing is ever submitted; the main loop values each auction (what we could have bid) and
-//! journals it for comparison with the winning on-chain bid.
+//! Chainlink SVR / Atlas solver auctions: subscribes to the public solver feed and forwards the Base
+//! auctions for our DappControl to the watch loop (`runner::SideEvent`), which values each one and
+//! journals it; `[atlas.solver] submit` also bids (atlas_submit.rs).
 //!
 //! Feed (docs.chain.link/data-feeds/svr-feeds/searcher-onboarding-atlas; checked 2026-10-18):
 //! `solver_subscribe ["userOperations"]` -> `solver_subscription` notifications whose
 //! `partial_user_operation` carries chainId, control, deadline (block), maxFeePerGas, userOpHash
 //! and `hints { aggregator, medianPrice, rawReport, forwardData }`. All chains share the feed.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use alloy::primitives::{Address, B256, U256};
 use futures::{SinkExt, StreamExt};
@@ -17,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
-use crate::flashblocks::FbEvent;
+use crate::runner::SideEvent;
 
 /// One SVR auction on our chain.
 #[derive(Debug, Clone)]
@@ -30,6 +35,8 @@ pub struct Auction {
     pub max_fee_per_gas: u128,
     pub user_op_hash: B256,
     pub seen: Instant,
+    /// Wall-clock arrival (unix ms), to place it against on-chain times.
+    pub seen_unix_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -82,11 +89,15 @@ pub fn parse(text: &str, chain_id: u64, control: Address, seen: Instant) -> Opti
         max_fee_per_gas: hex_u128(&op.max_fee_per_gas)?,
         user_op_hash: op.user_op_hash,
         seen,
+        seen_unix_ms: crate::gates::unix_ms(),
     })
 }
 
-/// Connects (and reconnects) in the background; our auctions go into `tx`.
-pub fn spawn(url: String, chain_id: u64, control: Address, tx: mpsc::Sender<FbEvent>) {
+/// Connects (and reconnects) in the background; our auctions go into `tx`. Returns the count of
+/// auctions dropped on a full channel (journaled by the loop as `atlas_dropped`).
+pub fn spawn(url: String, chain_id: u64, control: Address, tx: mpsc::Sender<SideEvent>) -> Arc<AtomicU64> {
+    let dropped = Arc::new(AtomicU64::new(0));
+    let counter = dropped.clone();
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
         loop {
@@ -96,16 +107,20 @@ pub fn spawn(url: String, chain_id: u64, control: Address, tx: mpsc::Sender<FbEv
                     if ws.send(Message::Text(sub.into())).await.is_err() {
                         continue;
                     }
-                    info!("atlas auction feed subscribed (observe only)");
+                    info!("atlas auction feed subscribed");
                     backoff = Duration::from_secs(1);
                     // Auctions on all chains arrive every few seconds: a minute of silence is a dead socket.
                     while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(60), ws.next()).await {
                         match msg {
                             Ok(Message::Text(t)) => {
                                 if let Some(a) = parse(&t, chain_id, control, Instant::now())
-                                    && tx.try_send(FbEvent::Auction(a)).is_err()
+                                    && tx.try_send(SideEvent::Auction(a)).is_err()
                                 {
-                                    warn!("flashblock event channel full; auction dropped");
+                                    if tx.is_closed() {
+                                        return;
+                                    }
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                    warn!("side event channel full; auction dropped");
                                 }
                             }
                             Ok(Message::Ping(p)) => {
@@ -123,6 +138,7 @@ pub fn spawn(url: String, chain_id: u64, control: Address, tx: mpsc::Sender<FbEv
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
     });
+    dropped
 }
 
 #[cfg(test)]

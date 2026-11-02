@@ -27,12 +27,12 @@ use alloy::sol;
 use crate::{
     actor::{self, ExecHandle},
     bid::WinningBids,
-    atlas, atlas_submit, atlas_venue, config, dex, executor, flash_venue, flashblocks, funding, gates, heads, live, loss, morpho, oracle, planner, protocol, risk, rpc, sim, v3router, venue,
+    atlas, atlas_submit, atlas_venue, config, dex, executor, flash_venue, funding, gates, heads, live, loss, morpho, oracle, oracle_logs, planner, protocol, risk, rpc, sim, v3router, venue,
     config::Config,
     engine::JournalRow,
     heads::Head,
     morpho::{Morpho, MorphoEngine, PositionView, evaluate_position, math, onchain::MarketMeta},
-    planner::{PlanCtx, Planner, PriceProbe},
+    planner::{PlanCtx, Planner},
     router::Kyber,
     policy::{AuctionBidPolicy, PriorityBidPolicy},
     sim::{LiquidatorCode, Simulator},
@@ -62,7 +62,8 @@ pub struct Runner<P> {
     pool: rpc::RpcPool,
     ws: Vec<(String, String)>,
     live: Option<(alloy::signers::local::PrivateKeySigner, Vec<(String, String)>)>,
-    fb_provider: Option<(P, rpc::RpcPool)>,
+    /// Valuation endpoints of the Atlas path (`[atlas] rpc`), when its own.
+    atlas_pool: Option<(P, rpc::RpcPool)>,
     from_block: Option<u64>,
     auction: Arc<dyn AuctionBidPolicy>,
     priority: Arc<dyn PriorityBidPolicy>,
@@ -93,29 +94,34 @@ impl Runner<()> {
             .map(|e| (e.name.clone(), e.url.clone()))
             .chain(extra.iter().enumerate().map(|(i, u)| (format!("extra{i}"), u.clone())))
             .collect();
-        // Same-block mode: a separate pool of the endpoints that serve the "pending" flashblock state.
-        let fb_specs: Vec<rpc::EndpointSpec> = if cfg.flashblocks.enabled {
-            cfg.flashblocks
-                .pending_rpc
-                .iter()
-                .filter_map(|n| resolved.http.iter().find(|e| &e.name == n))
-                .enumerate()
-                // Strict preference order (not load-spread): a quote and its simulation must read the
-                // same node's pending state, which differs between nodes by up to a flashblock.
-                .map(|(i, e)| rpc::EndpointSpec { name: e.name.clone(), url: e.url.clone(), priority: i as u32, skip_methods: e.skip_methods.clone(), max_log_blocks: e.max_log_blocks })
-                .collect()
-        } else {
-            vec![]
-        };
+        // Denim removes Flashblocks: the same-block path is not part of the runner (tag legacy-final
+        // of the old bot has it).
+        anyhow::ensure!(!cfg.flashblocks.enabled, "[flashblocks] enabled: the same-block path was removed (Base Denim drops Flashblocks); set it to false");
+        // Atlas valuations on their own endpoints, in strict preference order, when configured.
+        let atlas_specs: Vec<rpc::EndpointSpec> = cfg
+            .atlas
+            .rpc
+            .iter()
+            .map(|n| resolved.http.iter().find(|e| &e.name == n).with_context(|| format!("[atlas] rpc names {n:?}, not a configured [[rpc]] endpoint")))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| rpc::EndpointSpec { name: e.name.clone(), url: e.url.clone(), priority: i as u32, skip_methods: e.skip_methods.clone(), max_log_blocks: e.max_log_blocks })
+            .collect();
+        // The oracle logs WebSocket: `[atlas] logs_ws` first, then the head endpoints.
+        let mut ws = resolved.ws.clone();
+        if !cfg.atlas.logs_ws.is_empty() {
+            let i = ws.iter().position(|w| w.0 == cfg.atlas.logs_ws).with_context(|| format!("[atlas] logs_ws = {:?}: no [[rpc]] endpoint of that name has a ws url", cfg.atlas.logs_ws))?;
+            ws.swap(0, i);
+        }
         let pool = rpc::RpcPool::new(resolved.http)?;
         let provider = ProviderBuilder::new().connect_client(alloy::rpc::client::RpcClient::new(pool.clone(), false));
-        let fb_provider = if cfg.flashblocks.enabled {
-            anyhow::ensure!(!fb_specs.is_empty(), "flashblocks.pending_rpc names no configured [[rpc]] endpoint");
-            info!(pending_rpc = ?fb_specs.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), "flashblocks mode enabled");
-            let fb_pool = rpc::RpcPool::with_timeout(fb_specs, Duration::from_millis(1500))?;
-            Some((ProviderBuilder::new().connect_client(alloy::rpc::client::RpcClient::new(fb_pool.clone(), false)), fb_pool))
-        } else {
+        let atlas_pool = if atlas_specs.is_empty() {
             None
+        } else {
+            info!(rpc = ?atlas_specs.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), "atlas valuation endpoints");
+            let p = rpc::RpcPool::new(atlas_specs)?;
+            Some((ProviderBuilder::new().connect_client(alloy::rpc::client::RpcClient::new(p.clone(), false)), p))
         };
         let morpho = Morpho::from_config(&cfg);
         let engine = MorphoEngine::new(provider, cfg, morpho).await?;
@@ -123,7 +129,7 @@ impl Runner<()> {
         // would be silently mispriced, so it is refused here.
         let unpriced: Vec<String> = engine.metas.iter().filter(|m| morpho::loan_usd_model(engine.cfg.chain_id, m.params.loanToken, 1.0).is_none()).map(|m| format!("{} (loan {})", m.name, m.loan_symbol)).collect();
         anyhow::ensure!(unpriced.is_empty(), "markets with a loan token the bot cannot price in USD (Base USD stablecoins and WETH, by address): {}", unpriced.join(", "));
-        Ok(Runner { engine, pool, ws: resolved.ws, live: signer.map(|s| (s, broadcast)), fb_provider, from_block, auction: Arc::new(auction), priority: Arc::new(priority) })
+        Ok(Runner { engine, pool, ws, live: signer.map(|s| (s, broadcast)), atlas_pool, from_block, auction: Arc::new(auction), priority: Arc::new(priority) })
     }
 }
 
@@ -131,7 +137,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Runner<P> {
     /// The watch loop: every block (and every SVR auction) until an error. Shadow mode unless the
     /// inputs carried a signer.
     pub async fn run(mut self) -> Result<()> {
-        watch(&mut self.engine, self.from_block, self.pool, self.ws, self.live, self.fb_provider, self.auction, self.priority).await
+        watch(&mut self.engine, self.from_block, self.pool, self.ws, self.live, self.atlas_pool, self.auction, self.priority).await
     }
 
     /// One-shot risk summary of every tracked position, checked against the Morpho API.
@@ -182,8 +188,14 @@ async fn build_v3<P: Provider>(engine: &MorphoEngine<P>) -> Result<v3router::V3R
     Ok(v3)
 }
 
-/// Block time assumed until enough blocks were seen to measure it (one-off CLI paths use it too).
-const DEFAULT_BLOCK_TIME: f64 = 2.0;
+/// Seconds per block over the 10 blocks before `h` (the one-off commands; watch measures it
+/// continuously, BlockClock).
+async fn recent_block_time<P: Provider>(p: &P, h: &Head) -> f64 {
+    match heads::http_head(p, BlockNumberOrTag::Number(h.number.saturating_sub(10))).await {
+        Ok(b) if h.number > b.number && h.timestamp >= b.timestamp => (h.timestamp - b.timestamp) as f64 / (h.number - b.number) as f64,
+        _ => 2.0,
+    }
+}
 
 /// The liquidation contract the planner encodes for and simulates (`exec.venue`).
 enum Venue {
@@ -286,7 +298,7 @@ async fn atlas_surcharge<P: Provider>(engine: &MorphoEngine<P>) -> f64 {
         return fallback;
     }
     use alloy::sol_types::SolCall;
-    let tx = alloy::rpc::types::TransactionRequest::default().to(engine.cfg.flashblocks.atlas).input(IAtlasRates::getAtlasSurchargeRateCall {}.abi_encode().into());
+    let tx = alloy::rpc::types::TransactionRequest::default().to(engine.cfg.atlas.address).input(IAtlasRates::getAtlasSurchargeRateCall {}.abi_encode().into());
     match engine.provider.call(tx).await.ok().and_then(|out| IAtlasRates::getAtlasSurchargeRateCall::abi_decode_returns(&out).ok()) {
         Some(rate) => {
             let s = math::u256_f64(rate) / 1e4;
@@ -308,7 +320,7 @@ async fn build_atlas_solver<P: Provider>(engine: &MorphoEngine<P>) -> Result<Opt
         return Ok(None);
     }
     let (e, p, morpho) = (&engine.cfg.exec, &engine.provider, engine.protocol.address);
-    let atlas = engine.cfg.flashblocks.atlas;
+    let atlas = engine.cfg.atlas.address;
     let signer = c.signer.unwrap_or(e.executor);
     let solver = c.address.unwrap_or(atlas_venue::SIM_SOLVER);
     let solver_code = match c.address {
@@ -360,9 +372,10 @@ async fn plan_one<P: Provider>(engine: &mut MorphoEngine<P>, market: &str, user:
         bail!("--at-block needs router.mode = \"direct\": aggregators can only quote the current state");
     }
     let h = heads::http_head(&engine.provider, tag).await?;
+    let bt = recent_block_time(&engine.provider, &h).await;
     engine.reload(&[(mi, user)], h.number.into()).await?;
     let Some(&(shares, collateral)) = engine.positions.get(&(mi, user)) else { bail!("{user} has no debt in {market}") };
-    let snaps = engine.snapshots(h.number.into(), h.timestamp + engine.cfg.lookahead_secs(DEFAULT_BLOCK_TIME)).await?;
+    let snaps = engine.snapshots(h.number.into(), h.timestamp + engine.cfg.lookahead_secs(bt)).await?;
     let eth_usd = engine.eth_usd(&snaps);
     let mut snap = snaps[mi].clone().context("snapshot failed")?;
     let meta = &engine.metas[mi];
@@ -399,8 +412,8 @@ async fn plan_one<P: Provider>(engine: &mut MorphoEngine<P>, market: &str, user:
     let v3 = build_v3(engine).await?;
     let meta = &engine.metas[mi];
     let planner = Planner { protocol: &engine.protocol, aggregator: &kyber, venue: &simulator, cfg: &engine.cfg.exec, v3: Some(&v3), mode: &engine.cfg.router.mode };
-    let deadline_block = h.number + gates::deadline_blocks(engine.cfg.exec.deadline_secs, DEFAULT_BLOCK_TIME);
-    let sim_time = h.timestamp + engine.cfg.lookahead_secs(DEFAULT_BLOCK_TIME);
+    let deadline_block = h.number + gates::deadline_blocks(engine.cfg.exec.deadline_secs, bt);
+    let sim_time = h.timestamp + engine.cfg.lookahead_secs(bt);
     let ctx = PlanCtx { meta, snap: &snap, view: &view, block: h.number, base_fee_wei: h.base_fee, eth_usd, overrides, deadline_block, sim_time, pending, price_probe: None };
     let plan = planner.plan(&engine.provider, &ctx).await?;
     println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -492,27 +505,12 @@ async fn scan<P: Provider>(engine: &mut MorphoEngine<P>, top: usize) -> Result<(
 ///   HTTP right away, retried every 40 ms while the RPC nodes catch up (they trail the stream by
 ///   ~60-360 ms). Block data always comes from RPC, never from the stream;
 /// - HTTP polling as the fallback (every `poll_ms` without other sources, else every 2.5 s).
-async fn wait_head<P: Provider>(
-    ws: &mut Option<watch::Receiver<Option<Head>>>,
-    sealed: Option<&mut watch::Receiver<u64>>,
-    p: &P,
-    last: u64,
-    poll_ms: u64,
-) -> Result<Head> {
+async fn wait_head<P: Provider>(ws: &mut Option<watch::Receiver<Option<Head>>>, p: &P, last: u64, poll_ms: u64) -> Result<Head> {
     let fresh = |rx: &watch::Receiver<Option<Head>>| rx.borrow().filter(|h| h.number > last);
-    let fallback = Duration::from_millis(if ws.is_some() || sealed.is_some() { 2_500 } else { poll_ms });
-    let mut sealed = sealed;
+    let fallback = Duration::from_millis(if ws.is_some() { 2_500 } else { poll_ms });
     loop {
         if let Some(h) = ws.as_ref().and_then(fresh) {
             return Ok(h);
-        }
-        if sealed.as_ref().is_some_and(|s| *s.borrow() > last) {
-            let h = heads::http_head(p, BlockNumberOrTag::Latest).await?;
-            if h.number > last {
-                return Ok(Head { source: heads::SOURCE_FLASHBLOCK, ..h });
-            }
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            continue;
         }
         let ws_changed = async {
             match ws.as_mut() {
@@ -524,19 +522,8 @@ async fn wait_head<P: Provider>(
                 None => std::future::pending::<()>().await,
             }
         };
-        let sealed_changed = async {
-            match sealed.as_mut() {
-                Some(rx) => {
-                    if rx.changed().await.is_err() {
-                        std::future::pending::<()>().await;
-                    }
-                }
-                None => std::future::pending::<()>().await,
-            }
-        };
         tokio::select! {
             _ = ws_changed => {}
-            _ = sealed_changed => {}
             _ = tokio::time::sleep(fallback) => {
                 let h = heads::http_head(p, BlockNumberOrTag::Latest).await?;
                 if h.number > last {
@@ -569,7 +556,7 @@ async fn build_submitter<P: Provider>(engine: &MorphoEngine<P>, signer: Option<&
     use alloy::sol_types::SolCall;
     let c = &engine.cfg.atlas.solver;
     let Some(signer) = signer.filter(|_| c.submit) else { return Ok(None) };
-    let (p, atlas, control) = (&engine.provider, engine.cfg.flashblocks.atlas, engine.cfg.atlas.control);
+    let (p, atlas, control) = (&engine.provider, engine.cfg.atlas.address, engine.cfg.atlas.control);
     let solver = c.address.context("atlas.solver.submit needs the deployed solver address")?;
     anyhow::ensure!(c.signer.is_none_or(|s| s == signer.address()), "atlas.solver.signer must be the hot wallet (it signs the solver ops)");
     let req = alloy::rpc::types::TransactionRequest::default().to(solver).input(alloy::primitives::Bytes::from(ILiquidatorView::executorCall {}.abi_encode()).into());
@@ -709,24 +696,71 @@ type AuctionCache = HashMap<(Address, U256), (Instant, Arc<tokio::sync::OnceCell
 /// The background borrower refresh's result: (market, its borrowers or the error) per market.
 type BorrowerRefresh = Vec<(usize, Result<Vec<protocol::BorrowerInfo>>)>;
 
-/// Same-block (Flashblocks) mode state.
-struct FbState<P> {
-    /// Pool of endpoints for same-block quotes and sims (pending state + the snapshot's block, see
-    /// on_oracle_update).
+/// What the watch loop handles between and during blocks: SVR auctions and oracle log events.
+#[derive(Debug)]
+pub enum SideEvent {
+    Auction(atlas::Auction),
+    Oracle(oracle_logs::OracleLogEvent),
+}
+
+/// Capacity of the side-event channel (auctions + oracle logs); a full channel drops the event and
+/// journals `atlas_dropped` once a minute.
+const SIDE_CHANNEL: usize = 1024;
+
+/// How many recent heads the block-time estimate and the block -> timestamp table keep.
+const BLOCK_CLOCK_HEADS: usize = 50;
+const BLOCK_TS_KEEP: u64 = 600;
+
+/// The chain's block time from the last BLOCK_CLOCK_HEADS heads: follows a block-time change (Base
+/// Denim: 2 s -> 0.2 s) within that many blocks, no setting to switch.
+#[derive(Debug, Default)]
+struct BlockClock {
+    heads: std::collections::VecDeque<(u64, u64)>,
+}
+
+impl BlockClock {
+    fn push(&mut self, number: u64, timestamp: u64) {
+        if self.heads.back().is_some_and(|(n, _)| *n >= number) {
+            return;
+        }
+        self.heads.push_back((number, timestamp));
+        while self.heads.len() > BLOCK_CLOCK_HEADS {
+            self.heads.pop_front();
+        }
+    }
+
+    /// Seconds per block (2.0 until two heads are known).
+    fn block_time(&self) -> f64 {
+        match (self.heads.front(), self.heads.back()) {
+            (Some((n0, t0)), Some((n1, t1))) if n1 > n0 && t1 >= t0 => (t1 - t0) as f64 / (n1 - n0) as f64,
+            _ => 2.0,
+        }
+    }
+}
+
+/// The Atlas auction path: the price model the auctions are valued with (kept current by the oracle
+/// logs, cross-checked against each block's snapshot) and the valuation resources.
+struct AtlasState<P> {
+    /// Endpoints for valuations (`[atlas] rpc`, else the main pool).
     provider: P,
-    pool: rpc::RpcPool,
-    stream: flashblocks::Stream,
+    /// The valuation pool when it is its own (for the usage report).
+    pool: Option<rpc::RpcPool>,
     model: oracle::PriceModel,
-    /// market -> (block, flashblock index, when seen) of its latest oracle update.
-    last_oracle: HashMap<usize, (u64, u64, Instant)>,
-    /// (market, user) -> (block, ms from oracle update seen to plan ready, simulated net).
-    planned: HashMap<(usize, Address), (u64, u64, Option<f64>)>,
-    /// Highest block an applied update belongs to (the model runs ahead of sealed blocks).
+    logs: oracle_logs::OracleLogs,
+    /// block -> timestamp of recent heads, for oracle logs that carry none.
+    block_ts: HashMap<u64, u64>,
+    /// Oracle events whose block timestamp is not known yet.
+    held: Vec<oracle_logs::OracleLogEvent>,
+    /// Highest block an applied oracle event belongs to.
     max_update_block: u64,
-    updates: u64,
-    started: Instant,
-    /// Journal rows finished by background tasks (the receiver lives in `watch`, which writes
-    /// them via drain_journal so lines never interleave with its own, even after fb is gone).
+    /// Consecutive cross-checks that found the model behind the chain (missed oracle events).
+    missed_streak: u32,
+    /// Cross-check every market on the next block, whatever max_update_block says (the logs
+    /// reconnected, a log was removed, a secondary had no pending answer).
+    resync_all: bool,
+    svr_cutoff_secs: u64,
+    /// Journal rows finished by background tasks (the receiver lives in `watch`, which writes them
+    /// via drain_journal so lines never interleave with its own).
     journal_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Permits for auction valuations running at once (atlas.max_concurrent).
     valuations: Arc<tokio::sync::Semaphore>,
@@ -735,6 +769,123 @@ struct FbState<P> {
     /// first for the only permit and was valued again, 0.3-10 s late (10/24). (aggregator, median) ->
     /// (first seen, its valuation), kept AUCTION_SHARE_SECS.
     auction_cache: Arc<std::sync::Mutex<AuctionCache>>,
+    /// Auctions the feed task dropped on a full channel (journaled as they grow).
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+    dropped_journaled: u64,
+}
+
+impl<P: Provider + Clone + 'static> AtlasState<P> {
+    /// An oracle log event: applied now if its block's timestamp is known, else held for its head.
+    fn on_oracle_log(&mut self, ev: oracle_logs::OracleLogEvent) {
+        use oracle_logs::OracleLogEvent as E;
+        match ev {
+            E::Reconnected => self.resync_all = true,
+            E::Removed { aggregator } => {
+                warn!(%aggregator, "oracle log removed by a reorg; resyncing the model");
+                self.model.invalidate(aggregator);
+                self.resync_all = true;
+            }
+            E::Transmission { at, .. } | E::Secondary { at, .. } => {
+                let ts = if at.block_ts > 0 { Some(at.block_ts) } else { self.block_ts.get(&at.block).copied() };
+                match ts {
+                    Some(ts) => self.apply_oracle_log(ev, ts),
+                    None => self.held.push(ev),
+                }
+            }
+        }
+    }
+
+    fn apply_oracle_log(&mut self, ev: oracle_logs::OracleLogEvent, ts: u64) {
+        use oracle_logs::OracleLogEvent as E;
+        let (applied, path, aggregator, at) = match ev {
+            E::Transmission { aggregator, round, answer, at } => (Some(self.model.apply_transmission(aggregator, round, answer, ts)), oracle::Path::Primary, aggregator, at),
+            E::Secondary { aggregator, round, at } => (self.model.apply_secondary_round(aggregator, round, ts), oracle::Path::Secondary, aggregator, at),
+            _ => return,
+        };
+        self.max_update_block = self.max_update_block.max(at.block);
+        let outcome = match &applied {
+            Some(oracle::Applied::Moved(m)) => format!("moved {}", m.len()),
+            Some(oracle::Applied::Deferred(_)) => "deferred".into(),
+            Some(oracle::Applied::Rejected(why)) => format!("rejected: {why}"),
+            None => {
+                // A secondary with no pending answer of its round: the transmit was missed.
+                self.resync_all = true;
+                "no pending answer".into()
+            }
+        };
+        info!(%aggregator, block = at.block, path = ?path, outcome, "ORACLE log");
+        let _ = self.journal_tx.send(json!({ "kind": "oracle_log", "block": at.block, "tx": at.tx, "aggregator": aggregator, "path": path, "outcome": outcome }).to_string());
+    }
+
+    /// Per block: held logs of this block or earlier, SVR primaries past their cutoff, and the
+    /// cross-check of the PREVIOUS block's snapshot against the model (one block later, so that the
+    /// logs of that block have arrived; a mismatch is a missed event: resynced and counted).
+    async fn on_head(&mut self, head: &Head, prev: Option<(u64, &[Option<morpho::onchain::MarketSnapshot>])>) {
+        self.block_ts.insert(head.number, head.timestamp);
+        self.block_ts.retain(|b, _| b + BLOCK_TS_KEEP > head.number);
+        for ev in std::mem::take(&mut self.held) {
+            let Some(at) = ev.pos() else { continue };
+            if at.block > head.number {
+                self.held.push(ev);
+                continue;
+            }
+            let ts = match self.block_ts.get(&at.block) {
+                Some(ts) => *ts,
+                None => match heads::http_head(&self.provider, BlockNumberOrTag::Number(at.block)).await {
+                    Ok(h) => h.timestamp,
+                    Err(e) => {
+                        warn!(block = at.block, error = %e, "no timestamp for an oracle log's block; dropped (resync catches up)");
+                        self.resync_all = true;
+                        continue;
+                    }
+                },
+            };
+            self.apply_oracle_log(ev, ts);
+        }
+        for (aggregator, answer) in self.model.due(head.timestamp, self.svr_cutoff_secs) {
+            let r = self.model.apply(aggregator, answer, oracle::Path::Expired, head.timestamp);
+            info!(%aggregator, block = head.number, outcome = ?r, "ORACLE SVR primary past its cutoff");
+        }
+        let Some((prev_block, snaps)) = prev else { return };
+        if !(self.resync_all || self.max_update_block <= prev_block) {
+            return;
+        }
+        let before = self.model.aggregators();
+        let mut missed = 0;
+        for (mi, s) in snaps.iter().enumerate() {
+            if let Some(s) = s.as_ref().filter(|_| self.model.is_modelled(mi))
+                && self.model.price(mi) != Some(s.price)
+            {
+                missed += 1;
+                self.model.resync(&self.provider, mi, s.price, prev_block.into()).await;
+            }
+        }
+        if missed > 0 && !self.resync_all {
+            self.missed_streak += 1;
+            warn!(block = prev_block, markets = missed, streak = self.missed_streak, "oracle logs missed an update");
+            if self.missed_streak >= 3 {
+                self.logs.reconnect();
+                self.missed_streak = 0;
+            }
+        } else if missed == 0 {
+            self.missed_streak = 0;
+        }
+        self.resync_all = false;
+        let after = self.model.aggregators();
+        if after != before {
+            self.logs.set_addresses(after);
+        }
+    }
+
+    /// Journals the auctions the feed task dropped since the last call.
+    fn journal_dropped(&mut self, block: u64) {
+        let n = self.dropped.load(std::sync::atomic::Ordering::Relaxed);
+        if n > self.dropped_journaled {
+            warn!(dropped = n - self.dropped_journaled, "atlas_dropped: side event channel was full");
+            let _ = self.journal_tx.send(json!({ "kind": "atlas_dropped", "block": block, "dropped": n - self.dropped_journaled, "total": n }).to_string());
+            self.dropped_journaled = n;
+        }
+    }
 }
 
 /// Writes the journal rows background tasks have finished.
@@ -745,32 +896,22 @@ fn drain_journal(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>, journal:
     Ok(())
 }
 
-/// One event from the flashblock stream: an oracle update, or a block opening, at which SVR
-/// primaries that no auction carried become what Morpho reads once older than the cutoff.
-#[allow(clippy::too_many_arguments)]
-async fn on_fb_event<P: Provider + Clone + 'static>(
+/// One side event: an SVR auction is valued in the background (on the previous block's snapshots,
+/// the newest the loop has), an oracle log updates the price model.
+fn on_side<P: Provider + Clone + 'static>(
     engine: &MorphoEngine<P>,
-    fb: &mut FbState<P>,
-    ev: flashblocks::FbEvent,
-    snaps: &[Option<morpho::onchain::MarketSnapshot>],
-    head: &Head,
-    eth_usd: f64,
-    block_time: f64,
+    st: &mut AtlasState<P>,
+    ev: SideEvent,
+    ctx: Option<(&[Option<morpho::onchain::MarketSnapshot>], &Head, f64, f64)>,
     parts: &Arc<PlannerParts>,
-    exec: Option<&ExecHandle>,
-    journal: &mut std::fs::File,
-) -> Result<()> {
+) {
     match ev {
-        flashblocks::FbEvent::Oracle(u) => on_oracle_update(engine, fb, u, snaps, head, eth_usd, block_time, parts, exec, journal).await?,
-        flashblocks::FbEvent::Opened { block, timestamp, seen } => {
-            for (aggregator, answer) in fb.model.due(timestamp, engine.cfg.flashblocks.svr_cutoff_secs) {
-                let u = flashblocks::OracleUpdate { aggregator, answer, path: flashblocks::Path::Expired, block, block_ts: timestamp, index: 0, tx: alloy::primitives::B256::ZERO, seen };
-                on_oracle_update(engine, fb, u, snaps, head, eth_usd, block_time, parts, exec, journal).await?;
-            }
-        }
-        flashblocks::FbEvent::Auction(a) => on_auction(engine, fb, a, snaps, head, eth_usd, parts),
+        SideEvent::Oracle(ev) => st.on_oracle_log(ev),
+        SideEvent::Auction(a) => match ctx {
+            Some((snaps, head, eth_usd, block_time)) => on_auction(engine, st, a, snaps, head, eth_usd, block_time, parts),
+            None => info!(auction = %a.id, "ATLAS auction before the first block; skipped"),
+        },
     }
-    Ok(())
 }
 
 /// Longest an auction valuation may wait for a permit before it is skipped: SVR auctions last ~2 s,
@@ -791,32 +932,34 @@ struct AuctionMarket {
 /// The price comes from the auction hint (the report about to be written). Which positions it
 /// makes liquidatable is evaluated here, in memory; the RPC work runs in a background task so a
 /// big auction (dozens of positions, several seconds) never stalls the block path.
+#[allow(clippy::too_many_arguments)]
 fn on_auction<P: Provider + Clone + 'static>(
     engine: &MorphoEngine<P>,
-    fb: &FbState<P>,
+    st: &AtlasState<P>,
     a: atlas::Auction,
     snaps: &[Option<morpho::onchain::MarketSnapshot>],
     head: &Head,
     eth_usd: f64,
+    block_time: f64,
     parts: &Arc<PlannerParts>,
 ) {
-    let markets: Vec<AuctionMarket> = fb
+    let markets: Vec<AuctionMarket> = st
         .model
         .preview(a.aggregator, a.median)
         .into_iter()
         .filter_map(|(mi, price)| snaps.get(mi).and_then(|s| s.as_ref()).map(|base| auction_market(engine, mi, base, price)))
         .collect();
-    let sim_time = head.timestamp + engine.cfg.lookahead_secs(DEFAULT_BLOCK_TIME);
+    let sim_time = head.timestamp + engine.cfg.lookahead_secs(block_time);
     let atlas = engine.cfg.atlas.clone();
-    let (provider, parts, journal, permits, head) = (fb.provider.clone(), parts.clone(), fb.journal_tx.clone(), fb.valuations.clone(), *head);
+    let (provider, parts, journal, permits, head) = (st.provider.clone(), parts.clone(), st.journal_tx.clone(), st.valuations.clone(), *head);
     // The sibling auction of the same report shares the first one's valuation.
     let shared = {
-        let mut cache = fb.auction_cache.lock().unwrap();
+        let mut cache = st.auction_cache.lock().unwrap();
         cache.retain(|_, (t, _)| t.elapsed() < Duration::from_secs(AUCTION_SHARE_SECS));
         cache.entry((a.aggregator, a.median)).or_insert_with(|| (Instant::now(), Arc::new(tokio::sync::OnceCell::new()))).1.clone()
     };
     // Valuations queue behind each other (atlas.max_concurrent, taken inside value_auction by the
-    // one that values) instead of piling onto the RPC pool the same-block path needs; the wait is
+    // one that values) instead of piling onto the RPC pool the block path needs; the wait is
     // journaled as queued_ms.
     tokio::spawn(value_auction(provider, parts, a, markets, head, eth_usd, sim_time, atlas, true, journal, Some(permits), Some(shared)));
 }
@@ -845,12 +988,13 @@ async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngi
     let mi = engine.market_by_name(market).with_context(|| format!("market {market} not in config"))?;
     anyhow::ensure!(drop_bps < 10_000, "--price-drop-bps must be < 10000");
     let h = heads::http_head(&engine.provider, BlockNumberOrTag::Number(at_block)).await?;
+    let bt = recent_block_time(&engine.provider, &h).await;
     if users.is_empty() {
         engine.refresh_borrowers(h.number.into()).await?;
     } else {
         engine.reload(&users.iter().map(|u| (mi, *u)).collect::<Vec<_>>(), h.number.into()).await?;
     }
-    let sim_time = h.timestamp + engine.cfg.lookahead_secs(DEFAULT_BLOCK_TIME);
+    let sim_time = h.timestamp + engine.cfg.lookahead_secs(bt);
     let snaps = engine.snapshots(h.number.into(), sim_time).await?;
     let eth_usd = engine.eth_usd(&snaps);
     let base = snaps[mi].clone().context("snapshot failed")?;
@@ -866,6 +1010,7 @@ async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngi
         max_fee_per_gas: 0,
         user_op_hash: alloy::primitives::B256::ZERO,
         seen: Instant::now(),
+        seen_unix_ms: gates::unix_ms(),
     };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     value_auction(engine.provider.clone(), parts, a, vec![m], h, eth_usd, sim_time, engine.cfg.atlas.clone(), use_kyber, tx, None, None).await;
@@ -1152,204 +1297,6 @@ async fn valuation<P: Provider>(
     json!({ "markets": rows, "positions": positions, "liquidatable": n_liq, "bonus_usd": bonus_sum, "bundle_net_usd": bundle_net, "net_usd": net_sum, "bundle_ms": bundle_ms_max, "valued_unix_ms": valued_unix_ms, "first_auction": a.id })
 }
 
-/// A Chainlink update seen in a flashblock: new price -> re-evaluate that market in memory ->
-/// plan the liquidatable positions on the snapshot block with the new price pinned (direct router:
-/// aggregators quote too slowly) -> journal, and send when `flashblocks.send` and live.
-#[allow(clippy::too_many_arguments)]
-async fn on_oracle_update<P: Provider + Clone>(
-    engine: &MorphoEngine<P>,
-    fb: &mut FbState<P>,
-    u: flashblocks::OracleUpdate,
-    snaps: &[Option<morpho::onchain::MarketSnapshot>],
-    head: &Head,
-    eth_usd: f64,
-    block_time: f64,
-    parts: &PlannerParts,
-    exec: Option<&ExecHandle>,
-    journal: &mut std::fs::File,
-) -> Result<()> {
-    let queue_ms = u.seen.elapsed().as_millis() as u64;
-    fb.updates += 1;
-    fb.max_update_block = fb.max_update_block.max(u.block);
-    let moved = match fb.model.apply(u.aggregator, u.answer, u.path, u.block_ts) {
-        oracle::Applied::Moved(m) => m,
-        // SVR public transmit: not what Morpho reads yet. Journal what it will do once the Atlas
-        // metacall (typically next block) puts the same answer in effect; plan nothing now.
-        oracle::Applied::Deferred(preview) => {
-            for (mi, price) in preview {
-                let Some(base) = snaps.get(mi).and_then(|s| s.as_ref()) else { continue };
-                let mut snap = base.clone();
-                snap.price = price;
-                let n = engine.evaluate_market(mi, &snap).iter().take_while(|v| v.health.is_liquidatable()).count();
-                let meta = &engine.metas[mi];
-                info!(market = %meta.name, block = u.block, flashblock = u.index, liquidatable_once_in_effect = n, "FLASHBLOCK SVR primary seen; waiting for its Atlas metacall");
-                writeln!(journal, "{}", json!({ "kind": "fb_oracle", "path": "primary_svr_pending", "block": u.block, "flashblock": u.index, "market": meta.name, "tx": u.tx, "price_new": price.to_string(), "liquidatable_once_in_effect": n, "queue_ms": queue_ms }))?;
-            }
-            return Ok(());
-        }
-        oracle::Applied::Rejected(why) => {
-            warn!(aggregator = %u.aggregator, tx = %u.tx, why, "flashblock oracle update rejected");
-            return Ok(());
-        }
-    };
-    if moved.is_empty() {
-        return Ok(());
-    }
-    // An SVR secondary is in effect only if its metacall succeeds, and the auction winner's own
-    // liquidations come with it. We do not wait for the metacall's receipt to learn either: the
-    // RPCs serve it only once the block is sealed (2026-10-20, 12 metacalls: never within 800 ms,
-    // 1.0-1.5 s for half, 3-4+ s for the rest; ordinary txs ~70 ms), long after the leftovers are
-    // gone, and waiting stalled the main loop. Instead the fresh "pending" state answers both: it
-    // already holds the metacall's effects, so it is simulated WITHOUT the price override (a failed
-    // metacall leaves the old price; a borrower the winner liquidated is healthy). The sim also
-    // reads the oracle in that same state (PriceProbe): until the node has applied the metacall
-    // (it trails the stream by ~50-100 ms) the plan counts as stale and is retried briefly. Only a
-    // fresh, probed pending plan may send (see below).
-    let planner = parts.planner(&engine.cfg.flashblocks.router);
-    let deadline_block = u.block + gates::deadline_blocks(engine.cfg.exec.deadline_secs, block_time);
-    for (mi, price) in moved {
-        fb.last_oracle.insert(mi, (u.block, u.index, u.seen));
-        let meta = &engine.metas[mi];
-        let Some(base) = snaps.get(mi).and_then(|s| s.as_ref()) else { continue };
-        let mut snap = base.clone();
-        let old = snap.price;
-        snap.price = price;
-        let t_eval = Instant::now();
-        let views = engine.evaluate_market(mi, &snap);
-        let eval_us = t_eval.elapsed().as_micros() as u64;
-        let mut cands: Vec<&PositionView> = views
-            .iter()
-            .take_while(|v| v.health.is_liquidatable())
-            .filter(|v| v.max_seize > U256::ZERO && v.bonus >= engine.cfg.min_bonus)
-            .filter(|v| fb.planned.get(&(mi, v.user)).is_none_or(|p| p.0 != u.block))
-            .collect();
-        cands.sort_by(|a, b| b.bonus.total_cmp(&a.bonus));
-        let change_bps = (math::u256_f64(price) / math::u256_f64(old).max(1.0) - 1.0) * 1e4;
-        info!(market = %meta.name, block = u.block, flashblock = u.index, path = ?u.path, change_bps, candidates = cands.len(), queue_ms, eval_us, "FLASHBLOCK oracle update");
-        writeln!(
-            journal,
-            "{}",
-            json!({ "kind": "fb_oracle", "path": u.path, "block": u.block, "flashblock": u.index, "market": meta.name, "tx": u.tx, "price_old": old.to_string(), "price_new": price.to_string(), "change_bps": change_bps, "candidates": cands.len(), "queue_ms": queue_ms, "eval_us": eval_us })
-        )?;
-        // Each candidate is planned twice, in parallel:
-        //  - on "pending", the block being built: it includes what is already in it (the
-        //    metacall's own swaps on our pools, earlier liquidations), but nodes often serve it
-        //    1-5 blocks stale, and on a stale base Morpho accrues less interest than our model.
-        //    No price override: the state must hold the update itself, and the oracle is read in
-        //    that same state (PriceProbe) to prove it does (a transmit that reverted, or an SVR
-        //    cutoff one block away, shows up as the old price instead of being papered over);
-        //  - on the block our snapshot came from (`head`), as the next block at the accrual time,
-        //    with the new price pinned by a state override: exactly the state the candidate was
-        //    computed from, minus the in-block changes.
-        // The pending plan wins when its sim provably ran on the in-progress block with the update
-        // in effect, whatever it says (a revert there is real in-block information); else the
-        // snapshot plan, which may only send for a public transmit (may_send).
-        let mut overrides = StateOverride::default();
-        overrides.insert(meta.params.oracle, AccountOverride { code: Some(sim::constant_price_oracle(price)), ..Default::default() });
-        let sim_time = head.timestamp + engine.cfg.lookahead_secs(block_time);
-        let ctxs: Vec<(PlanCtx<Morpho>, PlanCtx<Morpho>)> = cands
-            .into_iter()
-            .take(engine.cfg.flashblocks.max_plans)
-            .map(|v| {
-                let at_head = PlanCtx { meta, snap: &snap, view: v, block: head.number, base_fee_wei: head.base_fee, eth_usd, overrides: overrides.clone(), deadline_block, sim_time, pending: false, price_probe: None };
-                let probe = Some(PriceProbe { oracle: meta.params.oracle, old, new: price });
-                let on_pending = PlanCtx { block: u.block - 1, pending: true, overrides: StateOverride::default(), price_probe: probe, ..at_head };
-                (at_head, on_pending)
-            })
-            .collect();
-        // All candidates are planned at once and each is handled (journaled, sent) the moment its
-        // plan is ready: the best one never waits for the slowest. Both plans of a candidate run at
-        // once; a fresh pending plan is used as soon as it is ready (the snapshot plan is dropped).
-        let provider = fb.provider.clone();
-        let ready: futures::stream::FuturesUnordered<_> = ctxs
-            .iter()
-            .enumerate()
-            .map(|(i, (h, p))| {
-                let (planner, provider) = (&planner, &provider);
-                async move {
-                    let at_head = planner.plan(provider, h);
-                    // The pending RPCs trail the flashblock stream by ~50-100 ms: while the probe
-                    // says the node has not applied the update yet, ask again (briefly).
-                    let on_pending = async {
-                        let mut tries = 1;
-                        loop {
-                            let r = planner.plan(provider, p).await;
-                            let behind = matches!(&r, Ok(plan) if plan.stale_price || !p.is_fresh(plan));
-                            if !(behind && tries < SECONDARY_PENDING_TRIES && u.seen.elapsed() < SECONDARY_PENDING_WINDOW) {
-                                break r;
-                            }
-                            tries += 1;
-                            tokio::time::sleep(SECONDARY_PENDING_RETRY).await;
-                        }
-                    };
-                    tokio::pin!(at_head, on_pending);
-                    let mut head_done = None;
-                    let rp = loop {
-                        tokio::select! {
-                            r = &mut on_pending => break r,
-                            r = &mut at_head, if head_done.is_none() => head_done = Some(r),
-                        }
-                    };
-                    let chosen = match rp {
-                        Ok(plan) if p.is_fresh(&plan) && !plan.stale_price => (Ok(plan), "pending"),
-                        _ => (match head_done {
-                            Some(r) => r,
-                            None => at_head.await,
-                        }, "snapshot"),
-                    };
-                    (i, chosen, u.seen.elapsed().as_millis() as u64)
-                }
-            })
-            .collect();
-        let planned = &mut fb.planned;
-        let on_plan = |(i, (res, state), ready_ms): (usize, (Result<planner::Plan>, &'static str), u64), journal: &mut std::fs::File| -> Result<_> {
-            let v = ctxs[i].0.view;
-            match res {
-                Ok(plan) => {
-                    planned.insert((mi, v.user), (u.block, ready_ms, plan.net_usd));
-                    let kill = std::path::Path::new(&engine.cfg.exec.kill_switch_file).exists();
-                    let decision = risk::decide(&engine.cfg.exec, &mut parts.budget.lock().unwrap(), &plan, eth_usd, head.base_fee, head.timestamp, kill, parts.priority.bid(&meta.name, &plan, parts.competition(&meta.name, head.timestamp), eth_usd));
-                    let send_ok = may_send(u.path, state);
-                    info!(market = %meta.name, user = %v.user, hf = v.hf, block = u.block, flashblock = u.index, state, ready_ms, net_usd = ?plan.net_usd, error = ?plan.error, decision = ?decision, "FLASHBLOCK PLAN");
-                    writeln!(
-                        journal,
-                        "{}",
-                        json!({ "kind": "fb_plan", "block": u.block, "flashblock": u.index, "market": meta.name, "user": v.user, "hf": v.hf, "state": state, "send_ok": send_ok, "ready_ms": ready_ms, "plan": plan, "decision": decision })
-                    )?;
-                    if let (true, risk::Decision::Send { priority_fee_wei, .. }) = (engine.cfg.flashblocks.send && send_ok, &decision) {
-                        return Ok(Some((i, state, plan, *priority_fee_wei)));
-                    }
-                }
-                Err(e) => warn!(error = %e, market = %meta.name, user = %v.user, "flashblock planning failed"),
-            }
-            Ok(None)
-        };
-        let ctx_of = |i: usize, state: &'static str| if state == "pending" { &ctxs[i].1 } else { &ctxs[i].0 };
-        plan_and_send(ready, exec, parts, &provider, "flashblock", journal, on_plan, ctx_of, None, no_side).await?;
-    }
-    Ok(())
-}
-
-/// `plan_and_send` without side events (the same-block path itself).
-async fn no_side(_: flashblocks::FbEvent, _: &mut std::fs::File) -> Result<()> {
-    Ok(())
-}
-
-/// Pending plans whose state is behind (stale block or old oracle price) are retried up to this
-/// many times in total, SECONDARY_PENDING_RETRY apart, while the update is younger than
-/// SECONDARY_PENDING_WINDOW (later the leftovers are usually gone anyway).
-const SECONDARY_PENDING_TRIES: u32 = 4;
-const SECONDARY_PENDING_RETRY: Duration = Duration::from_millis(80);
-const SECONDARY_PENDING_WINDOW: Duration = Duration::from_millis(600);
-
-/// May a same-block plan be sent? A public transmit (Primary) is in effect once included, so its
-/// snapshot plan (new price pinned) may send too. An SVR secondary or an expired SVR primary only
-/// from the fresh pending state with the price proved there: whether the metacall succeeded (and
-/// which borrowers it liquidated), or whether the cutoff has passed, is visible only there.
-fn may_send(path: flashblocks::Path, state: &str) -> bool {
-    path == flashblocks::Path::Primary || state == "pending"
-}
-
 /// The risk gate's bid, checked at its own priority. The plan was simulated at the base priority;
 /// pools that read tx.gasprice (priority-fee taxes, dynamic fees) pay out less at a higher bid, so
 /// the plan is simulated again at the bid and the bid is kept only if it still clears min_net_usd
@@ -1463,9 +1410,8 @@ fn tx_key(v: &PositionView) -> executor::TxKey {
 /// on a state that includes the first. `on_plan` journals a plan and returns the bid to send it at
 /// (None = not sent); `ctx_of(i, plan_state)` gives the context it was planned on.
 ///
-/// `side` = flashblock events that must not wait for this batch (the block path passes the
-/// stream): each one is handled by `on_side` the moment it arrives, ahead of the batch, whose
-/// planning resumes afterwards.
+/// `side` = auctions and oracle logs that must not wait for this batch: each one is handled by
+/// `on_side` the moment it arrives, ahead of the batch, whose planning resumes afterwards.
 #[allow(clippy::too_many_arguments)]
 async fn plan_and_send<'c, P, S, R, F, C, G>(
     mut ready: S,
@@ -1476,7 +1422,7 @@ async fn plan_and_send<'c, P, S, R, F, C, G>(
     journal: &mut std::fs::File,
     mut on_plan: F,
     ctx_of: C,
-    mut side: Option<&mut tokio::sync::mpsc::Receiver<flashblocks::FbEvent>>,
+    mut side: Option<&mut tokio::sync::mpsc::Receiver<SideEvent>>,
     mut on_side: G,
 ) -> Result<()>
 where
@@ -1484,7 +1430,7 @@ where
     S: futures::Stream<Item = R> + Unpin,
     F: FnMut(R, &mut std::fs::File) -> Result<Option<(usize, &'static str, planner::Plan, u128)>>,
     C: Fn(usize, &'static str) -> &'c PlanCtx<'c, Morpho>,
-    G: AsyncFnMut(flashblocks::FbEvent, &mut std::fs::File) -> Result<()>,
+    G: AsyncFnMut(SideEvent, &mut std::fs::File) -> Result<()>,
 {
     use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
     let mut sending: FuturesUnordered<futures::future::BoxFuture<'_, Option<executor::Inflight>>> = FuturesUnordered::new();
@@ -1544,7 +1490,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     pool: rpc::RpcPool,
     ws_endpoints: Vec<(String, String)>,
     live: Option<(alloy::signers::local::PrivateKeySigner, Vec<(String, String)>)>,
-    fb_provider: Option<(P, rpc::RpcPool)>,
+    atlas_pool: Option<(P, rpc::RpcPool)>,
     auction: Arc<dyn AuctionBidPolicy>,
     priority: Arc<dyn PriorityBidPolicy>,
 ) -> Result<()> {
@@ -1589,45 +1535,75 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     };
     // Background borrower refresh (see the end of the loop).
     let mut refresh_job: Option<tokio::task::JoinHandle<BorrowerRefresh>> = None;
-    // Observed block time (for deadline_secs -> blocks): anchor on the first live block.
-    let mut bt_anchor: Option<(u64, u64)> = None;
-    let mut known_tip = heads::http_head(&engine.provider, BlockNumberOrTag::Latest).await?.number;
+    // Observed block time (for deadline_secs -> blocks and the accrual lookahead).
+    let mut clock = BlockClock::default();
+    let tip = heads::http_head(&engine.provider, BlockNumberOrTag::Latest).await?;
+    let mut known_tip = tip.number;
+    if let Ok(back) = heads::http_head(&engine.provider, BlockNumberOrTag::Number(tip.number.saturating_sub(10))).await {
+        clock.push(back.number, back.timestamp);
+    }
+    clock.push(tip.number, tip.timestamp);
     let mut last_block = from_block.map(|b| b - 1).unwrap_or(known_tip);
     engine.refresh_borrowers(last_block.into()).await?;
     let mut last_refresh = Instant::now();
     let ws_names: Vec<String> = ws_endpoints.iter().map(|w| w.0.clone()).collect();
+    let logs_ws = ws_endpoints.first().cloned();
     let mut ws = (!ws_endpoints.is_empty()).then(|| heads::spawn_ws_many(ws_endpoints));
     // Which source delivered each processed block first (WS endpoint index, or HTTP polling).
     let mut head_wins: HashMap<usize, u64> = HashMap::new();
     let mut prev_snaps: Option<Vec<Option<morpho::onchain::MarketSnapshot>>> = None;
     let market_ids = engine.market_ids();
     let liquidator = venue::LiquidationVenue::<Morpho>::target(&parts.venue);
-    seed_winning_bids(&parts, &engine.cfg.journal_path, liquidator, engine.cfg.flashblocks.atlas);
+    seed_winning_bids(&parts, &engine.cfg.journal_path, liquidator, engine.cfg.atlas.address);
     if exec.is_some() {
         warn!(from_block = last_block + 1, ws = ws.is_some(), %liquidator, max_inflight = engine.cfg.exec.max_inflight, "LIVE mode: watching blocks, approved liquidations WILL be sent");
     } else {
         info!(from_block = last_block + 1, ws = ws.is_some(), %liquidator, "shadow mode: watching blocks, nothing will be sent");
     }
 
-    // Rows finished by background tasks (auction valuations), written by this loop.
+    // Rows finished by background tasks (auction valuations, oracle logs), written by this loop.
     let (journal_tx, mut journal_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    // Same-block mode: local oracle prices + the flashblock stream (live replay only).
-    let mut fb: Option<FbState<P>> = match fb_provider {
-        Some((provider, fb_pool)) if from_block.is_none() => {
-            let model = oracle::PriceModel::load(&engine.provider, &engine.metas, alloy::eips::BlockId::latest()).await;
-            let stream = flashblocks::spawn(engine.cfg.flashblocks.ws.clone(), model.watched(), engine.cfg.flashblocks.atlas);
-            if engine.cfg.atlas.observe {
-                atlas::spawn(engine.cfg.atlas.ws.clone(), engine.cfg.chain_id, engine.cfg.atlas.control, stream.sender.clone());
-                info!("atlas solver phase 0: valuing SVR auctions, never bidding");
-            }
-            info!(send = engine.cfg.flashblocks.send && exec.is_some(), "flashblocks mode: reacting to oracle updates inside the block");
-            Some(FbState { provider, pool: fb_pool, stream, model, last_oracle: HashMap::new(), planned: HashMap::new(), max_update_block: 0, updates: 0, started: Instant::now(), journal_tx: journal_tx.clone(), valuations: Arc::new(tokio::sync::Semaphore::new(engine.cfg.atlas.max_concurrent.max(1))), auction_cache: Arc::default() })
-        }
-        _ => None,
-    };
+    // The Atlas path: SVR auctions and the oracle logs that keep the price model current, on one
+    // channel the loop serves while waiting for a head, while fetching, and while planning.
+    let (side_tx, side_rx) = tokio::sync::mpsc::channel::<SideEvent>(SIDE_CHANNEL);
+    let mut side_rx = Some(side_rx);
+    let mut atlas_st: Option<AtlasState<P>> = None;
+    if engine.cfg.atlas.observe && from_block.is_none() {
+        let model = oracle::PriceModel::load(&engine.provider, &engine.metas, alloy::eips::BlockId::latest()).await;
+        let (name, url) = logs_ws.context("[atlas] observe needs a WebSocket endpoint ([[rpc]] ws) for the oracle logs")?;
+        let logs = oracle_logs::spawn(name, url, model.aggregators(), side_tx.clone());
+        let dropped = atlas::spawn(engine.cfg.atlas.ws.clone(), engine.cfg.chain_id, engine.cfg.atlas.control, side_tx.clone());
+        let (provider, own_pool) = match atlas_pool {
+            Some((p, pool)) => (p, Some(pool)),
+            None => (engine.provider.clone(), None),
+        };
+        info!(own_pool = own_pool.is_some(), "atlas: valuing SVR auctions; price model from the oracle logs");
+        atlas_st = Some(AtlasState {
+            provider,
+            pool: own_pool,
+            model,
+            logs,
+            block_ts: HashMap::new(),
+            held: vec![],
+            max_update_block: 0,
+            missed_streak: 0,
+            resync_all: false,
+            svr_cutoff_secs: engine.cfg.atlas.svr_cutoff_secs,
+            journal_tx: journal_tx.clone(),
+            valuations: Arc::new(tokio::sync::Semaphore::new(engine.cfg.atlas.max_concurrent.max(1))),
+            auction_cache: Arc::default(),
+            dropped,
+            dropped_journaled: 0,
+        });
+    }
+    drop(side_tx);
     let run_started = Instant::now();
-    // Context a mid-block oracle update needs: the latest processed head, ETH price, block time.
+    // Context a side event needs: the latest processed head, ETH price, block time.
     let mut last_ctx: Option<(Head, f64, f64)> = None;
+    let mut last_minute = Instant::now();
+    let mut last_usage = Instant::now();
+    let mut head_ms: Vec<u64> = Vec::new();
+    let mut skipped_heads = 0u64;
 
     loop {
         // Live: newest head. Replaying: step one block at a time so nothing is skipped.
@@ -1635,30 +1611,27 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         let head = if replaying {
             heads::http_head(&engine.provider, BlockNumberOrTag::Number(last_block + 1)).await
         } else {
-            // While waiting for the next block, handle oracle updates seen in flashblocks.
+            // While waiting for the next block, handle auctions and oracle logs.
             loop {
-                enum Ev {
-                    Head(Result<Head>),
-                    Oracle(Option<flashblocks::FbEvent>),
-                }
-                let ev = match fb.as_mut() {
-                    Some(f) => tokio::select! {
-                        u = f.stream.updates.recv() => Ev::Oracle(u),
-                        h = wait_head(&mut ws, Some(&mut f.stream.sealed), &engine.provider, last_block, engine.cfg.poll_ms) => Ev::Head(h),
+                let ev = match side_rx.as_mut() {
+                    Some(rx) => tokio::select! {
+                        ev = rx.recv() => Err(ev),
+                        h = wait_head(&mut ws, &engine.provider, last_block, engine.cfg.poll_ms) => Ok(h),
                     },
-                    None => Ev::Head(wait_head(&mut ws, None, &engine.provider, last_block, engine.cfg.poll_ms).await),
+                    None => Ok(wait_head(&mut ws, &engine.provider, last_block, engine.cfg.poll_ms).await),
                 };
                 match ev {
-                    Ev::Head(h) => break h,
-                    Ev::Oracle(Some(u)) => {
-                        if let (Some(f), Some(snaps), Some((h, eth_usd, bt))) = (fb.as_mut(), prev_snaps.as_ref(), last_ctx.as_ref()) {
-                            on_fb_event(engine, f, u, snaps, h, *eth_usd, *bt, &parts, exec.as_ref(), &mut journal).await?;
+                    Ok(h) => break h,
+                    Err(Some(ev)) => {
+                        if let Some(st) = atlas_st.as_mut() {
+                            let ctx = prev_snaps.as_deref().zip(last_ctx.as_ref()).map(|(s, (h, eth, bt))| (s, h, *eth, *bt));
+                            on_side(engine, st, ev, ctx, &parts);
                             drain_journal(&mut journal_rx, &mut journal)?;
                         }
                     }
-                    Ev::Oracle(None) => {
-                        warn!("flashblocks stream task ended; same-block mode off");
-                        fb = None;
+                    Err(None) => {
+                        warn!("side event tasks ended; Atlas path off");
+                        side_rx = None;
                     }
                 }
             }
@@ -1675,17 +1648,18 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         let number = h.number;
         // The executor task checks its txs in flight on this block, alongside the fetch below.
         blocks_tx.send_replace(number);
-        if !replaying && bt_anchor.is_none() {
-            bt_anchor = Some((number, h.timestamp));
+        if !replaying {
+            clock.push(number, h.timestamp);
         }
-        let block_time = match bt_anchor {
-            Some((n0, t0)) if number >= n0 + 10 && h.timestamp > t0 => (h.timestamp - t0) as f64 / (number - n0) as f64,
-            _ => DEFAULT_BLOCK_TIME,
-        };
+        let block_time = clock.block_time();
         let deadline_block = number + gates::deadline_blocks(engine.cfg.exec.deadline_secs, block_time);
+        let replan_blocks = engine.cfg.exec.replan_secs.map_or(engine.cfg.exec.replan_blocks, |s| (s / block_time).ceil().max(1.0) as u64);
         let t0 = Instant::now();
 
         let gap = number - last_block;
+        if gap > 1 && !replaying {
+            skipped_heads += gap - 1;
+        }
         if gap > engine.cfg.max_log_range && !replaying {
             // Too far behind for one getLogs: liquidations in the gap are not analysed.
             warn!(gap, "fell behind; full reload");
@@ -1695,15 +1669,18 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             last_block = number - 1;
             prev_snaps = None;
         }
+        // The Atlas price model: held oracle logs, SVR cutoffs, and the previous block's cross-check.
+        if let Some(st) = atlas_st.as_mut() {
+            st.on_head(&h, prev_snaps.as_deref().map(|s| (last_block, s))).await;
+        }
 
         // 1. Events since the last block and fresh market snapshots, fetched in parallel.
         //    Interest is accrued to ~the next block so interest-only crossings show up early.
         let accrue_to = h.timestamp + engine.cfg.lookahead_secs(block_time);
         let from_block_logs = last_block + 1;
-        // The fetch is most of a block's processing time (~270 ms without alchemy): oracle updates
-        // seen meanwhile are handled right away instead of queueing behind the block path (seen:
-        // 165 ms queue delay in the 2026-10-18 shadow run). Scoped so the future (and its borrows
-        // of engine / prev_snaps) is gone before the block path mutates them.
+        // Side events arriving meanwhile are handled right away instead of queueing behind the
+        // block path. Scoped so the future (and its borrows of engine / prev_snaps) is gone before
+        // the block path mutates them.
         let (touched, snaps) = {
             let fetch = async {
                 tokio::join!(
@@ -1718,14 +1695,13 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             };
             tokio::pin!(fetch);
             loop {
-                let Some(f) = fb.as_mut() else { break fetch.await };
+                let (Some(st), Some(rx)) = (atlas_st.as_mut(), side_rx.as_mut()) else { break fetch.await };
                 tokio::select! {
                     r = &mut fetch => break r,
-                    Some(u) = f.stream.updates.recv() => {
-                        if let (Some(prev), Some((lh, eth, bt))) = (prev_snaps.as_ref(), last_ctx.as_ref()) {
-                            on_fb_event(engine, f, u, prev, lh, *eth, *bt, &parts, exec.as_ref(), &mut journal).await?;
-                            drain_journal(&mut journal_rx, &mut journal)?;
-                        }
+                    Some(ev) = rx.recv() => {
+                        let ctx = prev_snaps.as_deref().zip(last_ctx.as_ref()).map(|(s, (lh, eth, bt))| (s, lh, *eth, *bt));
+                        on_side(engine, st, ev, ctx, &parts);
+                        drain_journal(&mut journal_rx, &mut journal)?;
                     }
                 }
             }
@@ -1798,7 +1774,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             let meta = &engine.metas[v.market];
             let key = (v.market, v.user);
             let kind = if v.health.is_liquidatable() && v.max_seize > U256::ZERO && v.bonus >= engine.cfg.min_bonus {
-                if !replaying && last_planned.get(&key).is_none_or(|b| number >= b + engine.cfg.exec.replan_blocks) {
+                if !replaying && last_planned.get(&key).is_none_or(|b| number >= b + replan_blocks) {
                     to_plan.push(v);
                 }
                 "candidate"
@@ -1874,44 +1850,26 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             }
             Ok(None)
         };
-        // Oracle updates seen while this batch is planned are handled at once (on the previous
-        // block's snapshots, like those seen during the fetch above), not after the batch: the
-        // stream's receiver is lent to plan_and_send for the duration.
-        let mut fb_events = fb.as_mut().map(|f| std::mem::replace(&mut f.stream.updates, tokio::sync::mpsc::channel(1).1));
+        // Side events arriving while this batch is planned are handled at once (on the previous
+        // block's snapshots, like those seen during the fetch above), not after the batch.
         let batch = {
-            let (fb, journal_rx) = (&mut fb, &mut journal_rx);
-            let (prev_snaps, last_ctx, parts, exec) = (&prev_snaps, &last_ctx, &parts, exec.as_ref());
+            let (st, journal_rx) = (&mut atlas_st, &mut journal_rx);
+            let (prev_snaps, last_ctx, parts) = (&prev_snaps, &last_ctx, &parts);
             let engine = &*engine;
-            let on_side = async move |ev: flashblocks::FbEvent, journal: &mut std::fs::File| -> Result<()> {
-                if let (Some(f), Some(prev), Some((lh, eth, bt))) = (fb.as_mut(), prev_snaps.as_ref(), last_ctx.as_ref()) {
-                    on_fb_event(engine, f, ev, prev, lh, *eth, *bt, parts, exec, journal).await?;
+            let on_side = async move |ev: SideEvent, journal: &mut std::fs::File| -> Result<()> {
+                if let Some(st) = st.as_mut() {
+                    let ctx = prev_snaps.as_deref().zip(last_ctx.as_ref()).map(|(s, (lh, eth, bt))| (s, lh, *eth, *bt));
+                    on_side(engine, st, ev, ctx, parts);
                     drain_journal(journal_rx, journal)?;
                 }
                 Ok(())
             };
-            plan_and_send(ready, exec, parts, &engine.provider, "block", &mut journal, on_plan, |i, _| &ctxs[i], fb_events.as_mut(), on_side).await
+            plan_and_send(ready, exec.as_ref(), parts, &engine.provider, "block", &mut journal, on_plan, |i, _| &ctxs[i], side_rx.as_mut(), on_side).await
         };
-        if let (Some(f), Some(rx)) = (fb.as_mut(), fb_events) {
-            f.stream.updates = rx;
-        }
         batch?;
         // The plans borrow this block's snapshots and the engine: release them before both move on.
         drop(ctxs);
         last_ctx = Some((h, eth_usd, block_time));
-        if let Some(f) = fb.as_mut() {
-            // The model runs ahead of sealed blocks; once they have caught up it must equal the
-            // chain (else an update was missed or reverted, or an aggregator was swapped).
-            if f.max_update_block <= number {
-                for (mi, s) in snaps.iter().enumerate() {
-                    if let Some(s) = s.as_ref().filter(|_| f.model.is_modelled(mi))
-                        && f.model.price(mi) != Some(s.price)
-                    {
-                        f.model.resync(&engine.provider, mi, s.price, number.into()).await;
-                    }
-                }
-            }
-            f.planned.retain(|_, p| p.0 + 30 > number);
-        }
         drain_journal(&mut journal_rx, &mut journal)?;
         prev_snaps = Some(snaps);
 
@@ -1922,7 +1880,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                 match cost {
                     Ok((eoa, to, prio, fee)) => {
                         row.apply_tx(loss::TxInfo { eoa, to, priority_fee_wei: prio, fee_wei: fee }, eth_usd);
-                        parts.observe_winner(row, liquidator, engine.cfg.flashblocks.atlas);
+                        parts.observe_winner(row, liquidator, engine.cfg.atlas.address);
                     }
                     Err(e) => warn!(tx = %row.tx, error = %e, "receipt lookup failed"),
                 }
@@ -1931,32 +1889,6 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                     gross = row.gross_bonus, outcome = %row.outcome, delay = ?row.delay_blocks, "LIQUIDATION observed"
                 );
                 writeln!(journal, "{}", serde_json::to_string(&*row)?)?;
-                // Same-block race: which flashblock the winner landed in vs when we were ready.
-                if let (Some(f), Some(mi)) = (fb.as_ref(), engine.market_by_name(&row.market)) {
-                    let winner = f.stream.seen.lock().unwrap().get(&row.tx).copied();
-                    let oracle = f.last_oracle.get(&mi).filter(|o| o.0 == row.block).copied();
-                    let ours = f.planned.get(&(mi, row.borrower)).filter(|p| p.0 == row.block).copied();
-                    let winner_after_oracle_ms = match (winner, oracle) {
-                        (Some(w), Some(o)) => Some(w.at.saturating_duration_since(o.2).as_millis() as i64),
-                        _ => None,
-                    };
-                    let verdict = match (oracle, ours, winner_after_oracle_ms) {
-                        (None, _, _) => "no_oracle_update_this_block",
-                        (Some(_), None, _) => "not_planned",
-                        (Some(_), Some(p), Some(w)) if (p.1 as i64) < w => "ready_before_winner_flashblock",
-                        (Some(_), Some(_), Some(_)) => "ready_after_winner_flashblock",
-                        (Some(_), Some(_), None) => "winner_not_in_stream",
-                    };
-                    info!(market = %row.market, borrower = %row.borrower, winner_flashblock = ?winner.map(|w| w.index), oracle_flashblock = ?oracle.map(|o| o.1), our_ready_ms = ?ours.map(|p| p.1), ?winner_after_oracle_ms, verdict, "FLASHBLOCK race");
-                    writeln!(
-                        journal,
-                        "{}",
-                        json!({ "kind": "fb_race", "block": row.block, "market": row.market, "borrower": row.borrower, "tx": row.tx,
-                                "winner_flashblock": winner.map(|w| w.index), "winner_block_in_stream": winner.map(|w| w.block),
-                                "oracle_flashblock": oracle.map(|o| o.1), "winner_after_oracle_ms": winner_after_oracle_ms,
-                                "our_ready_after_oracle_ms": ours.map(|p| p.1), "our_net_usd": ours.and_then(|p| p.2), "verdict": verdict })
-                    )?;
-                }
             }
         }
 
@@ -1987,8 +1919,10 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             block = number, tracked = views.len(), touched, planned, fetch_ms, reload_ms, eval_us, decide_ms, head_age_ms,
             "block"
         );
+        head_ms.push(h.seen_at.elapsed().as_millis() as u64);
         *head_wins.entry(h.source).or_default() += 1;
-        if number % 30 == 0 {
+        if last_minute.elapsed() >= Duration::from_secs(60) {
+            last_minute = Instant::now();
             let wins: Vec<String> = head_wins
                 .iter()
                 .map(|(i, n)| format!("{}={n}", if *i == heads::SOURCE_FLASHBLOCK { "flashblock" } else { ws_names.get(*i).map(String::as_str).unwrap_or("http-poll") }))
@@ -1998,22 +1932,24 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                 .iter()
                 .map(|e| format!("{}: req {} failover {} (lag {}) hedge {} ewma {:.0}ms{}", e.name, e.requests, e.failovers, e.lagging, e.hedges, e.ewma_ms, if e.cooling { " COOLING" } else { "" }))
                 .collect();
-            info!(?wins, ?rpc, "source stats");
-            if let Some(f) = fb.as_ref() {
-                let age_ms = f.stream.last_msg.lock().unwrap().map(|t| t.elapsed().as_millis() as u64);
-                let seen = f.stream.seen.lock().unwrap().len();
-                info!(updates = f.updates, last_msg_age_ms = ?age_ms, txs_tracked = seen, "flashblocks stats");
-                // Never connected yet is only a problem once startup is well over.
-                if age_ms.map_or(f.started.elapsed() > Duration::from_secs(30), |a| a > 5_000) {
-                    warn!("flashblocks stream silent for >5 s: same-block mode is blind until it reconnects");
-                }
+            head_ms.sort_unstable();
+            let head_ms_p50 = head_ms.get(head_ms.len() / 2).copied();
+            info!(?wins, ?rpc, ?head_ms_p50, heads = head_ms.len(), skipped_heads, block_time, "source stats");
+            head_ms.clear();
+            skipped_heads = 0;
+            if let Some(st) = atlas_st.as_mut() {
+                st.journal_dropped(number);
+                drain_journal(&mut journal_rx, &mut journal)?;
             }
         }
-        // Quota accounting: cumulative attempts per (endpoint, method), journaled every ~10 min.
-        if number % 300 == 0 {
-            let mut usage: Vec<serde_json::Value> = pool.method_report().into_iter().map(|(e, m, n)| json!({"pool": "main", "endpoint": e, "method": m, "n": n})).collect();
-            if let Some(f) = fb.as_ref() {
-                usage.extend(f.pool.method_report().into_iter().map(|(e, m, n)| json!({"pool": "pending", "endpoint": e, "method": m, "n": n})));
+        // Quota and egress accounting: cumulative attempts and request bytes per (endpoint, method),
+        // journaled every ~10 min.
+        if last_usage.elapsed() >= Duration::from_secs(600) {
+            last_usage = Instant::now();
+            let row = |pool_name: &str, (e, m, n, b): (String, String, u64, u64)| json!({"pool": pool_name, "endpoint": e, "method": m, "n": n, "bytes_out": b});
+            let mut usage: Vec<serde_json::Value> = pool.method_bytes_report().into_iter().map(|r| row("main", r)).collect();
+            if let Some(p) = atlas_st.as_ref().and_then(|st| st.pool.as_ref()) {
+                usage.extend(p.method_bytes_report().into_iter().map(|r| row("atlas", r)));
             }
             info!(uptime_s = run_started.elapsed().as_secs(), entries = usage.len(), "rpc method usage journaled");
             writeln!(journal, "{}", json!({ "kind": "rpc_usage", "block": number, "uptime_s": run_started.elapsed().as_secs(), "usage": usage }))?;
@@ -2029,7 +1965,7 @@ fn price_human(price: U256, meta: &MarketMeta) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::may_send;
+    use super::*;
 
     #[test]
     fn loopback_urls_are_recognized() {
@@ -2042,16 +1978,23 @@ mod tests {
     }
 
     #[test]
-    fn secondary_sends_only_from_fresh_pending_state() {
-        // SVR secondary: only the pending state knows whether the metacall worked and whom it took.
-        use crate::flashblocks::Path;
-        assert!(may_send(Path::Secondary, "pending"));
-        assert!(!may_send(Path::Secondary, "snapshot"));
-        // An expired SVR primary takes effect only past the cutoff: proven in the pending state only.
-        assert!(may_send(Path::Expired, "pending"));
-        assert!(!may_send(Path::Expired, "snapshot"));
-        // A public transmit is in effect once included.
-        assert!(may_send(Path::Primary, "pending"));
-        assert!(may_send(Path::Primary, "snapshot"));
+    fn block_clock_follows_a_block_time_change_within_its_window() {
+        let mut c = BlockClock::default();
+        assert_eq!(c.block_time(), 2.0, "nothing measured yet");
+        // 2 s blocks (Base before Denim)...
+        for n in 0..50u64 {
+            c.push(1000 + n, 10_000 + 2 * n);
+        }
+        assert_eq!(c.block_time(), 2.0);
+        // ...then 5 blocks a second: within one window the estimate is the new block time. Timestamps
+        // are whole seconds, so 50 heads span 10 s.
+        let (n0, t0) = (1050u64, 10_100u64);
+        for k in 0..50u64 {
+            c.push(n0 + k, t0 + k / 5);
+        }
+        assert!((c.block_time() - 0.2).abs() < 0.05, "{}", c.block_time());
+        // An old or repeated head changes nothing.
+        c.push(1000, 1);
+        assert!((c.block_time() - 0.2).abs() < 0.05);
     }
 }

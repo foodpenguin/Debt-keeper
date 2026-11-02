@@ -30,6 +30,7 @@ pub mod live;
 pub mod loss;
 pub mod morpho;
 pub mod oracle;
+pub mod oracle_logs;
 pub mod planner;
 pub mod policy;
 pub mod protocol;
