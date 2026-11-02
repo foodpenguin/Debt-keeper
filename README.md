@@ -18,8 +18,8 @@ shared with [Arb-seeker](https://github.com/foodpenguin/Arb-seeker). This crate 
 
 **Scope today.** Generic (the `liquidation_framework` library): the HF engine, the planner, the
 venue / DEX / funding seams and their venues, the risk gate and bidding; plus `onchain-core`'s
-executor and RPC plumbing. Still Morpho-bound: the application loop in `main.rs`
-(block and same-block paths, send path, pre-flight), the oracle price model, the Atlas valuation,
+executor and RPC plumbing. Still Morpho-bound: the application loop in `runner.rs`
+(block and Atlas paths, send path, pre-flight; a binary runs it with its own bidding policies), the oracle price model, the Atlas valuation,
 the dashboard and the loss analysis. A new protocol reuses the generic core, but needs its own
 application loop for now (see [docs/architecture.md](docs/architecture.md#scope-what-is-generic-today)).
 
@@ -63,7 +63,10 @@ application loop for now (see [docs/architecture.md](docs/architecture.md#scope-
 
 ```
 bot/src/
-  lib.rs        the library; main.rs is the Morpho bot built on it
+  lib.rs        the library; main.rs is the Morpho bot's CLI built on it
+  runner.rs     the watch loop (Runner::build / run) and the diagnostic commands
+  policy.rs     AuctionBidPolicy / PriorityBidPolicy: what a binary plugs its bidding into
+  ledger.rs     the day's failed gas, Atlas bond and PnL (persisted live), the loss stop
   protocol.rs   LendingProtocol: the seam a lending protocol implements
   engine.rs     generic health-factor engine
   venue.rs      LiquidationVenue: how a liquidation is encoded and simulated
@@ -77,7 +80,8 @@ bot/src/
   atlas_submit.rs  solver operations: EIP-712 signing, submission to the SVR bid endpoint
   router.rs     KyberSwap (first Dex)
   v3router.rs   self-built direct V3/CL router (GridQuoter-based quoting)
-  flashblocks.rs  oracle updates decoded from the Flashblocks stream
+  oracle_logs.rs  Chainlink updates from canonical-block logs (the Atlas price model)
+  flashblocks.rs  Flashblocks stream decoding (examples only; Denim removes Flashblocks)
   oracle.rs risk.rs atlas.rs   oracle model, risk gate (bid curve), SVR auctions
   dash/ live.rs loss.rs        dashboard, live page, post-mortems of missed liquidations
   testkit.rs    test doubles (toy protocol, mock venue, mock DEX)
