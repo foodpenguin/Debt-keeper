@@ -29,6 +29,11 @@ cd contracts && forge build && forge test   # fork 測試需要 BASE_RPC_URL；�
 
 改到任何會送交易的程式時，還必須在本地 anvil fork 上通過 `cargo test e2e -- --ignored`。
 
+## 發布
+
+發布就是在 `main` 上打 tag `vX.Y.Z`。同一個 commit 要把 `bot/Cargo.toml` 的 `version` 改成
+`X.Y.Z`，並在 `CHANGELOG.md` 加一筆紀錄。已經發布的 tag 不會再移動，要修正就發下一個 patch 版本。
+
 ## 原則
 
 - **透過 trait 擴充**，不要在核心裡加特例。新的協議、DEX 或 venue 要附一個用它驅動引擎和／或

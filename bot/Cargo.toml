@@ -1,6 +1,6 @@
 [package]
 name = "liquidation-framework"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2024"
 description = "Liquidation bot framework: generic health-factor engine and planner, Morpho Blue on Base as the first implementation"
 license = "AGPL-3.0-or-later"
