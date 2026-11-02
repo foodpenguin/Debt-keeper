@@ -54,6 +54,8 @@ pub struct RunnerInputs {
     pub signer: Option<alloy::signers::local::PrivateKeySigner>,
     /// `run` replays from this past block (needs an RPC with historical state).
     pub from_block: Option<u64>,
+    /// `run` returns once this turns true (tests; None = run until an error).
+    pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// The connected bot: RPC pools, the Morpho engine and, in live mode, the signer and its broadcast
@@ -66,6 +68,7 @@ pub struct Runner<P> {
     /// Valuation endpoints of the Atlas path (`[atlas] rpc`), when its own.
     atlas_pool: Option<(P, rpc::RpcPool)>,
     from_block: Option<u64>,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     auction: Arc<dyn AuctionBidPolicy>,
     priority: Arc<dyn PriorityBidPolicy>,
 }
@@ -74,7 +77,7 @@ impl Runner<()> {
     /// Connects to the configured endpoints and loads the markets. `auction` and `priority` decide
     /// the bids (`policy::defaults` for the `[atlas]` margin and the `[exec]` bid curve).
     pub async fn build(inputs: RunnerInputs, auction: impl AuctionBidPolicy, priority: impl PriorityBidPolicy) -> Result<Runner<impl Provider + Clone + 'static>> {
-        let RunnerInputs { cfg, signer, from_block } = inputs;
+        let RunnerInputs { cfg, signer, from_block, shutdown } = inputs;
         let resolved = cfg.resolve_rpc()?;
         info!(
             http = ?resolved.http.iter().map(|e| format!("{}(p{})", e.name, e.priority)).collect::<Vec<_>>(),
@@ -130,7 +133,7 @@ impl Runner<()> {
         // would be silently mispriced, so it is refused here.
         let unpriced: Vec<String> = engine.metas.iter().filter(|m| morpho::loan_usd_model(engine.cfg.chain_id, m.params.loanToken, 1.0).is_none()).map(|m| format!("{} (loan {})", m.name, m.loan_symbol)).collect();
         anyhow::ensure!(unpriced.is_empty(), "markets with a loan token the bot cannot price in USD (Base USD stablecoins and WETH, by address): {}", unpriced.join(", "));
-        Ok(Runner { engine, pool, ws, live: signer.map(|s| (s, broadcast)), atlas_pool, from_block, auction: Arc::new(auction), priority: Arc::new(priority) })
+        Ok(Runner { engine, pool, ws, live: signer.map(|s| (s, broadcast)), atlas_pool, from_block, shutdown, auction: Arc::new(auction), priority: Arc::new(priority) })
     }
 }
 
@@ -138,7 +141,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> Runner<P> {
     /// The watch loop: every block (and every SVR auction) until an error. Shadow mode unless the
     /// inputs carried a signer.
     pub async fn run(mut self) -> Result<()> {
-        watch(&mut self.engine, self.from_block, self.pool, self.ws, self.live, self.atlas_pool, self.auction, self.priority).await
+        watch(&mut self.engine, self.from_block, self.pool, self.ws, self.live, self.atlas_pool, self.auction, self.priority, self.shutdown).await
     }
 
     /// One-shot risk summary of every tracked position, checked against the Morpho API.
@@ -1591,6 +1594,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     atlas_pool: Option<(P, rpc::RpcPool)>,
     auction: Arc<dyn AuctionBidPolicy>,
     priority: Arc<dyn PriorityBidPolicy>,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
     if let Some(dir) = std::path::Path::new(&engine.cfg.journal_path).parent() {
         std::fs::create_dir_all(dir).ok();
@@ -1717,6 +1721,11 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     let loan_decimals: HashMap<Address, u8> = engine.metas.iter().map(|m| (m.params.loanToken, m.loan_decimals)).collect();
 
     loop {
+        if shutdown.as_ref().is_some_and(|s| *s.borrow()) {
+            info!("shutdown requested; watch loop ends");
+            parts.ledger.lock().unwrap().save_or_warn();
+            return Ok(());
+        }
         // Live: newest head. Replaying: step one block at a time so nothing is skipped.
         let replaying = known_tip > last_block + 10;
         let head = if replaying {
@@ -1724,12 +1733,22 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         } else {
             // While waiting for the next block, handle auctions and oracle logs.
             loop {
-                let ev = match side_rx.as_mut() {
-                    Some(rx) => tokio::select! {
-                        ev = rx.recv() => Err(ev),
-                        h = wait_head(&mut ws, &engine.provider, last_block, engine.cfg.poll_ms) => Ok(h),
-                    },
-                    None => Ok(wait_head(&mut ws, &engine.provider, last_block, engine.cfg.poll_ms).await),
+                let stop = async {
+                    match shutdown.as_mut() {
+                        Some(s) => {
+                            let _ = s.wait_for(|v| *v).await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                let ev = tokio::select! {
+                    _ = stop => {
+                        info!("shutdown requested; watch loop ends");
+                        parts.ledger.lock().unwrap().save_or_warn();
+                        return Ok(());
+                    }
+                    ev = async { side_rx.as_mut().expect("guarded").recv().await }, if side_rx.is_some() => Err(ev),
+                    h = wait_head(&mut ws, &engine.provider, last_block, engine.cfg.poll_ms) => Ok(h),
                 };
                 match ev {
                     Ok(h) => break h,

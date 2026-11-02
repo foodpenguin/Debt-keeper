@@ -114,7 +114,7 @@ async fn run(cli: Cli, cfg: Config, live_signer: Option<alloy::signers::local::P
         _ => None,
     };
     let (auction, priority) = policy::defaults(&cfg);
-    let mut runner = Runner::build(RunnerInputs { cfg, signer: live_signer, from_block }, auction, priority).await?;
+    let mut runner = Runner::build(RunnerInputs { cfg, signer: live_signer, from_block, shutdown: None }, auction, priority).await?;
     match cli.cmd {
         Cmd::Scan { top } => runner.scan(top).await,
         Cmd::Watch { .. } => runner.run().await,

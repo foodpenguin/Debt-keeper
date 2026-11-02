@@ -44,5 +44,7 @@ pub mod venue;
 
 #[cfg(test)]
 mod e2e;
+#[cfg(test)]
+mod e2e_runner;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
