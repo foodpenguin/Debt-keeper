@@ -1,3 +1,6 @@
+//! NOT USED BY THE WATCH LOOP (Base Denim removes Flashblocks; the Atlas path reads oracle logs,
+//! oracle_logs.rs). Kept for the fb_* examples until Denim, then deleted.
+//!
 //! Oracle updates from the Flashblocks stream (Base, until Denim; the reconnecting reader and the
 //! message decoding are `onchain_core::flashblocks`). There are no receipts in the stream, so oracle
 //! updates are recognised from the transactions themselves: a Chainlink transmitter calls
@@ -72,14 +75,10 @@ pub enum FbEvent {
     Oracle(OracleUpdate),
     /// Index 0 of a block arrived: its number and timestamp (SVR cutoffs are timed on it).
     Opened { block: u64, timestamp: u64, seen: Instant },
-    /// A Chainlink SVR auction on our chain (observe-only solver phase 0; see atlas.rs).
-    Auction(crate::atlas::Auction),
 }
 
 pub struct Stream {
     pub updates: mpsc::Receiver<FbEvent>,
-    /// For other feeds (the Atlas auctions) to share the same event loop.
-    pub sender: mpsc::Sender<FbEvent>,
     pub seen: SeenTxs,
     /// Last message time (stream health).
     pub last_msg: Arc<Mutex<Option<Instant>>>,
@@ -156,7 +155,6 @@ fn median(report: &[u8]) -> Option<U256> {
 /// Connects (and reconnects) to the stream in the background.
 pub fn spawn(url: String, watched: Watched, atlas: Address) -> Stream {
     let (tx, rx) = mpsc::channel(256);
-    let sender = tx.clone();
     let seen: SeenTxs = Arc::default();
     let last_msg: Arc<Mutex<Option<Instant>>> = Arc::default();
     let (seen2, last2) = (seen.clone(), last_msg.clone());
@@ -202,7 +200,7 @@ pub fn spawn(url: String, watched: Watched, atlas: Address) -> Stream {
             }
         }
     });
-    Stream { updates: rx, sender, seen, last_msg, sealed }
+    Stream { updates: rx, seen, last_msg, sealed }
 }
 
 #[cfg(test)]

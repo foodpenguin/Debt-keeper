@@ -1,0 +1,10 @@
+# ~8 MB of log per day in shadow mode; keep two weeks. copytruncate: the bot keeps its fd.
+@LOG@ {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su @USER@ @USER@
+}

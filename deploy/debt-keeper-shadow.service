@@ -1,0 +1,33 @@
+# Shadow-mode liquidation bot (never sends transactions). Installed by scripts/setup_wsl.sh
+# --install-service with @BIN@ / @CONFIG@ / @LOG@ / @USER@ filled in (BIN, CONFIG, LOG overridable:
+# e.g. a private build of the bot and a config kept outside this repository).
+#   sudo systemctl status debt-keeper-shadow     # state
+#   sudo systemctl restart debt-keeper-shadow    # after a rebuild
+#   sudo systemctl stop debt-keeper-shadow       # before starting `watch --live` by hand
+# Live mode is never started by systemd: it needs the keystore password, typed by a person.
+[Unit]
+Description=Liquidation bot (shadow mode)
+Wants=network-online.target
+After=network-online.target
+# Restart back-off window (these keys belong in [Unit]): at most 10 starts per 10 minutes.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@WORKDIR@
+ExecStart=@BIN@ -c @CONFIG@ watch
+Environment=NO_COLOR=1
+Environment=RUST_LOG=info
+# Restart after crashes or RPC outages, but back off if it keeps failing.
+Restart=always
+RestartSec=15
+StandardOutput=append:@LOG@
+StandardError=append:@LOG@
+# Shadow mode needs no privileges.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -173,7 +173,7 @@ simulate = false
 # backup_dir = "/path/to/backup"   # daily copy of metrics.db + journal
 # db_path = "data/metrics.db"
 # html_path = "data/dashboard.html"
-# log_path = "data/live_run.log"
+# log_path = "data/run.log"
 # raw_block_days = 14          # per-block rows; everything else is kept forever
 
 # Labels for other liquidators' exit paths (dashboard only), beyond the built-in aggregators.

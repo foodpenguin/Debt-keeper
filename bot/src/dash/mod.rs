@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS runs (ts REAL PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS rpc_stats (ts REAL, endpoint TEXT, requests INTEGER, failovers INTEGER, lagging INTEGER,
     hedges INTEGER, ewma_ms INTEGER, cooling INTEGER, PRIMARY KEY (ts, endpoint));
 CREATE TABLE IF NOT EXISTS rpc_usage (block INTEGER, uptime_s INTEGER, pool TEXT, endpoint TEXT, method TEXT, n INTEGER,
-    PRIMARY KEY (block, pool, endpoint, method));
+    bytes_out INTEGER, PRIMARY KEY (block, pool, endpoint, method));
 CREATE TABLE IF NOT EXISTS liquidations (tx TEXT, borrower TEXT, block INTEGER, market TEXT, liquidator TEXT, eoa TEXT,
     gross_usd REAL, repaid REAL, seized_value REAL, bad_debt REAL, fee_usd REAL, outcome TEXT, json TEXT, PRIMARY KEY (tx, borrower));
 CREATE INDEX IF NOT EXISTS liquidations_block ON liquidations (block);
@@ -98,6 +98,11 @@ pub async fn run(cfg: &Config) -> Result<()> {
     let mut db = Connection::open(&d.db_path).with_context(|| format!("opening {}", d.db_path))?;
     db.busy_timeout(Duration::from_secs(10))?;
     db.execute_batch(SCHEMA)?;
+    // Databases created before rpc_usage had bytes_out (request bytes = egress): add the column.
+    let has_bytes: bool = db.prepare("SELECT 1 FROM pragma_table_info('rpc_usage') WHERE name = 'bytes_out'")?.exists([])?;
+    if !has_bytes {
+        db.execute("ALTER TABLE rpc_usage ADD COLUMN bytes_out INTEGER", [])?;
+    }
 
     let (lines, first_new_ts) = ingest_log(&mut db, &d.log_path)?;
     refresh_hour_stats(&db, first_new_ts)?;
@@ -408,8 +413,8 @@ fn ingest_journal(db: &mut Connection, path: &str) -> Result<usize> {
             "rpc_usage" => {
                 for u in r["usage"].as_array().into_iter().flatten() {
                     tx.execute(
-                        "INSERT OR IGNORE INTO rpc_usage (block, uptime_s, pool, endpoint, method, n) VALUES (?1,?2,?3,?4,?5,?6)",
-                        params![i("block"), i("uptime_s"), u["pool"].as_str(), u["endpoint"].as_str(), u["method"].as_str(), u["n"].as_i64()],
+                        "INSERT OR IGNORE INTO rpc_usage (block, uptime_s, pool, endpoint, method, n, bytes_out) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        params![i("block"), i("uptime_s"), u["pool"].as_str(), u["endpoint"].as_str(), u["method"].as_str(), u["n"].as_i64(), u["bytes_out"].as_i64()],
                     )?;
                 }
             }

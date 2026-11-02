@@ -115,7 +115,7 @@ fn default_dash_html() -> String {
     "data/dashboard.html".into()
 }
 fn default_dash_log() -> String {
-    "data/live_run.log".into()
+    "data/run.log".into()
 }
 fn default_dash_raw_days() -> u64 {
     14

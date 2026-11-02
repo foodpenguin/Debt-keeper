@@ -497,7 +497,7 @@ function renderRpc() {
     }
     return `<div class="q"><div>${esc(e.name)}</div><div class="muted">no published quota · ${num(e.reqs)} requests this month</div><div class="r muted">projected ${num(e.proj_reqs)}</div></div>`;
   });
-  host.innerHTML = rows.length ? rows.join("") : '<div class="empty">No rpc_usage records this month yet (written every 300 blocks)</div>';
+  host.innerHTML = rows.length ? rows.join("") : '<div class="empty">No rpc_usage records this month yet (written every 10 minutes)</div>';
   const eps = [...new Set(R.hourly.map(h => h[1]))].sort();
   const hrs = [...new Set(R.hourly.map(h => h[0]))].sort((a, b) => a - b);
   const pal = [css("--accent"), css("--direct"), css("--warn"), css("--bad"), "#8a63d2", "#0f8fa3"];
