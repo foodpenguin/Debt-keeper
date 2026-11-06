@@ -122,6 +122,20 @@ struct MarketFeeds {
     quote: Vec<usize>,
 }
 
+/// A public SVR primary seen but not yet in effect. Morpho reads it only once an Atlas metacall
+/// carries it (`Secondary`) or it is older than the aggregator's cutoff (`Expired`). More than one
+/// can be in flight at once for the same aggregator when primaries arrive faster than the cutoff
+/// (ETH/USD in a fast market updates roughly every cutoff length), so they are kept per aggregator
+/// in a queue, in arrival (round) order.
+#[derive(Debug, Clone)]
+struct Pending {
+    answer: U256,
+    /// Timestamp of the block the primary was seen in (0 before any block is known).
+    ts: u64,
+    /// Round from the oracle log; `None` from the flashblock decoder, which carries no round.
+    round: Option<u32>,
+}
+
 /// Outcome of `PriceModel::apply`.
 #[derive(Debug, PartialEq)]
 pub enum Applied {
@@ -138,11 +152,10 @@ pub struct PriceModel {
     /// Per market (same index as Engine::metas): None = not on the fast path.
     markets: Vec<Option<MarketFeeds>>,
     watched: Watched,
-    /// SVR aggregator -> (public answer seen but not yet in effect, timestamp of its block).
-    pending: HashMap<Address, (U256, u64)>,
-    /// SVR aggregator -> the round of its pending answer, when known (oracle logs carry it; the
-    /// Flashblocks decoder does not).
-    pending_round: HashMap<Address, u32>,
+    /// SVR aggregator -> its in-flight public primaries, oldest first (see `Pending`). The chain
+    /// serves the newest one that has become effective, so an earlier primary is kept until it
+    /// takes effect or a later round supersedes it; it is never overwritten by a newer primary.
+    pending: HashMap<Address, Vec<Pending>>,
     /// SVR aggregator -> its cutoff (seconds), read from the DualAggregator's `CutoffTimeSet` log.
     /// Absent until a log arrives: `due` then falls back to the config `svr_cutoff_secs`.
     cutoffs: HashMap<Address, u64>,
@@ -276,17 +289,36 @@ impl PriceModel {
         match (svr, path) {
             (false, Path::Secondary | Path::Expired) => return Applied::Rejected("secondary/expiry for a non-SVR feed"),
             (true, Path::Primary) => {
-                self.pending.insert(aggregator, (answer, block_ts));
+                // Queued, not overwritten: an earlier primary still waiting for its cutoff must
+                // survive so it takes effect when the chain serves it (see `Pending`, `due`).
+                self.pending.entry(aggregator).or_default().push(Pending { answer, ts: block_ts, round: None });
                 return Applied::Deferred(self.affected(&touched, Some((aggregator, answer))));
             }
-            (true, Path::Secondary | Path::Expired) => match self.pending.get(&aggregator) {
-                Some((p, _)) if *p == answer => {
-                    self.pending.remove(&aggregator);
-                    self.pending_round.remove(&aggregator);
+            (true, Path::Secondary | Path::Expired) => {
+                // The chain now serves `answer` (an auctioned secondary, or a primary past its
+                // cutoff): that pending primary and every older one are consumed, since
+                // latestRoundData only moves forward and never serves a superseded round.
+                let hit = if let Some(q) = self.pending.get_mut(&aggregator) {
+                    match q.iter().position(|p| p.answer == answer) {
+                        Some(pos) => {
+                            q.drain(..=pos);
+                            Some(q.is_empty())
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                match hit {
+                    Some(empty) => {
+                        if empty {
+                            self.pending.remove(&aggregator);
+                        }
+                    }
+                    None if touched.iter().all(|&i| self.feeds[i].answer == answer) => return Applied::Moved(vec![]),
+                    None => return Applied::Rejected("secondary/expiry answer does not match a pending primary"),
                 }
-                _ if touched.iter().all(|&i| self.feeds[i].answer == answer) => return Applied::Moved(vec![]),
-                _ => return Applied::Rejected("secondary answer does not match the pending primary"),
-            },
+            }
             (false, Path::Primary) => {}
         }
         for &i in &touched {
@@ -298,32 +330,37 @@ impl PriceModel {
     /// A public transmit of `answer` for `round` (oracle logs): `apply` as Primary, remembering the
     /// round of a deferred SVR answer for its secondary.
     pub fn apply_transmission(&mut self, aggregator: Address, round: u32, answer: U256, block_ts: u64) -> Applied {
+        // A redelivered log for a round already queued (e.g. after a WS reconnect) adds nothing.
+        if self.pending.get(&aggregator).is_some_and(|q| q.iter().any(|p| p.round == Some(round))) {
+            return self.deferred_preview(aggregator, answer);
+        }
         let r = self.apply(aggregator, answer, Path::Primary, block_ts);
-        if matches!(r, Applied::Deferred(_)) {
-            self.pending_round.insert(aggregator, round);
+        if matches!(r, Applied::Deferred(_))
+            && let Some(p) = self.pending.get_mut(&aggregator).and_then(|q| q.last_mut())
+        {
+            p.round = Some(round);
         }
         r
     }
 
-    /// The SVR secondary of `round` (oracle logs: the round only): the pending answer of that round
-    /// takes effect. None when there is no pending answer of that round (a missed transmit; the
-    /// block path's resync catches up).
+    /// The SVR secondary of `round` (oracle logs: the round only): the queued primary of that round
+    /// takes effect (and supersedes any older still-pending primary). None when no queued primary
+    /// has that round (a missed transmit; the block path's resync catches up).
     pub fn apply_secondary_round(&mut self, aggregator: Address, round: u32, block_ts: u64) -> Option<Applied> {
-        let (answer, _) = *self.pending.get(&aggregator)?;
-        if self.pending_round.get(&aggregator).is_some_and(|r| *r != round) {
-            return None;
-        }
-        let r = self.apply(aggregator, answer, Path::Secondary, block_ts);
-        if matches!(r, Applied::Moved(_)) {
-            self.pending_round.remove(&aggregator);
-        }
-        Some(r)
+        let answer = self.pending.get(&aggregator)?.iter().find(|p| p.round == Some(round))?.answer;
+        Some(self.apply(aggregator, answer, Path::Secondary, block_ts))
     }
 
-    /// Forgets the pending answer of `aggregator` (a log it came from was removed by a reorg).
+    /// The `Deferred` preview an SVR primary of `answer` would give, changing nothing.
+    fn deferred_preview(&self, aggregator: Address, answer: U256) -> Applied {
+        let touched: Vec<usize> = (0..self.feeds.len()).filter(|&i| self.feeds[i].aggregator == aggregator).collect();
+        Applied::Deferred(self.affected(&touched, Some((aggregator, answer))))
+    }
+
+    /// Forgets the pending primaries of `aggregator` (a log one came from was removed by a reorg).
+    /// The whole queue is dropped; the block path's resync rebuilds from the sealed state.
     pub fn invalidate(&mut self, aggregator: Address) {
         self.pending.remove(&aggregator);
-        self.pending_round.remove(&aggregator);
     }
 
     /// The aggregators behind the modelled feeds, sorted (the oracle logs filter).
@@ -354,8 +391,12 @@ impl PriceModel {
     pub fn due(&self, ts: u64, default: u64) -> Vec<(Address, U256)> {
         self.pending
             .iter()
-            .filter(|(agg, (_, pts))| *pts > 0 && ts > *pts + self.cutoff_for(**agg, default))
-            .map(|(a, (ans, _))| (*a, *ans))
+            .filter_map(|(agg, q)| {
+                let cutoff = self.cutoff_for(*agg, default);
+                // The queue is in round order, so the newest primary past its cutoff is the last
+                // expired entry; any older expired one it skipped is superseded (`apply` drains it).
+                q.iter().rev().find(|p| p.ts > 0 && ts > p.ts + cutoff).map(|p| (*agg, p.answer))
+            })
             .collect()
     }
 
@@ -394,10 +435,15 @@ impl PriceModel {
                     warn!(error = %e, "could not load the new aggregator's transmitters: same-block mode blind for it");
                 }
             }
-            // The chain caught up with a pending SVR answer (its Atlas metacall, or the cutoff).
-            if self.pending.get(&feed.aggregator).is_some_and(|(a, _)| *a == feed.answer) {
-                self.pending.remove(&feed.aggregator);
-                self.pending_round.remove(&feed.aggregator);
+            // The chain caught up with a queued SVR answer (its Atlas metacall, or the cutoff):
+            // that primary and every older one it superseded are consumed.
+            if let Some(q) = self.pending.get_mut(&feed.aggregator)
+                && let Some(pos) = q.iter().position(|p| p.answer == feed.answer)
+            {
+                q.drain(..=pos);
+                if q.is_empty() {
+                    self.pending.remove(&feed.aggregator);
+                }
             }
             self.feeds[i] = feed;
         }
@@ -415,7 +461,6 @@ impl PriceModel {
             markets: markets.into_iter().map(|m| m.map(|(scale, base, quote)| MarketFeeds { scale, base, quote })).collect(),
             watched: Watched::default(),
             pending: HashMap::new(),
-            pending_round: HashMap::new(),
             cutoffs: HashMap::new(),
         }
     }
@@ -543,5 +588,75 @@ mod tests {
         // Expiry of an answer that is not the pending one changes nothing.
         assert!(matches!(m.apply(XRP, U256::from(5u64), Path::Expired, 1200), Applied::Rejected(_)));
         assert_eq!(m.price(1), Some(new * e(28)));
+    }
+
+    #[test]
+    fn two_primaries_in_flight_each_take_effect_at_their_own_cutoff() {
+        // D1: a second primary for the same aggregator arrives before the first is past its cutoff.
+        // The model must keep the first (a newer primary used to overwrite it), so the chain's
+        // switch at first_ts + cutoff is not read as a missed update.
+        let mut m = model(true);
+        let old = m.price(1).unwrap();
+        let a1 = U256::from(127_840_411u64);
+        let a2 = U256::from(128_500_000u64);
+        // Primary #1 at ts 1000 (round 0x10), primary #2 at ts 1030 (round 0x11), both deferred.
+        assert_eq!(m.apply_transmission(XRP, 0x10, a1, 1000), Applied::Deferred(vec![(1, a1 * e(28))]));
+        assert_eq!(m.apply_transmission(XRP, 0x11, a2, 1030), Applied::Deferred(vec![(1, a2 * e(28))]));
+        assert_eq!(m.price(1), Some(old), "nothing in effect yet");
+        // Cutoff 30 s. At 1031 only #1 is due; the chain serves a1, not the newer a2.
+        assert!(m.due(1030, 30).is_empty());
+        assert_eq!(m.due(1031, 30), vec![(XRP, a1)]);
+        assert_eq!(m.apply(XRP, a1, Path::Expired, 1031), Applied::Moved(vec![(1, a1 * e(28))]));
+        assert_eq!(m.price(1), Some(a1 * e(28)));
+        // #2 is still pending and becomes due at its own cutoff, 1060.
+        assert!(m.due(1060, 30).is_empty());
+        assert_eq!(m.due(1061, 30), vec![(XRP, a2)]);
+        assert_eq!(m.apply(XRP, a2, Path::Expired, 1061), Applied::Moved(vec![(1, a2 * e(28))]));
+        assert_eq!(m.price(1), Some(a2 * e(28)));
+        assert!(m.due(9000, 30).is_empty(), "both consumed");
+    }
+
+    #[test]
+    fn when_a_head_gap_passes_both_cutoffs_the_chain_serves_the_newest() {
+        // If the loop skips the block where #1 would have taken effect, the next head sees both
+        // past their cutoff: latestRoundData shows the newest (a2), and the older is superseded.
+        let mut m = model(true);
+        let a1 = U256::from(127_840_411u64);
+        let a2 = U256::from(128_500_000u64);
+        m.apply_transmission(XRP, 0x10, a1, 1000);
+        m.apply_transmission(XRP, 0x11, a2, 1005);
+        assert_eq!(m.due(1016, 10), vec![(XRP, a2)]);
+        assert_eq!(m.apply(XRP, a2, Path::Expired, 1016), Applied::Moved(vec![(1, a2 * e(28))]));
+        assert!(m.due(9000, 10).is_empty(), "the older primary was superseded, not applied after");
+        assert_eq!(m.price(1), Some(a2 * e(28)));
+    }
+
+    #[test]
+    fn an_auction_for_the_newer_round_supersedes_an_earlier_pending_primary() {
+        // An Atlas metacall carrying the newer round makes the chain jump to it; the earlier
+        // un-auctioned primary is never served and must be dropped, not left to expire later.
+        let mut m = model(true);
+        let a1 = U256::from(127_840_411u64);
+        let a2 = U256::from(128_500_000u64);
+        m.apply_transmission(XRP, 0x10, a1, 1000);
+        m.apply_transmission(XRP, 0x11, a2, 1005);
+        assert_eq!(m.apply_secondary_round(XRP, 0x11, 1006), Some(Applied::Moved(vec![(1, a2 * e(28))])));
+        assert_eq!(m.price(1), Some(a2 * e(28)));
+        assert!(m.due(9000, 10).is_empty(), "the earlier primary was superseded");
+        // A redelivered log for round 0x10 after it was superseded cannot resurrect it.
+        assert_eq!(m.apply_secondary_round(XRP, 0x10, 1008), None);
+    }
+
+    #[test]
+    fn a_redelivered_transmission_log_does_not_queue_a_duplicate() {
+        // After a WS reconnect the same NewTransmission can arrive twice; the second is a no-op.
+        let mut m = model(true);
+        let a1 = U256::from(127_840_411u64);
+        assert_eq!(m.apply_transmission(XRP, 0x10, a1, 1000), Applied::Deferred(vec![(1, a1 * e(28))]));
+        assert_eq!(m.apply_transmission(XRP, 0x10, a1, 1000), Applied::Deferred(vec![(1, a1 * e(28))]));
+        // One queued entry: it takes effect once, and nothing is left afterwards.
+        assert_eq!(m.due(1011, 10), vec![(XRP, a1)]);
+        assert_eq!(m.apply(XRP, a1, Path::Expired, 1011), Applied::Moved(vec![(1, a1 * e(28))]));
+        assert!(m.due(9000, 10).is_empty());
     }
 }
