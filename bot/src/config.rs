@@ -624,6 +624,12 @@ pub struct ExecConfig {
     /// gas limit = simulated gas used x this buffer (only gas actually used is paid).
     #[serde(default = "default_gas_buffer")]
     pub gas_limit_buffer: f64,
+    /// Reuse the previous market snapshot (skipping the per-head `eth_call`) on heads where nothing
+    /// moved, until it is this old. Caps how stale the price can be when no oracle update or market
+    /// log forces a refetch (a non-Chainlink, e.g. ERC-4626, rate drifts at most this long). The
+    /// big lever on RPC egress under 200 ms blocks; 0 disables the throttle (refetch every head).
+    #[serde(default = "default_snapshot_max_age_ms")]
+    pub snapshot_max_age_ms: u64,
     /// Plan a given candidate at most once per this many blocks.
     pub replan_blocks: u64,
     /// The same in seconds (converted with the measured block time); overrides replan_blocks.
@@ -762,6 +768,9 @@ fn default_bid_samples() -> usize {
 }
 fn default_bid_window() -> u64 {
     7 * 86_400
+}
+fn default_snapshot_max_age_ms() -> u64 {
+    1000
 }
 fn default_deadline_secs() -> f64 {
     4.0

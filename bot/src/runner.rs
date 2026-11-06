@@ -731,8 +731,19 @@ const SIDE_CHANNEL: usize = 1024;
 const BLOCK_CLOCK_HEADS: usize = 50;
 const BLOCK_TS_KEEP: u64 = 600;
 
-/// The Atlas bond is read every this many heads (and soon after an op was accepted).
-const BOND_CHECK_HEADS: u64 = 50;
+/// The Atlas bond is read every this many heads (and at once after an op was accepted, via
+/// `bond_dirty`). Head-counted, so post-Denim (200 ms blocks) this is ~100 s, not the old ~100 s at
+/// 2 s blocks x 50 — kept near 100 s here to avoid an extra bond read every few seconds on the Atlas
+/// RPC. `bond_dirty` still forces an immediate read whenever it actually matters.
+const BOND_CHECK_HEADS: u64 = 500;
+
+/// Whether a head must fetch fresh market snapshots rather than reuse the previous ones (the A1
+/// snapshot throttle). Refetch with no snapshot yet, on an oracle update, when a market log touched
+/// a position or a liquidation happened, or when the last snapshot is older than
+/// `snapshot_max_age`; otherwise the prices are still current and the snapshot is reused.
+fn must_refetch_snapshots(has_prev: bool, oracle_updated: bool, touched_any: bool, fresh_enough: bool) -> bool {
+    !has_prev || oracle_updated || touched_any || !fresh_enough
+}
 
 /// The chain's block time from the last BLOCK_CLOCK_HEADS heads: follows a block-time change (Base
 /// Denim: 2 s -> 0.2 s) within that many blocks, no setting to switch.
@@ -758,6 +769,20 @@ impl BlockClock {
             (Some((n0, t0)), Some((n1, t1))) if n1 > n0 && t1 >= t0 => (t1 - t0) as f64 / (n1 - n0) as f64,
             _ => 2.0,
         }
+    }
+
+    /// How late (ms) head `(number, timestamp)` reached us, at wall-clock `now_ms`. Block
+    /// timestamps are only second-granular, and post-Denim five 200 ms blocks share one second, so
+    /// `now - timestamp*1000` jitters 0..1000 ms. Instead we place the head within its second: the
+    /// first block seen with this timestamp sits on the second boundary, each later one `block_time`
+    /// after it. Pre-Denim (2 s blocks, one per timestamp) the index is always 0, so this reduces to
+    /// the old `now - timestamp*1000`. `number` must already be pushed.
+    fn head_age_ms(&self, number: u64, timestamp: u64, now_ms: u64) -> i64 {
+        let first = self.heads.iter().filter(|(_, t)| *t == timestamp).map(|(n, _)| *n).min().unwrap_or(number);
+        let idx = number.saturating_sub(first);
+        let spacing_ms = (self.block_time() * 1000.0).max(1.0);
+        let theoretical_ms = timestamp as i64 * 1000 + (idx as f64 * spacing_ms) as i64;
+        now_ms as i64 - theoretical_ms
     }
 }
 
@@ -807,6 +832,14 @@ impl<P: Provider + Clone + 'static> AtlasState<P> {
                 warn!(%aggregator, "oracle log removed by a reorg; resyncing the model");
                 self.model.invalidate(aggregator);
                 self.resync_all = true;
+            }
+            E::CutoffChanged { aggregator, cutoff_secs, at } => {
+                // Takes effect immediately: `due` reads the new value on the next head. Applied
+                // without waiting for the block timestamp (the cutoff is not timed on it).
+                if self.model.set_cutoff(aggregator, cutoff_secs as u64) {
+                    info!(%aggregator, cutoff_secs, block = at.block, "ORACLE SVR cutoff changed");
+                    let _ = self.journal_tx.send(json!({ "kind": "oracle_cutoff", "block": at.block, "aggregator": aggregator, "cutoff_secs": cutoff_secs }).to_string());
+                }
             }
             E::Transmission { at, .. } | E::Secondary { at, .. } => {
                 let ts = if at.block_ts > 0 { Some(at.block_ts) } else { self.block_ts.get(&at.block).copied() };
@@ -903,6 +936,12 @@ impl<P: Provider + Clone + 'static> AtlasState<P> {
         if after != before {
             self.logs.set_addresses(after);
         }
+    }
+
+    /// Did an oracle update (a log, or an SVR primary past its cutoff) land at a block after
+    /// `last_block`? The snapshot throttle refetches when so, so a price move is never missed.
+    fn pending_update(&self, last_block: u64) -> bool {
+        self.resync_all || self.max_update_block > last_block
     }
 
     /// Journals the auctions the feed task dropped since the last call.
@@ -1670,6 +1709,12 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     // Which source delivered each processed block first (WS endpoint index, or HTTP polling).
     let mut head_wins: HashMap<usize, u64> = HashMap::new();
     let mut prev_snaps: Option<Vec<Option<morpho::onchain::MarketSnapshot>>> = None;
+    // Snapshot throttle (A1): skip the per-head market `eth_call` (the bulk of egress) when nothing
+    // changed. `last_snap_at` is when snapshots were really fetched; `prev_fresh` is whether
+    // `prev_snaps` came from a real fetch (only those may feed the Atlas cross-check).
+    let mut last_snap_at: Option<Instant> = None;
+    let mut prev_fresh = false;
+    let snapshot_max_age = Duration::from_millis(engine.cfg.exec.snapshot_max_age_ms);
     let market_ids = engine.market_ids();
     let liquidator = venue::LiquidationVenue::<Morpho>::target(&parts.venue);
     seed_winning_bids(&parts, &engine.cfg.journal_path, liquidator, engine.cfg.atlas.address);
@@ -1805,42 +1850,61 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             prev_snaps = None;
         }
         // The Atlas price model: held oracle logs, SVR cutoffs, and the previous block's cross-check.
+        // Only a genuinely fetched previous snapshot may feed the cross-check (a reused one shares
+        // the model's prices, so a missed log would not show up — see the snapshot throttle below).
         if let Some(st) = atlas_st.as_mut() {
-            st.on_head(&h, prev_snaps.as_deref().map(|s| (last_block, s))).await;
+            let cross = if prev_fresh { prev_snaps.as_deref().map(|s| (last_block, s)) } else { None };
+            st.on_head(&h, cross).await;
         }
 
-        // 1. Events since the last block and fresh market snapshots, fetched in parallel.
-        //    Interest is accrued to ~the next block so interest-only crossings show up early.
+        // 1. Events since the last block, then the market snapshots. Side events arriving meanwhile
+        //    are handled right away instead of queueing behind the block path; `drive!` runs a
+        //    future while servicing them. Interest is accrued to ~the next block so interest-only
+        //    crossings show up early.
         let accrue_to = h.timestamp + engine.cfg.lookahead_secs(block_time);
         let from_block_logs = last_block + 1;
-        // Side events arriving meanwhile are handled right away instead of queueing behind the
-        // block path. Scoped so the future (and its borrows of engine / prev_snaps) is gone before
-        // the block path mutates them.
-        let (touched, snaps) = {
-            let fetch = async {
-                tokio::join!(
-                    engine.touched(&market_ids, from_block_logs, number),
-                    async {
-                        match &prev_snaps {
-                            Some(prev) => engine.snapshots_fast(number.into(), accrue_to, prev).await,
-                            None => engine.snapshots(number.into(), accrue_to).await,
+        macro_rules! drive {
+            ($fut:expr) => {{
+                let fut = $fut;
+                tokio::pin!(fut);
+                loop {
+                    let (Some(st), Some(rx)) = (atlas_st.as_mut(), side_rx.as_mut()) else { break fut.await };
+                    tokio::select! {
+                        r = &mut fut => break r,
+                        Some(ev) = rx.recv() => {
+                            let ctx = prev_snaps.as_deref().zip(last_ctx.as_ref()).map(|(s, (lh, eth, bt))| (s, lh, *eth, *bt));
+                            on_side(engine, st, ev, ctx, &parts);
+                            drain_journal(&mut journal_rx, &mut journal)?;
                         }
                     }
-                )
-            };
-            tokio::pin!(fetch);
-            loop {
-                let (Some(st), Some(rx)) = (atlas_st.as_mut(), side_rx.as_mut()) else { break fetch.await };
-                tokio::select! {
-                    r = &mut fetch => break r,
-                    Some(ev) = rx.recv() => {
-                        let ctx = prev_snaps.as_deref().zip(last_ctx.as_ref()).map(|(s, (lh, eth, bt))| (s, lh, *eth, *bt));
-                        on_side(engine, st, ev, ctx, &parts);
-                        drain_journal(&mut journal_rx, &mut journal)?;
-                    }
                 }
+            }};
+        }
+        let touched = drive!(engine.touched(&market_ids, from_block_logs, number));
+        // Snapshot throttle (A1): the per-head market snapshot `eth_call` is ~85% of the VM's
+        // egress, so skip it when nothing moved — no oracle update, no market-touching log, and the
+        // last real snapshot is younger than `snapshot_max_age`. Reuse the previous snapshot then
+        // (its prices are still current; interest drift over < max_age is negligible for the HF).
+        let oracle_updated = atlas_st.as_ref().is_some_and(|st| st.pending_update(last_block));
+        let fresh_enough = last_snap_at.is_some_and(|t| t.elapsed() < snapshot_max_age);
+        let touched_any = touched.as_ref().map(|t| !t.is_empty()).unwrap_or(true);
+        let fetched_this_head = must_refetch_snapshots(prev_snaps.is_some(), oracle_updated, touched_any, fresh_enough);
+        let snaps = if fetched_this_head {
+            let s = drive!(async {
+                match &prev_snaps {
+                    Some(prev) => engine.snapshots_fast(number.into(), accrue_to, prev).await,
+                    None => engine.snapshots(number.into(), accrue_to).await,
+                }
+            });
+            if s.is_ok() {
+                last_snap_at = Some(Instant::now());
             }
+            s
+        } else {
+            // Reuse: prev_snaps is Some (checked above via `prev_snaps.is_none()`).
+            Ok(prev_snaps.clone().unwrap_or_default())
         };
+        prev_fresh = fetched_this_head;
         let fetch_ms = t0.elapsed().as_millis() as u64;
         let (touched, snaps) = match (touched, snaps) {
             (Ok(t), Ok(s)) => (t, s),
@@ -2095,7 +2159,8 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             info!("background borrower refresh started");
         }
         // Wall-clock age of the block when we finished deciding (needs a synced clock, e.g. chrony).
-        let head_age_ms = gates::unix_ms() as i64 - (h.timestamp as i64) * 1000;
+        // Block-number-derived so it stays meaningful under 200 ms blocks (see BlockClock::head_age_ms).
+        let head_age_ms = clock.head_age_ms(number, h.timestamp, gates::unix_ms());
         info!(
             block = number, tracked = views.len(), touched, planned, fetch_ms, reload_ms, eval_us, decide_ms, head_age_ms,
             "block"
@@ -2248,5 +2313,39 @@ mod tests {
         // An old or repeated head changes nothing.
         c.push(1000, 1);
         assert!((c.block_time() - 0.2).abs() < 0.05);
+    }
+
+    #[test]
+    fn snapshot_throttle_reuses_only_on_a_quiet_fresh_head() {
+        // Quiet head with a fresh snapshot: reuse (no refetch).
+        assert!(!must_refetch_snapshots(true, false, false, true));
+        // Any one of: no prev, an oracle update, a touched market, or a stale snapshot forces a refetch.
+        assert!(must_refetch_snapshots(false, false, false, true), "no snapshot yet");
+        assert!(must_refetch_snapshots(true, true, false, true), "oracle updated");
+        assert!(must_refetch_snapshots(true, false, true, true), "a market was touched");
+        assert!(must_refetch_snapshots(true, false, false, false), "snapshot too old");
+    }
+
+    #[test]
+    fn head_age_places_blocks_within_their_second() {
+        // Five 200 ms blocks share each timestamp; span a whole number of seconds so the measured
+        // block_time is exactly 0.2 (blocks 2000..=2025 over seconds 10_000..=10_005).
+        let mut c = BlockClock::default();
+        for k in 0..=25u64 {
+            c.push(2000 + k, 10_000 + k / 5);
+        }
+        assert!((c.block_time() - 0.2).abs() < 1e-9, "{}", c.block_time());
+        // First block of the second 10_004 is #2020 (k=20). now = 10_004.300 s.
+        let now_ms = 10_004_300u64;
+        // #2020 is on the boundary: ~300 ms late. #2021 is +200 ms theoretical: ~100 ms late.
+        assert!((c.head_age_ms(2020, 10_004, now_ms) - 300).abs() <= 15, "{}", c.head_age_ms(2020, 10_004, now_ms));
+        assert!((c.head_age_ms(2021, 10_004, now_ms) - 100).abs() <= 15, "{}", c.head_age_ms(2021, 10_004, now_ms));
+
+        // Pre-Denim 2 s blocks, one per timestamp: reduces to now - timestamp*1000.
+        let mut c2 = BlockClock::default();
+        for n in 0..50u64 {
+            c2.push(1000 + n, 10_000 + 2 * n);
+        }
+        assert_eq!(c2.head_age_ms(1040, 10_080, 10_080_590), 590);
     }
 }

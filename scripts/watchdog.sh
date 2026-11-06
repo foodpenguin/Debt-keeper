@@ -31,6 +31,9 @@ WATCHDOG_ENV="${WATCHDOG_ENV:-$HOME/.config/liqbot/watchdog.env}"
 if [[ -r "$WATCHDOG_ENV" ]]; then
   while IFS== read -r k v; do
     [[ "$k" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+    v="${v%%#*}"                       # drop an inline "# comment"
+    v="${v#"${v%%[![:space:]]*}"}"     # trim leading whitespace
+    v="${v%"${v##*[![:space:]]}"}"     # trim trailing whitespace
     [[ -n "${!k:-}" ]] || export "$k=${v//\"/}"
   done < "$WATCHDOG_ENV"
 fi
@@ -49,13 +52,17 @@ KILL="${KILL:-$REPO/bot/data/KILL}"
 # "Crash with no send": at least this many liquidations in our markets within an hour and none of
 # our txs or Atlas ops.
 CRASH_LIQS="${CRASH_LIQS:-20}"
+# "oracle logs missed an update" lines happen occasionally; only mail when more than this many land
+# in one clock hour (the design target is < 1/hour on average).
+MISSED_PER_HOUR="${MISSED_PER_HOUR:-3}"
 SUMMARY_HOUR="${SUMMARY_HOUR:-09}"
 WATCH_TZ="${WATCH_TZ:-UTC}"   # time zone of SUMMARY_HOUR and of the timestamps in mails
 MAX_MAILS_PER_HOUR="${MAX_MAILS_PER_HOUR:-6}"
-# Measured baseline with an NTP-synced clock, heads woken by the flashblock stream: p50 ~ +680 ms,
-# p90 ~ +730 ms; the 2.5 s HTTP-poll fallback is ~ +1200 ms or worse. Keep the clock NTP-synced
-# (WSL2 clocks drift without it, which makes these numbers meaningless).
-HEAD_LAG_MS="${HEAD_LAG_MS:-1100}"
+# head_age_ms is now block-number-derived (runner BlockClock::head_age_ms), so it reads the true
+# lag (~250 ms on the GCP VM) instead of jittering 0..1000 ms under 200 ms blocks. Re-measure the
+# baseline per host and set HEAD_LAG_MS in watchdog.env; keep the clock NTP-synced (see A7 / deploy
+# checklist) or these numbers are meaningless. Default is generous for an accurate metric.
+HEAD_LAG_MS="${HEAD_LAG_MS:-700}"
 LAG_CHECKS="${LAG_CHECKS:-5}"
 DRY_RUN="${DRY_RUN:-0}"
 BOT_NAME="${BOT_NAME:-bot}"   # process name (comm) of the bot binary (the private build: keeper)
@@ -137,7 +144,7 @@ check() {
   fi
   if [[ -n "$new" ]]; then
     local ev
-    ev=$(grep -E 'LIVE tx SENT|LIVE tx outcome|LIVE send failed|HALTED|sending paused|cannot cover worst-case gas|balance check failed|fell behind|kill switch written|atlas_dropped|oracle logs missed an update|ATLAS solver op SUBMITTED' <<<"$new" | cut -c1-400 || true)
+    ev=$(grep -E 'LIVE tx SENT|LIVE tx outcome|LIVE send failed|HALTED|sending paused|cannot cover worst-case gas|balance check failed|fell behind|kill switch written|atlas_dropped|ATLAS solver op SUBMITTED' <<<"$new" | cut -c1-400 || true)
     [[ -n "$ev" ]] && alerts+=("log events:"$'\n'"$ev")
     # counters for the daily summary
     put n_blocks $(( $(get n_blocks 0) + $(grep -c 'runner: block ' <<<"$new" || true) ))
@@ -146,13 +153,20 @@ check() {
     sent_now=$(grep -cE 'LIVE tx SENT|ATLAS solver op SUBMITTED' <<<"$new" || true)
     liq_now=$(grep -c 'LIQUIDATION observed' <<<"$new" || true)
     put n_sent $(( $(get n_sent 0) + sent_now ))
-    # crash with no send: this clock hour's liquidations vs our sends
-    local hr; hr=$(date +%Y%m%d%H)
-    [[ "$(get crash_hour)" == "$hr" ]] || { put crash_hour "$hr"; put hr_liq 0; put hr_sent 0; put crash_alerted 0; }
+    # crash with no send + missed-oracle-log rate: counted per clock hour
+    local hr missed_now; hr=$(date +%Y%m%d%H)
+    missed_now=$(grep -c 'oracle logs missed an update' <<<"$new" || true)
+    [[ "$(get crash_hour)" == "$hr" ]] || { put crash_hour "$hr"; put hr_liq 0; put hr_sent 0; put hr_missed 0; put crash_alerted 0; put missed_alerted 0; }
     put hr_liq $(( $(get hr_liq 0) + liq_now )); put hr_sent $(( $(get hr_sent 0) + sent_now ))
-    if (( $(get hr_liq 0) >= CRASH_LIQS && $(get hr_sent 0) == 0 )) && [[ "$(get crash_alerted 0)" == 0 ]] && bot_running; then
+    put hr_missed $(( $(get hr_missed 0) + missed_now ))
+    # "crash with no send" only matters live: shadow never sends, so bot_running would fire every hour.
+    if (( $(get hr_liq 0) >= CRASH_LIQS && $(get hr_sent 0) == 0 )) && [[ "$(get crash_alerted 0)" == 0 ]] && live_running; then
       alerts+=("$(get hr_liq 0) liquidations in our markets this hour and none of our txs or Atlas ops: is the bot blind or refused by its limits? (see refused rows in the journal)")
       put crash_alerted 1
+    fi
+    if (( $(get hr_missed 0) > MISSED_PER_HOUR )) && [[ "$(get missed_alerted 0)" == 0 ]]; then
+      alerts+=("$(get hr_missed 0) 'oracle logs missed an update' this hour (> ${MISSED_PER_HOUR}): oracle log stream dropping events, or the SVR cutoff is wrong")
+      put missed_alerted 1
     fi
     put n_liq $(( $(get n_liq 0) + $(grep -c 'LIQUIDATION observed' <<<"$new" || true) ))
     grep 'LIQUIDATION observed' <<<"$new" | cut -c1-300 >> "$STATE/liq_today" || true
@@ -226,7 +240,7 @@ check() {
   liquidations seen  : $(get n_liq 0)   (by anyone, in our markets)
   hot wallet ETH     : $(get hot_bal ?)
   kill switch        : $([[ -e "$KILL" ]] && echo 'PRESENT (sending disabled)' || echo absent)
-  head_age_ms median : $(sort -n "$STATE/lag_today" 2>/dev/null | awk '{v[NR]=$1} END{if (NR) printf "%d ms (p90 %d ms, healthy WS ~ -500)", v[int((NR+1)/2)], v[int(NR*0.9+0.5)]; else print "?"}')
+  head_age_ms median : $(sort -n "$STATE/lag_today" 2>/dev/null | awk '{v[NR]=$1} END{if (NR) printf "%d ms (p90 %d ms; true lag, ~250 ms healthy on the VM)", v[int((NR+1)/2)], v[int(NR*0.9+0.5)]; else print "?"}')
 
 $( [[ -s "$STATE/liq_today" ]] && { echo 'liquidations observed:'; tail -n 20 "$STATE/liq_today"; } )
 $( [[ -s "$STATE/unsent.log" ]] && echo "note: some alerts were not mailed (hourly budget); see $STATE/unsent.log" )"

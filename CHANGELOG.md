@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.2.2 (unreleased)
+
+Fixes from the first post-Denim shadow run (GCP, 2026-11-02..06).
+
+- SVR cutoff from the chain: the window an unauctioned SVR primary waits before the proxy serves it
+  is read per DualAggregator from its `CutoffTimeSet(uint32)` log (added to the `oracle_logs`
+  subscription, same addresses) instead of trusting a single config constant. `[atlas]
+  svr_cutoff_secs` is now only the startup default, used per aggregator until its first log. The
+  aggregator exposes no getter for the value (checked on the Base DualAggregator bytecode), so the
+  log is the source; the `ts > primary_ts + cutoff` comparison stays strict as measured on-chain and
+  is re-verified on the next shadow run.
+
+- Dashboard clock: the `blocks` table was never populated — the per-head log line is
+  `runner: block block=...` but ingest matched a stale `bot: block block=` prefix — so times were
+  extrapolated from `(0, now)` at a fixed 2 s and rendered blocks years in the future. Ingest now
+  matches the real line, and the clock reads the real per-block timestamps (interpolating across the
+  200 ms fork, extrapolating with the measured edge spacing rather than a constant 2 s).
+- `head_age_ms`: block-number-derived (places each block within its second), so it reads the true
+  lag under 200 ms blocks instead of jittering 0..1000 ms. The watchdog's `HEAD_LAG_MS` default and
+  summary baseline were updated.
+- Watchdog: `oracle logs missed an update` alerts only when over `MISSED_PER_HOUR` (default 3) land
+  in a clock hour; "crash with no send" is gated to live mode (shadow never sends); the env-file
+  reader accepts inline `# comments`.
+- `setup_wsl.sh --install-service` and the README check the clock (`chronyc tracking`: Leap Normal,
+  offset < 50 ms).
+- `BOND_CHECK_HEADS` 50 -> 500: under 200 ms blocks the periodic Atlas-bond read stays near ~100 s
+  instead of every ~10 s (`bond_dirty` still forces an immediate read when it matters).
+- Expected under 200 ms blocks: the loop processes the newest head and skips the rest, so ~16 % of
+  heads are skipped (about 4.3 heads/s observed). Head-counted windows now cover less wall time:
+  `BLOCK_CLOCK_HEADS` 50 ~= 10 s (block-time estimate), `log_chunk` 100 ~= 20 s of catch-up per
+  getLogs chunk. Time-based settings (`deadline_secs`, `bid_window_secs`, `replan_secs`) are
+  unaffected; prefer them over the block-count equivalents.
+
 ## v0.2.1 (2026-11-02)
 
 Same code as v0.2.0. `bot/Cargo.toml` now carries the release version (v0.2.0 still said 0.1.0).

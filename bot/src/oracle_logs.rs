@@ -8,6 +8,11 @@
 //!   Morpho reads yet (the price model keeps it pending).
 //! - `SecondaryRoundIdUpdated`: the SVR secondary written by the auction winner's Atlas metacall. It
 //!   carries the round only; the answer is the pending one of that round.
+//! - `CutoffTimeSet(uint32)`: the DualAggregator's own setter log (`setCutoffTime(uint32)`), the
+//!   window after which an unauctioned SVR primary the proxy serves (see `oracle::PriceModel::due`).
+//!   The new cutoff (seconds) is the single non-indexed argument, so the value is read straight from
+//!   the log — the aggregator exposes no getter for it (checked on the Base DualAggregator bytecode
+//!   2026-11-06). The config `svr_cutoff_secs` is only the startup default until the first log.
 //!
 //! `AnswerUpdated` is not read: an SVR feed emits it at the public transmit too, before the price is
 //! in effect. The block path cross-checks the model against each block's snapshot (runner.rs), which
@@ -31,6 +36,7 @@ use crate::runner::SideEvent;
 sol! {
     event NewTransmission(uint32 indexed aggregatorRoundId, int192 answer, address transmitter, uint32 observationsTimestamp, int192[] observations, bytes observers, int192 juelsPerFeeCoin, bytes32 configDigest, uint40 epochAndRound);
     event SecondaryRoundIdUpdated(uint32 indexed secondaryRoundId);
+    event CutoffTimeSet(uint32 cutoffTime);
 }
 
 /// Where an oracle event sits in the chain.
@@ -49,6 +55,9 @@ pub enum OracleLogEvent {
     Transmission { aggregator: Address, round: u32, answer: U256, at: LogPos },
     /// The SVR secondary of `round` (Atlas metacall): the pending answer of that round takes effect.
     Secondary { aggregator: Address, round: u32, at: LogPos },
+    /// The DualAggregator's SVR cutoff changed to `cutoff_secs` (seconds): the window an unauctioned
+    /// primary waits before the proxy serves it.
+    CutoffChanged { aggregator: Address, cutoff_secs: u32, at: LogPos },
     /// A log of `aggregator` was removed by a reorg: what the model took from it may be wrong.
     Removed { aggregator: Address },
     /// The subscription was (re)established after a gap: events may have been missed.
@@ -56,7 +65,8 @@ pub enum OracleLogEvent {
 }
 
 impl OracleLogEvent {
-    /// The block of a transmission or secondary.
+    /// The block of a transmission or secondary. A cutoff change is applied the moment it arrives
+    /// (it does not depend on the block's timestamp), so it is deliberately not held by position.
     pub fn pos(&self) -> Option<LogPos> {
         match self {
             OracleLogEvent::Transmission { at, .. } | OracleLogEvent::Secondary { at, .. } => Some(*at),
@@ -85,6 +95,10 @@ pub fn decode(log: &Log) -> Option<OracleLogEvent> {
         t if *t == SecondaryRoundIdUpdated::SIGNATURE_HASH => {
             let e = SecondaryRoundIdUpdated::decode_log(&log.inner).ok()?.data;
             Some(OracleLogEvent::Secondary { aggregator, round: e.secondaryRoundId, at })
+        }
+        t if *t == CutoffTimeSet::SIGNATURE_HASH => {
+            let e = CutoffTimeSet::decode_log(&log.inner).ok()?.data;
+            Some(OracleLogEvent::CutoffChanged { aggregator, cutoff_secs: e.cutoffTime, at })
         }
         _ => None,
     }
@@ -136,7 +150,7 @@ pub fn spawn(name: String, ws_url: String, mut addresses: Vec<Address>, tx: mpsc
             let addrs = addr_rx.borrow_and_update().clone();
             let r = async {
                 let provider = ProviderBuilder::new().connect_ws(WsConnect::new(ws_url.as_str())).await?;
-                let filter = Filter::new().address(addrs.clone()).event_signature(vec![NewTransmission::SIGNATURE_HASH, SecondaryRoundIdUpdated::SIGNATURE_HASH]);
+                let filter = Filter::new().address(addrs.clone()).event_signature(vec![NewTransmission::SIGNATURE_HASH, SecondaryRoundIdUpdated::SIGNATURE_HASH, CutoffTimeSet::SIGNATURE_HASH]);
                 let mut stream = provider.subscribe_logs(&filter).await?.into_stream();
                 info!(endpoint = %name, aggregators = addrs.len(), "oracle logs subscribed");
                 if connected_before && tx.send(SideEvent::Oracle(OracleLogEvent::Reconnected)).await.is_err() {
@@ -221,6 +235,32 @@ mod tests {
             }
             e => panic!("{e:?}"),
         }
+    }
+
+    #[test]
+    fn cutoff_event_signature_is_the_onchain_topic() {
+        // Guards the ABI against the DualAggregator's real event (setCutoffTime(uint32) =
+        // 0xb17f2a6b; its log is CutoffTimeSet(uint32)), so a wrong signature can't silently stop
+        // cutoff updates. Topic verified on Base 2026-11-06.
+        assert_eq!(
+            CutoffTimeSet::SIGNATURE_HASH,
+            "0xb24a681ce3399a408a89fd0c2b59dfc24bdad592b1c7ec7671cf060596c1c4d1".parse::<B256>().unwrap()
+        );
+    }
+
+    #[test]
+    fn decodes_a_cutoff_change() {
+        use alloy::sol_types::SolEvent;
+        let mut log = fixture().remove(0);
+        log.inner = alloy::primitives::Log { address: XRP, data: CutoffTimeSet { cutoffTime: 60 }.encode_log_data() };
+        match decode(&log) {
+            Some(OracleLogEvent::CutoffChanged { aggregator, cutoff_secs, at }) => {
+                assert_eq!((aggregator, cutoff_secs, at.block), (XRP, 60, 52_741_702));
+            }
+            e => panic!("{e:?}"),
+        }
+        // A cutoff change is applied the moment it arrives, not held by block position.
+        assert_eq!(decode(&log).and_then(|e| e.pos()), None);
     }
 
     #[test]

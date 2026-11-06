@@ -79,6 +79,19 @@ if [[ "$INSTALL_SERVICE" == "1" ]]; then
   sudo systemctl enable --now debt-keeper-shadow.service
   sudo systemctl enable --now chrony
   systemctl --no-pager status debt-keeper-shadow.service | head -5
+  # Clock check: head_age_ms and the daily budget both assume a synced clock. On a VM whose egress
+  # firewall blocks the default NTP pool (e.g. GCE with only 443/465 open), chrony silently never
+  # syncs and the clock drifts ~1 s/day. Verify sync is actually happening.
+  if command -v chronyc >/dev/null; then
+    say "clock (chronyc tracking):"
+    chronyc tracking 2>/dev/null | grep -E 'Leap status|System time' || true
+    leap=$(chronyc tracking 2>/dev/null | awk -F': *' '/Leap status/{print $2}')
+    off=$(chronyc tracking 2>/dev/null | awk '/System time/{print $4}')  # seconds, absolute
+    if [[ "$leap" != "Normal" ]] || awk -v o="${off:-9}" 'BEGIN{exit !(o+0 > 0.05)}'; then
+      say "WARNING: clock not synced (Leap '$leap', offset ${off:-?}s > 50 ms). If NTP egress is"
+      say "         blocked, point chrony at the cloud metadata server. See the deploy checklist."
+    fi
+  fi
 fi
 
 say "done"

@@ -310,7 +310,11 @@ fn ingest_log(db: &mut Connection, path: &str) -> Result<(usize, Option<f64>)> {
             let rest = rest.trim_start();
             let (level, msg) = rest.split_once(' ').unwrap_or((rest, ""));
             if level == "INFO" {
-                if msg.starts_with("bot: block block=") {
+                // The per-head line is `<target>: block block=<n> ... head_age_ms=<ms> ...`. Match
+                // on the message, not a stale "bot:" target (the crate is now liquidation_framework;
+                // the block table was silently empty, which drove the dashboard clock to extrapolate
+                // from (0, now) at 2 s and print blocks years in the future).
+                if msg.contains("block block=") {
                     let (Some(b), Some(age)) = (num(&line, "block"), num(&line, "head_age_ms")) else { continue };
                     let bts = ts - age as f64 / 1000.0;
                     first = Some(first.map_or(bts, |f: f64| f.min(bts)));

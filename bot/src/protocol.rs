@@ -63,6 +63,13 @@ impl<L> Default for Touched<L> {
     }
 }
 
+impl<L> Touched<L> {
+    /// No market was touched in the range (no position change, no liquidation).
+    pub fn is_empty(&self) -> bool {
+        self.positions.is_empty() && self.liquidations.is_empty()
+    }
+}
+
 /// What a liquidation seizes and what it repays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct Pair {

@@ -59,6 +59,8 @@ priority_fee_wei = 1000000     # 0.001 gwei
 deadline_secs = 4.0            # tx valid this long; converted to blocks with the observed block time
 replan_blocks = 5
 # replan_secs = 10.0           # the same in seconds (overrides replan_blocks; follows the measured block time)
+snapshot_max_age_ms = 1000     # reuse the last market snapshot on quiet heads until this old (skips the
+                               # per-head eth_call: the main RPC egress under 200 ms blocks). 0 = off
 # Spending limits (ledger.rs). A block-path tx is held to max_tx_cost_eth on its worst case
 # (gas_limit x (2 x base fee + priority) + L1 fee): the bid is cut to fit, and not sent if the cut bid
 # no longer beats the predicted competitor. Past daily_loss_limit_usd (realized: block path receipts
@@ -141,7 +143,9 @@ ws = "wss://mainnet.flashblocks.base.org/ws"
 observe = false
 ws = "wss://svr-bid-endpoint.chain.link/ws/solver"
 address = "0x583dcFef0D240DC80753F0F0B26513feE27D9B77"   # Atlas (Base)
-svr_cutoff_secs = 10           # an unauctioned SVR update takes effect once older than this
+svr_cutoff_secs = 10           # startup default only: an unauctioned SVR update takes effect once
+                               # older than this. The live value is read per DualAggregator from its
+                               # CutoffTimeSet log (oracle_logs.rs); this is used until the first one.
 # rpc = ["secondary"]          # [[rpc]] names for auction valuations, in order (empty = the main pool)
 # logs_ws = "primary"          # [[rpc]] name whose ws serves the oracle logs (empty = the first ws)
 control = "0xa5E1a36938769cbd5a26f5e19D8FCB379f597c83"   # Base DappControl (Chainlink searcher docs)
