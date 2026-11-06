@@ -1,9 +1,31 @@
 # Changelog
 
-## v0.2.2 (unreleased)
+## v0.2.3 (unreleased)
+
+Fixes from the v0.2.2 post-Denim shadow run (GCP, 2026-11-06).
+
+- SVR primaries in flight are queued per aggregator instead of a single slot. When a public primary
+  for an aggregator arrived before the previous one had passed its cutoff, the newer one overwrote
+  the older; the chain still served the older at its cutoff, so the model read the resulting price
+  change as a missed oracle update (`oracle logs missed an update` — mostly ETH/USD in a fast
+  market, i.e. when accurate prices matter most). The model now keeps each in-flight primary until
+  it takes effect or a later round supersedes it, and each head serves the newest primary past its
+  cutoff (`latestRoundData` only moves forward, so an older expired or an un-auctioned skipped round
+  is never re-served). Regression tests cover two primaries in flight, a head gap past both cutoffs,
+  an auction for the newer round, and a redelivered log. The local shadow snapshot ends before the
+  window the run observed, so this is verified by unit test rather than by log replay.
+
+## v0.2.2 (2026-11-06)
 
 Fixes from the first post-Denim shadow run (GCP, 2026-11-02..06).
 
+- Per-head snapshot traffic: the market snapshot `eth_call` (the bulk of the VM's egress under
+  200 ms blocks) is reused on quiet heads instead of refetched every block. A fresh snapshot is
+  taken only when a log touched a market, an oracle update landed (log or an SVR primary past its
+  cutoff), or the last real snapshot is older than `[exec] snapshot_max_age_ms` (default 1000);
+  other heads reuse it and accrue interest locally. Only a genuinely fetched snapshot feeds the
+  Atlas cross-check, so throttling does not create false missed-update reports. A non-Chainlink
+  (e.g. ERC-4626) rate may lag up to that bound.
 - SVR cutoff from the chain: the window an unauctioned SVR primary waits before the proxy serves it
   is read per DualAggregator from its `CutoffTimeSet(uint32)` log (added to the `oracle_logs`
   subscription, same addresses) instead of trusting a single config constant. `[atlas]
