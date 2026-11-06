@@ -86,8 +86,14 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // Default to info, but quiet alloy's WebSocket transport: post-Denim a flapping free-tier WS
+    // makes it log an error per reconnect attempt (~16k/h seen). Our own reconnect WARNs
+    // (onchain_core::heads) still show. RUST_LOG overrides the whole thing.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,alloy_transport_ws=warn,alloy_pubsub=warn,alloy_rpc_client=warn".into()),
+        )
         .init();
     let cli = Cli::parse();
     let cfg = Config::load(&cli.config)?;

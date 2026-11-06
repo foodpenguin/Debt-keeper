@@ -145,6 +145,9 @@ them. The walkthrough is in [docs/architecture.md](docs/architecture.md).
 - Live mode is always started by the operator. Before going live set a priority-fee cap, a daily
   gas cap, a market allowlist (permissionless lending has markets with fake tokens or oracles) and
   a kill switch.
+- Keep the clock synced: `head_age_ms` and the daily budget assume it. Check with
+  `chronyc tracking` (Leap status `Normal`, offset < 50 ms). If the host's NTP egress is firewalled,
+  point chrony at a reachable server (`--install-service` warns when sync is off).
 - Several bots may sign with one hot wallet; they coordinate nonces through one lock file per
   wallet (`~/.local/state/onchain-bots/nonce-<wallet>` by default; leave `exec.nonce_file` empty).
   All of them must be built on the same `onchain-core` nonce-file version.

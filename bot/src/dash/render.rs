@@ -15,36 +15,71 @@ use crate::config::Config;
 const TEMPLATE: &str = include_str!("template.html");
 /// History shipped to the page (the longest time filter).
 const DATA_DAYS: f64 = 90.0;
-/// Display fallback for blocks no longer in `blocks`: Base makes a block every 2 s until Denim
-/// (~2026-11, 200 ms blocks); per-block rows give exact times while they are kept.
-const BLOCK_SECS: f64 = 2.0;
 /// Display time zone for the page and its daily buckets, in seconds east of UTC: env
 /// `BOT_DASH_TZ_HOURS` (e.g. "8" or "-5.5"), UTC when unset or unparsable.
 fn tz_offset() -> f64 {
     std::env::var("BOT_DASH_TZ_HOURS").ok().and_then(|h| h.trim().parse::<f64>().ok()).filter(|h| h.abs() <= 14.0).unwrap_or(0.0) * 3600.0
 }
 
-/// Block time: exact while the per-block row exists, else extrapolated from the newest block.
+/// Block <-> time from the real per-block timestamps in the `blocks` table, so it stays correct
+/// across a block-time change (Base Denim: 2 s -> 200 ms). Blocks outside the table's range are
+/// extrapolated with the measured spacing at the nearest edge, never a fixed 2 s.
 struct Clock {
-    ref_block: i64,
-    ref_ts: f64,
+    newest: (i64, f64),
+    oldest: (i64, f64),
+    fwd_spacing: f64, // s/block near the newest block (forward extrapolation)
+    bwd_spacing: f64, // s/block near the oldest block (backward extrapolation)
 }
 
 impl Clock {
     fn new(db: &Connection) -> Result<Self> {
-        let r: Option<(i64, f64)> = db.query_row("SELECT block, ts FROM blocks ORDER BY block DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        let (ref_block, ref_ts) = r.unwrap_or((0, now()));
-        Ok(Self { ref_block, ref_ts })
+        let edge = |order: &str| -> Option<(i64, f64)> {
+            db.query_row(&format!("SELECT block, ts FROM blocks ORDER BY block {order} LIMIT 1"), [], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok().flatten()
+        };
+        let newest = edge("DESC").unwrap_or((0, now()));
+        let oldest = edge("ASC").unwrap_or(newest);
+        // Local spacing: s/block over the 50 blocks nearest each edge, so the fork's 200 ms (not the
+        // old 2 s) is used near the newest edge. Robust to row count; falls back to 2 s with < 2 rows.
+        let spacing = |order: &str| -> f64 {
+            db.query_row(
+                &format!("SELECT MAX(block), MIN(block), MAX(ts), MIN(ts) FROM (SELECT block, ts FROM blocks ORDER BY block {order} LIMIT 50)"),
+                [],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, Option<f64>>(3)?)),
+            )
+            .ok()
+            .and_then(|(hb, lb, ht, lt)| Some(((ht? - lt?) / (hb? - lb?) as f64).abs()).filter(|s: &f64| s.is_finite() && *s > 0.0))
+            .unwrap_or(2.0)
+        };
+        let (fwd_spacing, bwd_spacing) = (spacing("DESC"), spacing("ASC"));
+        Ok(Self { newest, oldest, fwd_spacing, bwd_spacing })
     }
+
     fn ts(&self, db: &Connection, block: i64) -> f64 {
-        db.query_row("SELECT ts FROM blocks WHERE block = ?1", params![block], |r| r.get(0)).unwrap_or_else(|_| self.estimate(block))
+        if let Some(ts) = db.query_row("SELECT ts FROM blocks WHERE block = ?1", params![block], |r| r.get::<_, f64>(0)).optional().ok().flatten() {
+            return ts;
+        }
+        if block >= self.newest.0 {
+            return self.newest.1 + (block - self.newest.0) as f64 * self.fwd_spacing;
+        }
+        if block <= self.oldest.0 {
+            return self.oldest.1 - (self.oldest.0 - block) as f64 * self.bwd_spacing;
+        }
+        // A gap (a skipped head) inside the range: interpolate between the neighbours.
+        let near = |cmp: &str, order: &str| db.query_row(&format!("SELECT block, ts FROM blocks WHERE block {cmp} ?1 ORDER BY block {order} LIMIT 1"), params![block], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))).optional().ok().flatten();
+        match (near("<", "DESC"), near(">", "ASC")) {
+            (Some((lb, lt)), Some((hb, ht))) if hb > lb => lt + (ht - lt) * (block - lb) as f64 / (hb - lb) as f64,
+            (Some((_, lt)), _) => lt,
+            (_, Some((_, ht))) => ht,
+            _ => self.newest.1,
+        }
     }
-    fn estimate(&self, block: i64) -> f64 {
-        self.ref_ts + (block - self.ref_block) as f64 * BLOCK_SECS
-    }
-    /// First block at or after `ts` (estimated).
-    fn block_at(&self, ts: f64) -> i64 {
-        self.ref_block - ((self.ref_ts - ts) / BLOCK_SECS) as i64
+
+    /// First processed block at or after `ts` (a query lower bound), from the real timestamps.
+    fn block_at(&self, db: &Connection, ts: f64) -> i64 {
+        if ts > self.newest.1 {
+            return self.newest.0 + ((ts - self.newest.1) / self.fwd_spacing.max(1e-6)) as i64;
+        }
+        db.query_row("SELECT MIN(block) FROM blocks WHERE ts >= ?1", params![ts], |r| r.get::<_, Option<i64>>(0)).optional().ok().flatten().flatten().unwrap_or(self.oldest.0)
     }
 }
 
@@ -150,7 +185,7 @@ fn liquidations(db: &Connection, clock: &Clock, since: f64) -> Result<Vec<Value>
          FROM liquidations l LEFT JOIN liq_txs t ON t.tx = l.tx WHERE l.block >= ?1 ORDER BY l.block DESC",
     )?;
     let rows: Vec<LiquidationDbRow> =
-        q.query_map(params![clock.block_at(since)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?;
+        q.query_map(params![clock.block_at(db, since)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?;
     Ok(rows
         .into_iter()
         .map(|(b, m, g, l, o, a, tx, who)| json!([clock.ts(db, b), m, g.unwrap_or(0.0), l, o, a.map(|a| if a { "atlas" } else { "direct" }), tx, who]))
@@ -169,7 +204,7 @@ fn auctions(db: &Connection, clock: &Clock, since: f64, eth_usd_now: f64) -> Res
     let mut rows: Vec<Value> = vec![];
     let mut matched: std::collections::HashSet<(i64, i64)> = Default::default();
     let raw: Vec<_> = q
-        .query_map(params![clock.block_at(since)], |r| {
+        .query_map(params![clock.block_at(db, since)], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
@@ -227,7 +262,7 @@ fn paper(db: &Connection, clock: &Clock, since: f64, cfg: &Config) -> Result<Val
          WHERE a.liquidatable > 0 AND a.bid_basis = 'bundle_net' AND t.win_bid_eth IS NOT NULL AND a.head >= ?1 ORDER BY a.head",
     )?;
     let rows: Vec<PaperRow> = q
-        .query_map(params![clock.block_at(since)], |r| Ok((r.get(0)?, r.get::<_, Option<f64>>(1)?.unwrap_or(0.0), r.get::<_, Option<f64>>(2)?.unwrap_or(0.0), r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
+        .query_map(params![clock.block_at(db, since)], |r| Ok((r.get(0)?, r.get::<_, Option<f64>>(1)?.unwrap_or(0.0), r.get::<_, Option<f64>>(2)?.unwrap_or(0.0), r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let deadline = cfg.atlas.paper_deadline_ms as i64;
     let mut margins = vec![];
@@ -280,11 +315,15 @@ fn paper(db: &Connection, clock: &Clock, since: f64, cfg: &Config) -> Result<Val
 
 /// [day (Taipei, days since epoch), valued, with liquidatable, skipped]
 fn auction_days(db: &Connection, clock: &Clock, since: f64) -> Result<Vec<Value>> {
+    // Day from the head's real timestamp (blocks table); fall back to the newest edge's spacing,
+    // never a fixed 2 s, for the rare head with no block row.
     let mut q = db.prepare(
-        "SELECT CAST((?2 + (head - ?3) * ?4 + ?5) / 86400 AS INTEGER) d, count(*), sum(liquidatable > 0), sum(skipped IS NOT NULL)
-         FROM atlas_auctions WHERE head >= ?1 GROUP BY d ORDER BY d",
+        "SELECT CAST((COALESCE(b.ts, ?2 + (a.head - ?3) * ?4) + ?5) / 86400 AS INTEGER) d,
+                count(*), sum(a.liquidatable > 0), sum(a.skipped IS NOT NULL)
+         FROM atlas_auctions a LEFT JOIN blocks b ON b.block = a.head
+         WHERE a.head >= ?1 GROUP BY d ORDER BY d",
     )?;
-    let rows = q.query_map(params![clock.block_at(since), clock.ref_ts, clock.ref_block, BLOCK_SECS, tz_offset()], |r| Ok(json!([r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?])))?;
+    let rows = q.query_map(params![clock.block_at(db, since), clock.newest.1, clock.newest.0, clock.fwd_spacing, tz_offset()], |r| Ok(json!([r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?])))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -296,7 +335,7 @@ fn exits(db: &Connection, clock: &Clock, since: f64) -> Result<Vec<Value>> {
                 (SELECT sum(gross_usd) FROM liquidations l WHERE l.tx = e.tx), (SELECT group_concat(DISTINCT market) FROM liquidations l WHERE l.tx = e.tx)
          FROM liq_exits e WHERE e.block >= ?1 ORDER BY e.block DESC",
     )?;
-    let rows = q.query_map(params![clock.block_at(since)], |r| {
+    let rows = q.query_map(params![clock.block_at(db, since)], |r| {
         let parse = |s: Option<String>| s.and_then(|s| serde_json::from_str::<Value>(&s).ok()).unwrap_or(Value::Null);
         Ok(json!({
             "t": clock.ts(db, r.get::<_, i64>(0)?), "tx": r.get::<_, String>(1)?, "actor": r.get::<_, Option<String>>(2)?, "eoa": r.get::<_, Option<String>>(3)?,
@@ -359,7 +398,7 @@ fn rpc(db: &Connection, clock: &Clock) -> Result<Value> {
             _ => n, // first snapshot of a run
         };
         prev.insert(key, (up, n));
-        let ts = clock.estimate(block);
+        let ts = clock.ts(db, block);
         if ts >= month_start {
             *month.entry(ep.clone()).or_default().entry(method).or_default() += delta as f64;
         }
@@ -414,5 +453,33 @@ mod tests {
     #[test]
     fn template_has_the_data_slot() {
         assert!(TEMPLATE.contains("/*__DATA__*/null"), "render replaces this placeholder");
+    }
+
+    #[test]
+    fn clock_uses_real_timestamps_across_a_block_time_change() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute("CREATE TABLE blocks (block INTEGER PRIMARY KEY, ts REAL)", []).unwrap();
+        // 20 pre-Denim 2 s blocks (1000..1019 at 10_000..10_038), then 60 post-Denim 200 ms blocks
+        // (1020..1079, five per second from 10_040) so the newest 50 are all post-fork.
+        for n in 0..20u64 {
+            db.execute("INSERT INTO blocks VALUES (?1, ?2)", params![1000 + n as i64, 10_000.0 + 2.0 * n as f64]).unwrap();
+        }
+        for k in 0..60u64 {
+            db.execute("INSERT INTO blocks VALUES (?1, ?2)", params![1020 + k as i64, 10_040.0 + (k / 5) as f64]).unwrap();
+        }
+        let c = Clock::new(&db).unwrap();
+        // Exact rows: last pre-fork and a mid post-fork block.
+        assert_eq!(c.ts(&db, 1019), 10_038.0);
+        assert_eq!(c.ts(&db, 1033), 10_042.0); // 14th post-fork block -> second 10_042
+        // A gap (skipped head) interpolates between neighbours, not at 2 s.
+        db.execute("DELETE FROM blocks WHERE block = 1032", []).unwrap();
+        assert!((c.ts(&db, 1032) - 10_042.0).abs() < 0.3, "{}", c.ts(&db, 1032));
+        // Forward extrapolation uses the ~0.2 s post-fork spacing, not 2 s: 50 blocks past the newest
+        // is ~10 s later, nowhere near the +100 s the old 2 s constant gave (the 2030 bug).
+        let newest = 1079;
+        assert!((c.ts(&db, newest + 50) - c.ts(&db, newest)) < 30.0, "forward extrapolation must use post-fork spacing");
+        // block_at maps a post-fork time back to a block in range.
+        let b = c.block_at(&db, 10_041.5);
+        assert!((1025..=1035).contains(&b), "block_at post-fork = {b}");
     }
 }

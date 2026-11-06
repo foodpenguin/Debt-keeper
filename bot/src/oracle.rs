@@ -143,6 +143,9 @@ pub struct PriceModel {
     /// SVR aggregator -> the round of its pending answer, when known (oracle logs carry it; the
     /// Flashblocks decoder does not).
     pending_round: HashMap<Address, u32>,
+    /// SVR aggregator -> its cutoff (seconds), read from the DualAggregator's `CutoffTimeSet` log.
+    /// Absent until a log arrives: `due` then falls back to the config `svr_cutoff_secs`.
+    cutoffs: HashMap<Address, u64>,
 }
 
 impl PriceModel {
@@ -331,11 +334,29 @@ impl PriceModel {
         a
     }
 
+    /// Records an aggregator's SVR cutoff from a `CutoffTimeSet` log (seconds). Returns whether it
+    /// changed, for logging. The value takes effect on the next `due` evaluation.
+    pub fn set_cutoff(&mut self, aggregator: Address, cutoff_secs: u64) -> bool {
+        self.cutoffs.insert(aggregator, cutoff_secs) != Some(cutoff_secs)
+    }
+
+    /// The cutoff (seconds) in effect for `aggregator`: its logged value, else the config `default`.
+    pub fn cutoff_for(&self, aggregator: Address, default: u64) -> u64 {
+        self.cutoffs.get(&aggregator).copied().unwrap_or(default)
+    }
+
     /// Pending SVR primaries no auction carried, now old enough to be what the proxy serves in a
-    /// block with timestamp `ts`: the proxy switches once `ts > primary_ts + cutoff` (strictly;
-    /// on Base an unauctioned update took effect ~12 s = 6 blocks later).
-    pub fn due(&self, ts: u64, cutoff_secs: u64) -> Vec<(Address, U256)> {
-        self.pending.iter().filter(|(_, (_, pts))| *pts > 0 && ts > pts + cutoff_secs).map(|(a, (ans, _))| (*a, *ans)).collect()
+    /// block with timestamp `ts`: the proxy switches once `ts > primary_ts + cutoff` (strictly; on
+    /// Base an unauctioned update took effect ~12 s = 6 blocks later). The cutoff is each
+    /// aggregator's logged `CutoffTimeSet` value, falling back to `default` (config
+    /// `svr_cutoff_secs`) until its first log. `ts` is the block timestamp in whole seconds (Denim
+    /// has no sub-second granularity), matching the on-chain `block.timestamp` comparison.
+    pub fn due(&self, ts: u64, default: u64) -> Vec<(Address, U256)> {
+        self.pending
+            .iter()
+            .filter(|(agg, (_, pts))| *pts > 0 && ts > *pts + self.cutoff_for(**agg, default))
+            .map(|(a, (ans, _))| (*a, *ans))
+            .collect()
     }
 
     /// (market, price) if `aggregator` answered `answer`, without changing anything (to value an
@@ -395,6 +416,7 @@ impl PriceModel {
             watched: Watched::default(),
             pending: HashMap::new(),
             pending_round: HashMap::new(),
+            cutoffs: HashMap::new(),
         }
     }
 }
@@ -485,6 +507,24 @@ mod tests {
         // Absurd base answer: the product overflows U256 -> no price instead of a panic.
         assert_eq!(m.apply(ETH, U256::MAX, Path::Primary, 1000), Applied::Moved(vec![]));
         assert_eq!(m.price(0), None);
+    }
+
+    #[test]
+    fn a_logged_cutoff_overrides_the_config_default_per_aggregator() {
+        let mut m = model(true);
+        let new = U256::from(127_840_411u64);
+        assert!(matches!(m.apply(XRP, new, Path::Primary, 1000), Applied::Deferred(_)));
+        // Default cutoff 10 s (strict >): a block at 1010 is not yet due, 1011 is.
+        assert!(m.due(1010, 10).is_empty());
+        assert_eq!(m.due(1011, 10), vec![(XRP, new)]);
+        // CutoffTimeSet moved XRP's cutoff to 30 s: now due only past 1030, config default ignored.
+        assert!(m.set_cutoff(XRP, 30));
+        assert!(!m.set_cutoff(XRP, 30), "no change reported when the value is the same");
+        assert_eq!(m.cutoff_for(XRP, 10), 30);
+        assert!(m.due(1030, 10).is_empty());
+        assert_eq!(m.due(1031, 10), vec![(XRP, new)]);
+        // An aggregator with no logged cutoff still uses the default.
+        assert_eq!(m.cutoff_for(ETH, 10), 10);
     }
 
     #[test]
