@@ -1,6 +1,16 @@
 # Changelog
 
-## v0.2.3 (unreleased)
+## v0.2.4 (unreleased)
+
+- Dashboard backlog drain: `bot dashboard --drain` keeps looking up liquidation txs until the
+  backlog is cleared, instead of one `LOOKUPS_PER_PASS` (40) batch. A busy day leaves hundreds of
+  txs behind and the per-minute loop only clears 40 a pass, so winners for most auctions stayed
+  `null` on a host that ran the pass once (it is not a decode bug). `scripts/dashboard_loop.sh`
+  gains `BIN` / `WORKDIR` overrides (render a copied run, e.g. a shadow snapshot, with another
+  build) and a one-shot `once` / `drain` mode. The periodic loop is unchanged: one gentle batch per
+  pass.
+
+## v0.2.3 (2026-11-06)
 
 Fixes from the v0.2.2 post-Denim shadow run (GCP, 2026-11-06).
 
