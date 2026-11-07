@@ -90,7 +90,18 @@ const FETCH_RETRY_SECS: f64 = 300.0;
 const WALLET_EVERY_SECS: f64 = 600.0;
 const BACKUPS_KEPT: usize = 14;
 
+/// One dashboard pass: ingest, look up up to `LOOKUPS_PER_PASS` liquidation txs, render.
 pub async fn run(cfg: &Config) -> Result<()> {
+    run_inner(cfg, false).await
+}
+
+/// Like `run`, but keep looking up liquidation txs until the backlog is drained (one-shot
+/// catch-up; `bot dashboard --drain`). A single render at the end.
+pub async fn run_drain(cfg: &Config) -> Result<()> {
+    run_inner(cfg, true).await
+}
+
+async fn run_inner(cfg: &Config, drain: bool) -> Result<()> {
     let d = &cfg.dashboard;
     if let Some(dir) = std::path::Path::new(&d.db_path).parent() {
         std::fs::create_dir_all(dir).ok();
@@ -112,8 +123,17 @@ pub async fn run(cfg: &Config) -> Result<()> {
 
     if let Some(url) = rpc_url(cfg)? {
         let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
-        if let Err(e) = fetch_liq_raw(&db, &http, &url).await {
-            warn!(error = format!("{e:#}"), "dashboard: liquidation tx fetch failed");
+        // One batch per pass keeps a busy day's backlog from bursting the endpoint; `--drain`
+        // loops until a pass fetches fewer than a full batch (the rest are in timed backoff).
+        loop {
+            match fetch_liq_raw(&db, &http, &url).await {
+                Ok(fetched) if drain && fetched >= LOOKUPS_PER_PASS => continue,
+                Ok(_) => break,
+                Err(e) => {
+                    warn!(error = format!("{e:#}"), "dashboard: liquidation tx fetch failed");
+                    break;
+                }
+            }
         }
         if let Err(e) = analyze_liq_txs(&db, &http, &url, cfg).await {
             warn!(error = format!("{e:#}"), "dashboard: liquidation decoding failed");
@@ -493,7 +513,7 @@ fn decode_metacall(input: &Bytes, receipt: &Value) -> Option<MetacallBids> {
 /// per pass), stored verbatim in liq_raw. A tx the RPC does not serve is set aside with backoff
 /// (liq_fetch_fail) so it cannot hold up the ones behind it; 3 failures in a row end the pass
 /// (the endpoint itself is likely down).
-async fn fetch_liq_raw(db: &Connection, http: &reqwest::Client, url: &str) -> Result<()> {
+async fn fetch_liq_raw(db: &Connection, http: &reqwest::Client, url: &str) -> Result<usize> {
     let todo: Vec<(String, i64)> = {
         let mut q = db.prepare(
             "SELECT DISTINCT l.tx, l.block FROM liquidations l LEFT JOIN liq_raw r ON r.tx = l.tx LEFT JOIN liq_fetch_fail f ON f.tx = l.tx
@@ -501,6 +521,7 @@ async fn fetch_liq_raw(db: &Connection, http: &reqwest::Client, url: &str) -> Re
         )?;
         q.query_map(params![LOOKUPS_PER_PASS as i64, FETCH_TRIES, FETCH_RETRY_SECS, now()], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
     };
+    let n = todo.len();
     let mut failed_in_row = 0;
     for (hash, block) in todo {
         let tx = rpc(http, url, "eth_getTransactionByHash", json!([hash])).await;
@@ -530,7 +551,7 @@ async fn fetch_liq_raw(db: &Connection, http: &reqwest::Client, url: &str) -> Re
             }
         }
     }
-    Ok(())
+    Ok(n)
 }
 
 /// One eth_call; None on revert / empty.

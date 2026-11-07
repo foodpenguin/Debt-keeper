@@ -79,7 +79,13 @@ enum Cmd {
     Report,
     /// One dashboard pass: ingest the journal + run log into SQLite, look up Atlas winners and the
     /// wallet balance on dashboard.rpc, render dashboard.html (scripts/dashboard_loop.sh).
-    Dashboard,
+    Dashboard {
+        /// Keep fetching liquidation txs until the backlog is drained, instead of one
+        /// LOOKUPS_PER_PASS batch. For a one-shot catch-up (a busy day leaves hundreds of txs
+        /// behind, and the per-minute loop only clears 40 a pass); the periodic loop omits it.
+        #[arg(long)]
+        drain: bool,
+    },
     /// Serves the dashboard on 127.0.0.1:[dashboard] live_port, with a live section of the
     /// positions closest to liquidation (the snapshot `watch` writes every block). Read-only, no RPC.
     Live,
@@ -109,8 +115,8 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli, cfg: Config, live_signer: Option<alloy::signers::local::PrivateKeySigner>) -> Result<()> {
-    if let Cmd::Dashboard = cli.cmd {
-        return dash::run(&cfg).await;
+    if let Cmd::Dashboard { drain } = cli.cmd {
+        return if drain { dash::run_drain(&cfg).await } else { dash::run(&cfg).await };
     }
     if let Cmd::Live = cli.cmd {
         return live::serve(&cfg.dashboard).await;
@@ -127,7 +133,7 @@ async fn run(cli: Cli, cfg: Config, live_signer: Option<alloy::signers::local::P
         Cmd::Plan { market, user, price_drop_bps, at_block, pending } => runner.plan(&market, user, price_drop_bps, at_block, pending).await,
         Cmd::ValueAuction { market, price_drop_bps, at_block, users, kyber } => runner.value_auction(&market, price_drop_bps, at_block, &users, kyber).await,
         Cmd::Report => unreachable!("handled before connecting"),
-        Cmd::Dashboard => unreachable!("handled before connecting"),
+        Cmd::Dashboard { .. } => unreachable!("handled before connecting"),
         Cmd::Live => unreachable!("handled before connecting"),
     }
 }
