@@ -390,6 +390,9 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         bundle_gas: BundleGas,
         use_kyber: bool,
         flash_headroom_bps: u64,
+        // Gas price (wei) to weigh the exits at: the Atlas auction's (max_fee x (1 + surcharge)),
+        // where gas dominates; None falls back to the planner's own route gas price.
+        gas_price_wei: Option<u128>,
     ) -> BundleQuote {
         let t0 = Instant::now();
         let Some(pair) = views.first().map(|v| v.pair) else {
@@ -439,8 +442,9 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         };
         let (direct, kyber) = tokio::join!(direct, kyber);
         q.quote_ms = t0.elapsed().as_millis() as u64;
-        // Route selection weighs the exits at the caller's gas price (the auction's at live time).
-        let gas_price = self.route_gas_price(base_fee_wei);
+        // Route selection weighs the exits at the auction's gas price when given (gas dominates at
+        // 15 gwei: a lower-gas exit can beat a higher-output one), else the planner's own.
+        let gas_price = gas_price_wei.map(|w| w as f64).unwrap_or_else(|| self.route_gas_price(base_fee_wei));
         let gas_units = |e: &BundleExit| e.3 + bundle_gas.per_position * views.len() as u64 + bundle_gas.overhead;
         let net = |e: &BundleExit| e.2 - gas_units(e) as f64 * gas_price / 1e18 * eth_usd;
         let de = direct.as_ref().ok().map(|x| &x.0);
@@ -719,7 +723,7 @@ mod generic_tests {
         assert_eq!(v.max_seize, U256::from(90u64));
 
         let planner = Planner { protocol: &toy, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000 }, false, 5).await;
+        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000 }, false, 5, None).await;
         assert_eq!(q.positions, 1);
         let err = q.error.unwrap();
         assert!(err.contains("no direct pools") && err.contains("mockdex: off (mockdex quotes"), "{err}");

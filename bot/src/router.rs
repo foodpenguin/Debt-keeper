@@ -35,10 +35,16 @@ async fn read_json(req: reqwest::RequestBuilder) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("kyber http {status}: {}", text.chars().take(200).collect::<String>()))
 }
 
-/// Gas prices (wei) Kyber is asked to price route gas at: its default (the live price) and 100 gwei,
-/// which trades a little output for far fewer split paths. Two rungs, not more: a big quote takes
-/// Kyber 0.4-1.4 s and parallel bursts get throttled (2026-10-19: 4 plans x 9 quotes all fell back).
-const KYBER_GAS_LADDER: [Option<u128>; 2] = [None, Some(100_000_000_000)];
+/// Gas prices (wei) Kyber is asked to price route gas at: its default (the live price, best output)
+/// and a forcing ~1000 gwei penalty that collapses the route to a single PMM/RFQ or pool path (a
+/// little less output for far less gas). The forcing value is deliberate, not the real fee: measured
+/// 2026-11-08, 100 gwei was too weak to collapse a split $50k route at the real ~15 gwei auction
+/// price (whether it collapsed depended mostly on transient `pmm-19` RFQ depth, hence the earlier
+/// "identical routes" observation), while 1000 gwei reliably returned 1 path / ~0.28M gas that fits
+/// the Atlas 6M cap. The live-price rung wins when it fits the budget; the forcing rung is the
+/// guaranteed-fits fallback. Two rungs, not more: a big quote takes Kyber 0.4-1.4 s and parallel
+/// bursts get throttled (2026-10-19: 4 plans x 9 quotes all fell back).
+const KYBER_GAS_LADDER: [Option<u128>; 2] = [None, Some(1_000_000_000_000)];
 /// Real gas of a Kyber swap inside our liquidation vs Kyber's estimate (2026-10-19: 12.67M real
 /// for a route Kyber put at ~8M).
 pub const KYBER_GAS_SAFETY: f64 = 1.6;
@@ -73,7 +79,14 @@ impl Kyber {
     /// One route. `gas_price_wei` (None = Kyber's default, the live price) is what Kyber charges each
     /// unit of route gas when it compares splits: a high value buys fewer, cheaper paths.
     pub async fn quote(&self, token_in: Address, token_out: Address, amount_in: U256, gas_price_wei: Option<u128>) -> Result<Quote> {
-        let mut query = vec![("tokenIn", format!("{token_in:#x}")), ("tokenOut", format!("{token_out:#x}")), ("amountIn", amount_in.to_string())];
+        // gasInclude=true asks for gas-aware route selection and populates routeSummary.gas/gasUsd
+        // (harmless at the default price; needed for the gasPrice penalty to bite).
+        let mut query = vec![
+            ("tokenIn", format!("{token_in:#x}")),
+            ("tokenOut", format!("{token_out:#x}")),
+            ("amountIn", amount_in.to_string()),
+            ("gasInclude", "true".to_string()),
+        ];
         if let Some(g) = gas_price_wei {
             query.push(("gasPrice", g.to_string()));
         }

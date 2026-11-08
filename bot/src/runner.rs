@@ -1365,6 +1365,9 @@ async fn valuation<P: Provider>(
     // bursts, and the bundle quote already priced the Kyber exit.
     let planner = parts.planner("direct");
     let planner_top = parts.planner(if live { "best" } else { "direct" });
+    // The exits are weighed at what Atlas charges a solver op's gas (the auction's max fee plus the
+    // escrow surcharge), where gas dominates, so a lower-gas exit can beat a higher-output one.
+    let auction_gas_wei = (a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge)) as u128;
     let valued = futures::future::join_all(markets.iter().map(|m| async {
         let mut overrides = StateOverride::default();
         overrides.insert(m.meta.params.oracle, AccountOverride { code: Some(sim::constant_price_oracle(m.snap.price)), ..Default::default() });
@@ -1373,7 +1376,7 @@ async fn valuation<P: Provider>(
         let fit = &m.liq[..m.liq.len().min(atlas_venue::bundle_capacity(atlas.solver_gas_limit, atlas.max_bundle_positions))];
         let bundle = match fit.is_empty() {
             true => None,
-            false => Some(planner.quote_bundle(provider, &m.meta, &m.snap, fit, head.number, &overrides, head.base_fee, eth_usd, atlas_venue::bundle_swap_budget(atlas.solver_gas_limit, fit.len()), atlas_venue::ATLAS_BUNDLE_GAS, live, atlas.flash_headroom_bps).await),
+            false => Some(planner.quote_bundle(provider, &m.meta, &m.snap, fit, head.number, &overrides, head.base_fee, eth_usd, atlas_venue::bundle_swap_budget(atlas.solver_gas_limit, fit.len()), atlas_venue::ATLAS_BUNDLE_GAS, live, atlas.flash_headroom_bps, Some(auction_gas_wei)).await),
         };
         let bundle_ms = a.seen.elapsed().as_millis() as u64;
         let ctxs: Vec<PlanCtx<Morpho>> = m
