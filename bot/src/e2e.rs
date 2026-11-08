@@ -347,6 +347,75 @@ async fn e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation() {
     assert!(nets[2].is_none(), "a 1 ETH bid on a 0.1 WETH liquidation cannot be paid");
 }
 
+/// The Atlas BATCH solver op end to end (simulation only): several cbXRP/USDC positions liquidated
+/// in one Morpho flash loan, their collateral sold in a single direct exit, inside a solver op that
+/// buys and pays an ETH bid. Replays the 2026-11-07 02:53 auction (block 54148058, the winner's
+/// borrowers; needs an archive fork — run with BASE_FORK_URL = the Alchemy archive). The bid comes
+/// out of the profit; a bid the profit cannot cover makes the op fail (contract keeps nothing).
+#[tokio::test]
+#[ignore = "needs anvil + an archive fork; run with --ignored"]
+async fn e2e_atlas_batch_solver_op() {
+    use alloy::{eips::BlockId, rpc::types::state::StateOverride};
+
+    use crate::{
+        atlas_venue::{AtlasBid, AtlasSolver, SIM_SOLVER},
+        dex::ExitRoute,
+        planner::BundlePlan,
+        venue::LiquidationVenue,
+    };
+    const ATLAS: Address = address!("583dcFef0D240DC80753F0F0B26513feE27D9B77");
+    const WETH: Address = address!("4200000000000000000000000000000000000006");
+    const UNI_ROUTER: Address = address!("2626664c2603336E57B271c5C0b26F421741e481");
+    const XRP_MARKET: B256 = b256!("d4a903dc6d949519060c7707f9604fdc9772c046e05c2e3a8fce0bd7196e4109");
+    const PANCAKE_XRP_WETH_500: Address = address!("170b6bFc071426aaB7C81AE12383219facBb6B6A");
+    const FORK_BLOCK: u64 = 54148058;
+    let price_after: U256 = "1164024870000000000000000000000000000".parse().unwrap(); // 1.16402487e36
+
+    let fork = std::env::var("BASE_FORK_URL").unwrap_or_else(|_| "https://base.gateway.tenderly.co".into());
+    let anvil = Anvil::new().fork(fork).fork_block_number(FORK_BLOCK).chain_id(8453).spawn();
+    let p = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let signer = anvil.addresses()[1];
+    let meta = onchain::load_market_meta(&p, MORPHO, XRP_MARKET, "cbXRP/USDC").await.unwrap();
+    p.anvil_set_code(meta.params.oracle, sim::constant_price_oracle(price_after)).await.unwrap();
+    let n = p.get_block_number().await.unwrap();
+
+    let solver_code = sim::LiquidatorCode::build(&p, "../contracts/out/AtlasLiquidationSolver.sol/AtlasLiquidationSolver.json", &[ATLAS, WETH, signer, signer, signer], signer).await.unwrap();
+    let liq_code = sim::LiquidatorCode::build(&p, "../contracts/out/MorphoLiquidator.sol/MorphoLiquidator.json", &[MORPHO, SIM_SOLVER, SIM_SOLVER, SIM_SOLVER], SIM_SOLVER).await.unwrap();
+    let mut liq = Simulator::new(None, SIM_SOLVER, Some(liq_code), vec![]);
+    liq.add_approval(USDC, sim::discover_allowance_key(&p, USDC, liq.liquidator, MORPHO).await.unwrap());
+    let art: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("../contracts/out/AtlasStub.sol/AtlasStub.json").unwrap()).unwrap();
+    let stub: Bytes = art["deployedBytecode"]["object"].as_str().unwrap().parse().unwrap();
+    let solver = AtlasSolver::new(ATLAS, None, signer, WETH, UNI_ROUTER, 500, liq, Some(solver_code), stub);
+
+    // Three of the auction's borrowers, each seized at 1/1000 so the direct exit stays executable.
+    let items: Vec<(Address, U256)> = [
+        (address!("75d871189219172514178AD4ab4E35444c8c2d0c"), 194871528250u64),
+        (address!("2e6a6B91C5B0432f0dA00C7b0DD3e65baef0E709"), 24975700233u64),
+        (address!("504B9B3058064B12b8C2B207B898e2e618A9d153"), 22546096380u64),
+    ]
+    .into_iter()
+    .map(|(b, s)| (b, U256::from(s) / U256::from(1000u64)))
+    .collect();
+    let total_seize: U256 = items.iter().map(|(_, s)| *s).fold(U256::ZERO, |a, b| a + b);
+    // One 2-hop route (cbXRP -> WETH -> USDC) selling the whole seized amount.
+    let route: Vec<u8> = [hop(PANCAKE_XRP_WETH_500, 0, total_seize.to::<u128>()), hop(UNI_WETH_USDC_500, 3, 0)].concat();
+    let flash_assets = total_seize * price_after / U256::from(10u64).pow(U256::from(36u64)) + U256::from(1_000_000u64);
+    let plan = BundlePlan { items: items.clone(), total_seize, flash_assets, exit: ExitRoute::Packed(route.into()), router: "direct", gas_est: 1_500_000 };
+
+    let mut nets = vec![];
+    for bid_wei in [U256::ZERO, U256::from(10u64).pow(U256::from(15)), U256::from(10u64).pow(U256::from(18))] {
+        let inner = solver.batch_inner(&meta, &plan, n + 5);
+        let calldata = solver.calldata(USDC, &inner, bid_wei, U256::ZERO);
+        let venue = AtlasBid { solver: &solver, bid_wei };
+        let r = venue.simulate(&p, calldata, BlockId::number(n), &StateOverride::default(), None, None, None).await;
+        println!("e2e atlas batch ({} positions): bid {bid_wei} wei -> {:?}", items.len(), r.as_ref().map(|s| (s.profit, s.gas_used)).map_err(|e| e.to_string()));
+        nets.push(r.ok().map(|s| s.profit));
+    }
+    let (free, bid) = (nets[0].expect("no-bid batch op succeeds"), nets[1].expect("0.001 ETH bid batch op succeeds"));
+    assert!(free > U256::ZERO && bid < free, "the bid is paid out of the bundle's profit: {free} -> {bid}");
+    assert!(nets[2].is_none(), "a 1 ETH bid on this small bundle cannot be paid");
+}
+
 /// A tx given up on while it still sits in the mempool is replaced (same nonce, 0-value
 /// self-transfer, higher fees), so later nonces are not stuck behind it. Automine is off: the tx
 /// stays pending until a block is mined by hand.

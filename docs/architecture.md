@@ -117,9 +117,17 @@ Turns one liquidatable position (or a bundle of positions in one market) into a 
   `net_usd` = `profit_usd - gas_cost_usd`. A market without a loan price is a plan error.
 - **Sanity checks** on the simulation (profit vs quote, block the node really simulated).
 - `quote_bundle` values a whole market's liquidatable positions on one pair as one exit (used by
-  the Atlas valuation, where one solver tx liquidates them all); `gross_usd` is in USD and
+  the Atlas valuation, where one batch solver op liquidates them all); `gross_usd` is in USD and
   `gas_units` is the whole operation's estimated gas (liquidations + swap + overhead, from the
-  `BundleGas` the caller passes: `atlas_venue::ATLAS_BUNDLE_GAS` for Atlas solver ops).
+  `BundleGas` the caller passes: `atlas_venue::ATLAS_BUNDLE_GAS` for Atlas solver ops). It also
+  produces an executable `BundlePlan` (the positions at full seize, the flash-loan size and the one
+  full-size exit) that `atlas_venue::AtlasSolver::batch_inner` turns into the solver op's inner
+  `liquidateBatch` call. v1 liquidates each position in full and sells 100 %, so a direct route is a
+  candidate only when its allocation is full-size (route mode spends exactly the seized amount); the
+  exits are weighed at the auction's gas price, where gas dominates. The bid is this estimate
+  (`batch_est`: gross minus the whole metacall gas including `METACALL_FIXED_GAS`); the op's
+  simulation only gates the send. Gas is calibrated on `contracts/test/AtlasBundleGas.fork.t.sol`
+  (a 30-position batch ≈ 1.5M gas before its exit swap, ~34k per extra position).
 
 ### `LiquidationVenue<L>` (`bot/src/venue.rs`)
 
@@ -227,6 +235,13 @@ estimate by a safety factor.
   calldata). Only `executor` may call them.
 - Morpho transfers the collateral, then calls `onMorphoLiquidate(repaidAssets, data)`, where the
   swaps run; Morpho then pulls the repayment (standing allowance set by `approveMorpho`).
+- `liquidateBatch(params, items, flashAssets, exit, minProfit, deadlineBlock)` (ABI entry and a
+  packed `fallback` tag `0x01`), for an Atlas solver op: one Morpho `flashLoan` funds N `liquidate`
+  calls on the same market (empty callback data, so Morpho pulls each repayment through the standing
+  allowance), then a single `exit` (a direct route that must spend exactly the sum seized, or
+  allowlisted aggregator steps) sells all the collateral. `onMorphoFlashLoan` runs only inside our
+  own batch (an `inBatch` transient flag, the Morpho sender, once; `NotFunded` otherwise), and the
+  collateral received must equal the sum seized.
 - After the callback the contract checks the loan-token gain is at least `minProfit`, sends profit
   to the immutable `PROFIT_RECEIVER` and holds nothing at rest.
 - Admin: `setExecutor`, `setAllowedTarget`, `approveMorpho`, `pause` (owner or executor) /
@@ -249,6 +264,8 @@ estimate by a safety factor.
 | Pool reporting positive output | every hop's output must be a negative delta (`BadRoute`) | `test_route_positiveOutputRejected` |
 | Malformed packed calldata | strict decoding, no selector collision with the ABI entries | `test_packed_malformedRejected`, `test_packed_noSelectorCollision`, `test_packedEntry_equalsAbiEntry` |
 | Emergency | the executor (hot wallet) or the owner may `pause` (an operator stop; the bot itself never calls it, its kill switch is a file), only the owner may resume | `test_pauseKillSwitch` |
+| Forged / mistimed / repeated batch flash callback | `onMorphoFlashLoan` needs `msg.sender == MORPHO` and a batch of our own in flight (`inBatch`), cleared on entry so it runs once; `onMorphoLiquidate` stays blocked in batch mode (its own in-flight flag is never set) | `test_batch_flashCallbackAuth`, `test_batch_secondCallbackBlocked`, `test_batch_notFunded`, `test_batch_onMorphoLiquidateBlockedInBatch` |
+| Batch seizing less than paid for, or a short exit | the collateral received must equal the sum seized (`CollateralShortfall`); a route exit must spend exactly it (`RouteSpendMismatch`); `minProfit`, the allowlist and no-funds-at-rest hold as for the single paths | `test_batch_collateralShortfall`, `test_batch_routeSpendMismatch`, `test_batch_minProfitEnforced`, `test_batch_swapTargetNotAllowlisted`, `test_batch_happyPath_steps` |
 
 Off-chain defences: aggregator targets must be in `allowed_targets`; market ids are re-derived from
 params at start; implausible simulations (profit far from the quote) are rejected; RPC errors are

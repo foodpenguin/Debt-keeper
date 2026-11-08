@@ -244,6 +244,30 @@ impl Simulator {
         d.into()
     }
 
+    /// Packed batch calldata (contract fallback tag 0x01): N positions of one market liquidated in
+    /// one flash loan, then a single `exit`. Layout must match MorphoLiquidator._packedBatch:
+    /// tag(1) loan(20) collateral(20) oracle(20) irm(20) lltv(8) flashAssets(16) minProfit(16)
+    /// deadline(4) nItems(2) | items(borrower 20 | seized 16, each) | exit.
+    pub fn calldata_batch(&self, mp: &MarketParams, items: &[(Address, U256)], flash_assets: U256, exit: &[u8], min_profit: U256, deadline_block: u64) -> Bytes {
+        let mut d = Vec::with_capacity(127 + items.len() * 36 + exit.len());
+        d.push(0x01);
+        d.extend_from_slice(mp.loanToken.as_slice());
+        d.extend_from_slice(mp.collateralToken.as_slice());
+        d.extend_from_slice(mp.oracle.as_slice());
+        d.extend_from_slice(mp.irm.as_slice());
+        d.extend_from_slice(&mp.lltv.to::<u64>().to_be_bytes());
+        d.extend_from_slice(&flash_assets.to::<u128>().to_be_bytes());
+        d.extend_from_slice(&min_profit.to::<u128>().to_be_bytes());
+        d.extend_from_slice(&(deadline_block as u32).to_be_bytes());
+        d.extend_from_slice(&(items.len() as u16).to_be_bytes());
+        for (borrower, seized) in items {
+            d.extend_from_slice(borrower.as_slice());
+            d.extend_from_slice(&seized.to::<u128>().to_be_bytes());
+        }
+        d.extend_from_slice(exit);
+        d.into()
+    }
+
     pub fn overrides(&self, extra: &StateOverride) -> StateOverride {
         let mut ov = extra.clone();
         if let Some(code) = &self.code {
@@ -449,5 +473,34 @@ mod tests {
         assert_eq!(u128::from_be_bytes(d[125..141].try_into().unwrap()), 8);
         assert_eq!(&d[141..145], &[1, 2, 3, 4]);
         assert_eq!(&d[145..], &route);
+    }
+
+    #[test]
+    fn batch_packed_layout() {
+        let sim = Simulator::new(None, Address::ZERO, None, vec![]);
+        let mp = MarketParams {
+            loanToken: Address::repeat_byte(1),
+            collateralToken: Address::repeat_byte(2),
+            oracle: Address::repeat_byte(3),
+            irm: Address::repeat_byte(4),
+            lltv: U256::from(860_000_000_000_000_000u64),
+        };
+        let items = [(Address::repeat_byte(0xB0), U256::from(100u64)), (Address::repeat_byte(0xB1), U256::from(200u64))];
+        let exit = [0x01u8, 0xAA, 0xBB]; // MODE_ROUTE + a stub route
+        let d = sim.calldata_batch(&mp, &items, U256::from(5000u64), &exit, U256::from(7u64), 0x01020304);
+        assert_eq!(d.len(), 127 + 2 * 36 + exit.len());
+        assert_eq!(d[0], 0x01, "batch tag");
+        assert_eq!(&d[1..21], mp.loanToken.as_slice());
+        assert_eq!(&d[61..81], mp.irm.as_slice());
+        assert_eq!(u64::from_be_bytes(d[81..89].try_into().unwrap()), 860_000_000_000_000_000);
+        assert_eq!(u128::from_be_bytes(d[89..105].try_into().unwrap()), 5000, "flashAssets");
+        assert_eq!(u128::from_be_bytes(d[105..121].try_into().unwrap()), 7, "minProfit");
+        assert_eq!(&d[121..125], &[1, 2, 3, 4], "deadline");
+        assert_eq!(u16::from_be_bytes(d[125..127].try_into().unwrap()), 2, "nItems");
+        assert_eq!(&d[127..147], items[0].0.as_slice());
+        assert_eq!(u128::from_be_bytes(d[147..163].try_into().unwrap()), 100, "seize 0");
+        assert_eq!(&d[163..183], items[1].0.as_slice());
+        assert_eq!(u128::from_be_bytes(d[183..199].try_into().unwrap()), 200, "seize 1");
+        assert_eq!(&d[199..], &exit, "exit follows the items");
     }
 }

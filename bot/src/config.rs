@@ -167,6 +167,16 @@ pub struct AtlasConfig {
     /// must fit what its liquidations leave of it.
     #[serde(default = "default_solver_gas")]
     pub solver_gas_limit: u64,
+    /// Most positions one batch solver op liquidates together (also capped by solver_gas_limit).
+    #[serde(default = "default_max_bundle")]
+    pub max_bundle_positions: usize,
+    /// Extra loan token the batch flash-borrows over the sum of the repayments (per-position
+    /// rounding headroom), in basis points; at least one unit per position.
+    #[serde(default = "default_atlas_flash_headroom")]
+    pub flash_headroom_bps: u64,
+    /// Skip auctions whose total bonus is below this (USD). 0 = off (the real floor is private).
+    #[serde(default)]
+    pub min_bonus_usd: f64,
     /// Auction valuations running at once. They share an RPC pool: a crash brings dozens of
     /// auctions within seconds, and unbounded valuations would starve it.
     #[serde(default = "default_atlas_concurrent")]
@@ -188,7 +198,7 @@ pub struct AtlasConfig {
 
 impl Default for AtlasConfig {
     fn default() -> Self {
-        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
+        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
     }
 }
 
@@ -299,6 +309,12 @@ fn default_atlas_plans() -> usize {
 }
 fn default_solver_gas() -> u64 {
     6_000_000
+}
+fn default_max_bundle() -> usize {
+    20
+}
+fn default_atlas_flash_headroom() -> u64 {
+    5
 }
 fn default_atlas_concurrent() -> usize {
     1

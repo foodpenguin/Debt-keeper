@@ -65,6 +65,29 @@ pub struct BundleQuote {
     pub kyber_net_usd: Option<f64>,
     pub error: Option<String>,
     pub quote_ms: u64,
+    /// The executable form of this bundle (positions, flash-loan size, the one full-size exit),
+    /// built when a 100 %-size exit is available. Not journaled.
+    #[serde(skip)]
+    pub plan: Option<BundlePlan>,
+}
+
+/// The executable form of a `BundleQuote`: the positions an Atlas solver op liquidates together in
+/// one flash loan, and the single exit over all their collateral. v1 liquidates each in full and
+/// sells 100 % of the seized amount, so the exit is a full direct route or a Kyber swap over the
+/// total. `quote_bundle` attaches it to the quote (`BundleQuote::plan`).
+#[derive(Debug, Clone)]
+pub struct BundlePlan {
+    /// (borrower, seize) per position, each at its full max_seize.
+    pub items: Vec<(Address, U256)>,
+    pub total_seize: U256,
+    /// Σ repay(max_seize) plus headroom: what the batch flash-borrows.
+    pub flash_assets: U256,
+    /// The one exit selling all `total_seize`.
+    pub exit: ExitRoute,
+    /// "direct" or the aggregator's name.
+    pub router: &'static str,
+    /// Estimated solver-op gas (overhead + per-position + swap), for the bid basis.
+    pub gas_est: u64,
 }
 
 /// One candidate exit for a bundle: (router, fraction_bps, gross, swap gas).
@@ -366,6 +389,10 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         swap_gas_budget: u64,
         bundle_gas: BundleGas,
         use_kyber: bool,
+        flash_headroom_bps: u64,
+        // Gas price (wei) to weigh the exits at: the Atlas auction's (max_fee x (1 + surcharge)),
+        // where gas dominates; None falls back to the planner's own route gas price.
+        gas_price_wei: Option<u128>,
     ) -> BundleQuote {
         let t0 = Instant::now();
         let Some(pair) = views.first().map(|v| v.pair) else {
@@ -391,13 +418,17 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         }
         let repay = |s: U256| bundle_repay(s, total_seize, total_repaid);
         let gross = |out: U256, s: U256| (num::units(out, loan_dec) - num::units(repay(s), loan_dec)) * loan_usd;
+        // v1 sells the whole bundle in one exit: a direct route is a candidate only when its
+        // allocation sells all of `total_seize` (route mode requires spending exactly the seized
+        // amount); Kyber is quoted at the full size. Each candidate carries what builds its exit.
         let direct = async {
             if !self.v3.is_some_and(|v| v.routes.get(&pair).is_some_and(|r| !r.is_empty())) {
                 return Err("no direct pools for this pair".to_string());
             }
             match self.direct_exit(p, meta, pair, snap, total_seize, eth_usd, base_fee_wei, BlockId::number(block), overrides, repay, Some(swap_gas_budget)).await? {
                 None => Err("no profitable direct allocation".into()),
-                Some((_, a)) => Ok(("direct", (num::u256_f64(a.seize) / num::u256_f64(total_seize) * 1e4) as u64, gross(a.expected_out, a.seize), a.est_swap_gas)),
+                Some((grid, a)) if a.seize == total_seize => Ok((("direct", 10_000u64, gross(a.expected_out, a.seize), a.est_swap_gas), grid, a)),
+                Some(_) => Err("direct route would not sell the whole bundle (route mode needs the exact amount)".into()),
             }
         };
         let agg_name = self.aggregator.name();
@@ -405,38 +436,49 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             if !use_kyber {
                 return Err(format!("off ({agg_name} quotes the current market only)"));
             }
-            let sizes: Vec<(u64, U256)> = [10_000u64, 5_000].iter().map(|f| (*f, total_seize * U256::from(*f) / U256::from(10_000u64))).collect();
-            let quotes = join_all(sizes.iter().map(|(_, s)| self.aggregator.quote_within(collateral, loan, *s, swap_gas_budget))).await;
-            let mut best: Option<BundleExit> = None;
-            let mut last_err = format!("{agg_name}: no quote");
-            for ((f, s), r) in sizes.iter().zip(quotes) {
-                match r {
-                    Ok(k) => {
-                        let g = gross(self.aggregator.amount_out(&k), *s);
-                        if best.is_none_or(|b| g > b.2) {
-                            best = Some((agg_name, *f, g, self.aggregator.swap_gas(&k).unwrap_or(swap_gas_budget)));
-                        }
-                    }
-                    Err(e) => last_err = e.to_string(),
-                }
-            }
-            best.ok_or(last_err)
+            let k = self.aggregator.quote_within(collateral, loan, total_seize, swap_gas_budget).await.map_err(|e| e.to_string())?;
+            let g = gross(self.aggregator.amount_out(&k), total_seize);
+            Ok(((agg_name, 10_000u64, g, self.aggregator.swap_gas(&k).unwrap_or(swap_gas_budget)), k))
         };
         let (direct, kyber) = tokio::join!(direct, kyber);
         q.quote_ms = t0.elapsed().as_millis() as u64;
-        let gas_price = self.route_gas_price(base_fee_wei);
+        // Route selection weighs the exits at the auction's gas price when given (gas dominates at
+        // 15 gwei: a lower-gas exit can beat a higher-output one), else the planner's own.
+        let gas_price = gas_price_wei.map(|w| w as f64).unwrap_or_else(|| self.route_gas_price(base_fee_wei));
         let gas_units = |e: &BundleExit| e.3 + bundle_gas.per_position * views.len() as u64 + bundle_gas.overhead;
         let net = |e: &BundleExit| e.2 - gas_units(e) as f64 * gas_price / 1e18 * eth_usd;
-        q.direct_net_usd = direct.as_ref().ok().map(net);
-        q.kyber_net_usd = kyber.as_ref().ok().map(net);
-        let best = [&direct, &kyber].into_iter().filter_map(|r| r.as_ref().ok()).max_by(|a, b| net(a).total_cmp(&net(b)));
-        match best {
-            Some(e) => {
-                (q.router, q.fraction_bps, q.gross_usd, q.swap_gas, q.gas_units) = (e.0.to_string(), e.1, e.2, e.3, gas_units(e));
-                q.net_usd = Some(net(e));
-                q.gas_usd = q.gross_usd - net(e);
+        let de = direct.as_ref().ok().map(|x| &x.0);
+        let ke = kyber.as_ref().ok().map(|x| &x.0);
+        q.direct_net_usd = de.map(net);
+        q.kyber_net_usd = ke.map(net);
+        let best = [de, ke].into_iter().flatten().max_by(|a, b| net(a).total_cmp(&net(b)));
+        let Some(e) = best else {
+            q.error = Some(format!("direct: {}; {agg_name}: {}", direct.as_ref().err().cloned().unwrap_or_default(), kyber.as_ref().err().cloned().unwrap_or_default()));
+            return q;
+        };
+        (q.router, q.fraction_bps, q.gross_usd, q.swap_gas, q.gas_units) = (e.0.to_string(), e.1, e.2, e.3, gas_units(e));
+        q.net_usd = Some(net(e));
+        q.gas_usd = q.gross_usd - net(e);
+
+        // Build the executable full-size exit of the winning router.
+        let headroom = (total_repaid * U256::from(flash_headroom_bps) / U256::from(10_000u64)).max(U256::from(views.len()));
+        let flash_assets = total_repaid + headroom;
+        let items: Vec<(Address, U256)> = views.iter().map(|v| (v.user, v.max_seize)).collect();
+        let exit = if q.router == "direct" {
+            let (_, grid, a) = direct.as_ref().expect("direct won");
+            Some((ExitRoute::Packed(self.v3.expect("direct needs v3").encode(pair, grid, a)), "direct"))
+        } else {
+            let holder = self.venue.swap_recipient();
+            match self.aggregator.build(&kyber.as_ref().expect("kyber won").1, holder, holder, self.cfg.slippage_bps).await {
+                Ok(b) => Some((ExitRoute::Call { target: b.target, calldata: b.calldata }, agg_name)),
+                Err(err) => {
+                    q.error = Some(format!("{agg_name} build failed: {err}"));
+                    None
+                }
             }
-            None => q.error = Some(format!("direct: {}; {agg_name}: {}", direct.err().unwrap_or_default(), kyber.err().unwrap_or_default())),
+        };
+        if let Some((exit, router)) = exit {
+            q.plan = Some(BundlePlan { items, total_seize, flash_assets, exit, router, gas_est: q.gas_units });
         }
         q
     }
@@ -681,7 +723,7 @@ mod generic_tests {
         assert_eq!(v.max_seize, U256::from(90u64));
 
         let planner = Planner { protocol: &toy, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000 }, false).await;
+        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000 }, false, 5, None).await;
         assert_eq!(q.positions, 1);
         let err = q.error.unwrap();
         assert!(err.contains("no direct pools") && err.contains("mockdex: off (mockdex quotes"), "{err}");

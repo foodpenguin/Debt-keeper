@@ -152,6 +152,9 @@ control = "0xa5E1a36938769cbd5a26f5e19D8FCB379f597c83"   # Base DappControl (Cha
 margin = 0.05                  # journaled bid = bundle net (all positions sold as one exit) x (1 - margin)
 max_plans = 5                  # largest positions also planned + simulated one by one
 solver_gas_limit = 6000000     # the DappControl's solverGasLimit: liquidations + the bundle swap must fit
+max_bundle_positions = 20      # most positions one batch solver op liquidates together (also gas-capped)
+flash_headroom_bps = 5         # extra loan token the batch flash-borrows over the sum of the repayments
+min_bonus_usd = 0              # skip auctions below this total bonus (USD); 0 = off (real floor is private)
 max_concurrent = 1             # valuations at once (they share the RPC pool)
 paper_margins = [0.01, 0.05, 0.1]   # dashboard paper trading: bid = bundle net x (1 - m) vs the decoded winning bid
 paper_deadline_ms = 2000       # a valuation later than this after the auction could not have bid in time

@@ -39,6 +39,7 @@ contract MorphoLiquidatorSecurityTest is Test {
         router = new MockRouter();
         coll.mint(address(morpho), 1_000_000e18);
         loan.mint(address(router), 1_000_000e18);
+        loan.mint(address(morpho), 10_000_000e18); // so Morpho can flash-lend in the batch tests
         liq = new MorphoLiquidator(IMorpho(address(morpho)), owner, executor, receiver);
         mp = MarketParams({loanToken: address(loan), collateralToken: address(coll), oracle: address(0), irm: address(0), lltv: 0.86e18});
         vm.startPrank(owner);
@@ -331,11 +332,12 @@ contract MorphoLiquidatorSecurityTest is Test {
     }
 
     /// The packed calldata's first 4 bytes (tag + loan token prefix) must never hit a real
-    /// function selector, for every loan token we may use.
+    /// function selector, for either packed tag (0x00 single, 0x01 batch) and every loan token.
     function test_packed_noSelectorCollision() public pure {
-        bytes4[19] memory sels = [
+        bytes4[21] memory sels = [
             MorphoLiquidator.liquidate.selector, MorphoLiquidator.liquidateRoute.selector,
-            MorphoLiquidator.onMorphoLiquidate.selector, MorphoLiquidator.uniswapV3SwapCallback.selector,
+            MorphoLiquidator.liquidateBatch.selector, MorphoLiquidator.onMorphoLiquidate.selector,
+            MorphoLiquidator.onMorphoFlashLoan.selector, MorphoLiquidator.uniswapV3SwapCallback.selector,
             MorphoLiquidator.pancakeV3SwapCallback.selector, MorphoLiquidator.setExecutor.selector,
             MorphoLiquidator.setAllowedTarget.selector, MorphoLiquidator.approveMorpho.selector,
             MorphoLiquidator.pause.selector, MorphoLiquidator.unpause.selector,
@@ -350,12 +352,181 @@ contract MorphoLiquidatorSecurityTest is Test {
             0x4200000000000000000000000000000000000006, // WETH
             0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2 // USDT
         ];
-        for (uint256 i; i < loans.length; ++i) {
-            bytes4 prefix = bytes4(abi.encodePacked(bytes1(0x00), loans[i]));
-            for (uint256 j; j < sels.length; ++j) {
-                assertTrue(prefix != sels[j], "packed prefix collides with a selector");
+        bytes1[2] memory tags = [bytes1(0x00), bytes1(0x01)];
+        for (uint256 t; t < tags.length; ++t) {
+            for (uint256 i; i < loans.length; ++i) {
+                bytes4 prefix = bytes4(abi.encodePacked(tags[t], loans[i]));
+                for (uint256 j; j < sels.length; ++j) {
+                    assertTrue(prefix != sels[j], "packed prefix collides with a selector");
+                }
             }
         }
+    }
+
+    // ------------------------------------------------------------- batch (Atlas) entry
+
+    function _item(uint256 i, uint256 seize) internal pure returns (bytes memory) {
+        return abi.encodePacked(address(uint160(0xB0B00 + i)), uint128(seize));
+    }
+
+    function _items(uint256 n) internal pure returns (bytes memory items, uint256 total) {
+        for (uint256 i; i < n; ++i) {
+            items = bytes.concat(items, _item(i, SEIZE));
+            total += SEIZE;
+        }
+    }
+
+    /// MODE_STEPS exit selling `amount` of collateral through `target` (a MockRouter, 1:1).
+    function _stepsExit(address target, uint256 amount) internal view returns (bytes memory) {
+        SwapStep[] memory s = new SwapStep[](1);
+        s[0] = SwapStep({target: target, tokenIn: address(coll), amountIn: amount, data: abi.encodeCall(MockRouter.swap, (coll, loan, amount))});
+        return abi.encodePacked(bytes1(0x02), abi.encode(s));
+    }
+
+    /// MODE_ROUTE exit selling `amount` of collateral through one honest V3 pool.
+    function _routeExit(MockV3Pool pool, uint256 amount) internal returns (bytes memory) {
+        pool.setMode(0);
+        return abi.encodePacked(bytes1(0x01), abi.encodePacked(address(pool), uint8(1), uint128(amount)));
+    }
+
+    function _batchRun(bytes memory items, bytes memory exit, uint256 flashAssets, uint256 minProfit) internal returns (uint256) {
+        vm.prank(executor);
+        return liq.liquidateBatch(mp, items, flashAssets, exit, minProfit, block.number);
+    }
+
+    function test_batch_happyPath_steps() public {
+        (bytes memory items, uint256 total) = _items(3);
+        uint256 p = _batchRun(items, _stepsExit(address(router), total), total, 1);
+        assertEq(p, total / 10, "10% bonus over the whole batch");
+        assertEq(loan.balanceOf(receiver), p);
+        assertEq(loan.balanceOf(address(liq)), 0, "loan left in contract");
+        assertEq(coll.balanceOf(address(liq)), 0, "collateral left in contract");
+        assertEq(coll.allowance(address(liq), address(router)), 0, "router allowance not reset");
+    }
+
+    function test_batch_happyPath_route() public {
+        MockV3Pool pool = new MockV3Pool(coll, loan);
+        loan.mint(address(pool), 1_000_000e18);
+        (bytes memory items, uint256 total) = _items(3);
+        uint256 p = _batchRun(items, _routeExit(pool, total), total, 1);
+        assertEq(p, total / 10);
+        assertEq(coll.balanceOf(address(liq)), 0);
+        assertEq(loan.balanceOf(address(liq)), 0);
+    }
+
+    function test_batch_packedEntry() public {
+        (bytes memory items, uint256 total) = _items(3);
+        bytes memory cd = abi.encodePacked(
+            bytes1(0x01), mp.loanToken, mp.collateralToken, mp.oracle, mp.irm, uint64(mp.lltv),
+            uint128(total), uint128(1), uint32(block.number), uint16(3), items, _stepsExit(address(router), total)
+        );
+        (bool ok, bytes memory ret) = address(liq).call(cd); // not the executor
+        assertFalse(ok);
+        assertEq(bytes4(ret), MorphoLiquidator.Unauthorized.selector);
+        vm.prank(executor);
+        (ok, ret) = address(liq).call(cd);
+        assertTrue(ok);
+        assertEq(abi.decode(ret, (uint256)), total / 10);
+        assertEq(loan.balanceOf(receiver), total / 10);
+    }
+
+    function test_batch_onlyExecutor() public {
+        (bytes memory items, uint256 total) = _items(2);
+        vm.expectRevert(MorphoLiquidator.Unauthorized.selector); // caller is not the executor
+        liq.liquidateBatch(mp, items, total, _stepsExit(address(router), total), 0, block.number);
+    }
+
+    function test_batch_flashCallbackAuth() public {
+        vm.expectRevert(MorphoLiquidator.Unauthorized.selector); // external caller, not Morpho
+        liq.onMorphoFlashLoan(1, "");
+        vm.prank(address(morpho)); // Morpho, but no batch in flight
+        vm.expectRevert(MorphoLiquidator.Unauthorized.selector);
+        liq.onMorphoFlashLoan(1, "");
+    }
+
+    function test_batch_secondCallbackBlocked() public {
+        morpho.setFlashMode(false, true); // call onMorphoFlashLoan twice in one flash loan
+        (bytes memory items, uint256 total) = _items(2);
+        vm.prank(executor);
+        vm.expectRevert(MorphoLiquidator.Unauthorized.selector); // second entry: inBatch already cleared
+        liq.liquidateBatch(mp, items, total, _stepsExit(address(router), total), 0, block.number);
+    }
+
+    function test_batch_notFunded() public {
+        morpho.setFlashMode(true, false); // never call back
+        (bytes memory items, uint256 total) = _items(2);
+        vm.prank(executor);
+        vm.expectRevert(MorphoLiquidator.NotFunded.selector);
+        liq.liquidateBatch(mp, items, total, _stepsExit(address(router), total), 0, block.number);
+    }
+
+    function test_batch_onMorphoLiquidateBlockedInBatch() public {
+        morpho.setForceLiqCb(true); // Morpho (mis)calls the liquidate callback during the batch
+        (bytes memory items, uint256 total) = _items(2);
+        vm.prank(executor);
+        vm.expectRevert(MorphoLiquidator.Unauthorized.selector); // onMorphoLiquidate: inFlight is false here
+        liq.liquidateBatch(mp, items, total, _stepsExit(address(router), total), 0, block.number);
+    }
+
+    function test_batch_swapTargetNotAllowlisted() public {
+        MockRouter other = new MockRouter();
+        loan.mint(address(other), 1_000_000e18);
+        (bytes memory items, uint256 total) = _items(2);
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLiquidator.TargetNotAllowed.selector, address(other)));
+        liq.liquidateBatch(mp, items, total, _stepsExit(address(other), total), 0, block.number);
+    }
+
+    function test_batch_minProfitEnforced() public {
+        (bytes memory items, uint256 total) = _items(2);
+        uint256 min = total / 10 + 1;
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLiquidator.InsufficientProfit.selector, total / 10, min));
+        liq.liquidateBatch(mp, items, total, _stepsExit(address(router), total), min, block.number);
+    }
+
+    function test_batch_collateralShortfall() public {
+        coll.setFee(100); // 1% skimmed on every transfer -> received < sum seized
+        (bytes memory items, uint256 total) = _items(2);
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLiquidator.CollateralShortfall.selector, total * 99 / 100, total));
+        liq.liquidateBatch(mp, items, total, _stepsExit(address(router), total), 0, block.number);
+    }
+
+    function test_batch_routeSpendMismatch() public {
+        MockV3Pool pool = new MockV3Pool(coll, loan);
+        loan.mint(address(pool), 1_000_000e18);
+        pool.setMode(0);
+        (bytes memory items, uint256 total) = _items(2);
+        // Route sells only half the seized collateral.
+        bytes memory exit = abi.encodePacked(bytes1(0x01), abi.encodePacked(address(pool), uint8(1), uint128(total / 2)));
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLiquidator.RouteSpendMismatch.selector, total / 2, total));
+        liq.liquidateBatch(mp, items, total, exit, 0, block.number);
+    }
+
+    function test_batch_expiredAndPaused() public {
+        (bytes memory items, uint256 total) = _items(2);
+        vm.prank(executor);
+        vm.expectRevert(MorphoLiquidator.Expired.selector);
+        liq.liquidateBatch(mp, items, total, _stepsExit(address(router), total), 0, block.number - 1);
+        vm.prank(executor);
+        liq.pause();
+        vm.prank(executor);
+        vm.expectRevert(MorphoLiquidator.IsPaused.selector);
+        liq.liquidateBatch(mp, items, total, _stepsExit(address(router), total), 0, block.number);
+    }
+
+    function test_batch_badItemsAndExit() public {
+        (bytes memory items, uint256 total) = _items(1);
+        vm.startPrank(executor);
+        vm.expectRevert(MorphoLiquidator.BadBatch.selector); // empty items
+        liq.liquidateBatch(mp, "", 0, _stepsExit(address(router), SEIZE), 0, block.number);
+        vm.expectRevert(MorphoLiquidator.BadBatch.selector); // not a multiple of 36
+        liq.liquidateBatch(mp, hex"0011", SEIZE, _stepsExit(address(router), SEIZE), 0, block.number);
+        vm.expectRevert(MorphoLiquidator.BadBatch.selector); // empty exit
+        liq.liquidateBatch(mp, items, total, "", 0, block.number);
+        vm.stopPrank();
     }
 
     // ------------------------------------------------------------- admin
