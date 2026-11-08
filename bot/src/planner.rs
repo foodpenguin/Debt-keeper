@@ -393,6 +393,10 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         // Gas price (wei) to weigh the exits at: the Atlas auction's (max_fee x (1 + surcharge)),
         // where gas dominates; None falls back to the planner's own route gas price.
         gas_price_wei: Option<u128>,
+        // The contract that will run the exit swap, as the aggregator route's sender and recipient. An
+        // Atlas batch op swaps inside the solver's own MorphoLiquidator, not in this planner's venue;
+        // None = the venue's swap_recipient.
+        exit_holder: Option<Address>,
     ) -> BundleQuote {
         let t0 = Instant::now();
         let Some(pair) = views.first().map(|v| v.pair) else {
@@ -468,7 +472,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             let (_, grid, a) = direct.as_ref().expect("direct won");
             Some((ExitRoute::Packed(self.v3.expect("direct needs v3").encode(pair, grid, a)), "direct"))
         } else {
-            let holder = self.venue.swap_recipient();
+            let holder = exit_holder.unwrap_or_else(|| self.venue.swap_recipient());
             match self.aggregator.build(&kyber.as_ref().expect("kyber won").1, holder, holder, self.cfg.slippage_bps).await {
                 Ok(b) => Some((ExitRoute::Call { target: b.target, calldata: b.calldata }, agg_name)),
                 Err(err) => {
@@ -723,7 +727,7 @@ mod generic_tests {
         assert_eq!(v.max_seize, U256::from(90u64));
 
         let planner = Planner { protocol: &toy, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000 }, false, 5, None).await;
+        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000 }, false, 5, None, None).await;
         assert_eq!(q.positions, 1);
         let err = q.error.unwrap();
         assert!(err.contains("no direct pools") && err.contains("mockdex: off (mockdex quotes"), "{err}");
@@ -736,6 +740,50 @@ mod generic_tests {
         let packed = LiquidationVenue::<Toy>::encode(&venue, &m, user(1), TOY_PAIR, U256::from(90u64), U256::from(90u64), &ExitRoute::Packed(Bytes::new()), U256::ZERO, 3);
         let call = LiquidationVenue::<Toy>::encode(&venue, &m, user(1), TOY_PAIR, U256::from(90u64), U256::from(90u64), &ExitRoute::Call { target: Address::ZERO, calldata: Bytes::new() }, U256::ZERO, 3);
         assert_eq!((packed.to, packed.calldata[0], call.calldata[0]), (LiquidationVenue::<Toy>::target(&venue), 1, 2));
+    }
+
+    /// MockDex that records who each route was built for.
+    #[derive(Default)]
+    struct HolderDex(std::sync::Mutex<Vec<(Address, Address)>>);
+
+    impl Dex for HolderDex {
+        type Quote = U256;
+        fn name(&self) -> &'static str {
+            "holderdex"
+        }
+        async fn quote_within(&self, token_in: Address, token_out: Address, amount_in: U256, gas_budget: u64) -> Result<U256> {
+            MockDex.quote_within(token_in, token_out, amount_in, gas_budget).await
+        }
+        fn amount_out(&self, quote: &U256) -> U256 {
+            MockDex.amount_out(quote)
+        }
+        fn swap_gas(&self, quote: &U256) -> Option<u64> {
+            MockDex.swap_gas(quote)
+        }
+        async fn build(&self, quote: &U256, sender: Address, recipient: Address, slippage_bps: u32) -> Result<crate::dex::SwapCall> {
+            self.0.lock().unwrap().push((sender, recipient));
+            MockDex.build(quote, sender, recipient, slippage_bps).await
+        }
+    }
+
+    #[tokio::test]
+    async fn bundle_aggregator_exit_is_built_for_the_exit_holder() {
+        // An Atlas batch op swaps inside the solver's liquidator, not the planner's venue: a route
+        // built for the venue would pay the proceeds to the wrong contract (the flash loan then
+        // cannot be repaid). None keeps the venue's swap_recipient.
+        let provider = ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap());
+        let (toy, venue, cfg) = (Toy::default(), MockVenue, cfg());
+        let m = Mk { key: key(1), name: "alpha".into() };
+        let v = view(&toy, 0, user(1), &m, &1.0, &(100, 90));
+        let holder = Address::repeat_byte(0x77);
+        for (exit_holder, want) in [(Some(holder), holder), (None, LiquidationVenue::<Toy>::target(&venue))] {
+            let dex = HolderDex::default();
+            let planner = Planner { protocol: &toy, aggregator: &dex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
+            let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000 }, true, 5, None, exit_holder).await;
+            assert_eq!(q.router, "holderdex", "{:?}", q.error);
+            assert!(q.plan.as_ref().is_some_and(|p| matches!(p.exit, ExitRoute::Call { .. })), "{:?}", q.error);
+            assert_eq!(*dex.0.lock().unwrap(), vec![(want, want)]);
+        }
     }
 
     #[tokio::test]

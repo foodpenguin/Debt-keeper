@@ -1,6 +1,15 @@
 # Changelog
 
-## v0.3.0 (unreleased)
+## v0.3.1 (unreleased)
+
+- Atlas batch op: the aggregator (Kyber) exit route is built for the solver's own MorphoLiquidator,
+  where the batch swaps, instead of the planner's main venue. Built for the main venue, the proceeds
+  landed in another contract and Morpho could not pull the flash loan back, so every batch with an
+  aggregator exit reverted in simulation (seen in shadow on the first 20-position cbXRP auction,
+  2026-11-08). `Planner::quote_bundle` takes the exit holder (`None` = the venue's swap recipient);
+  direct-route batches were not affected.
+
+## v0.3.0 (2026-11-08)
 
 Atlas batch solver: one solver op liquidates several positions of a market in one Morpho flash loan
 and sells all the seized collateral in a single exit, so the bid and the op finally match the bundle
