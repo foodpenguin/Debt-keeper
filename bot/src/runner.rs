@@ -1188,19 +1188,35 @@ async fn solver_op<P: Provider>(
     parts: &PlannerParts,
     mi: usize,
     m: &AuctionMarket,
+    bundle: Option<&planner::BundleQuote>,
     top: Option<&Result<planner::Plan>>,
     overrides: &StateOverride,
     block: u64,
     sim_time: u64,
+    deadline: u64,
+    min_bonus_usd: f64,
     atlas_gas_usd: f64,
     eth_usd: f64,
 ) -> Option<(serde_json::Value, Option<OpCandidate>)> {
-    let (Some(solver), Venue::Callback(_), Some(Ok(plan))) = (&parts.solver, &parts.venue, top) else { return None };
+    let (Some(solver), Venue::Callback(_)) = (&parts.solver, &parts.venue) else { return None };
+    // Below the bonus floor: do not value a solver op for this market.
+    let bonus: f64 = m.liq.iter().map(|v| v.bonus).sum();
+    if bonus < min_bonus_usd {
+        return Some((json!({ "ok": false, "skipped": "min_bonus", "bonus_usd": bonus }), None));
+    }
+    // A batch op over the whole bundle when it has an executable plan; otherwise the single top plan.
+    if let Some(b) = bundle
+        && let Some(plan) = &b.plan
+    {
+        return Some(batch_op(provider, parts, mi, m, b, plan, solver, overrides, block, sim_time, deadline, atlas_gas_usd, eth_usd).await);
+    }
+
+    let Some(Ok(plan)) = top else { return None };
     let payload = plan.payload.as_ref().filter(|_| plan.router == "direct")?;
     // Net of the op's gas as Atlas charges it (see valuation()).
     let net = plan.profit_usd.unwrap_or(0.0) - plan.gas_used.unwrap_or(0) as f64 * atlas_gas_usd;
     let Some(bid_usd) = parts.auction.bid_usd(Some(&m.meta.name), net.max(0.0), eth_usd) else {
-        return Some((json!({ "ok": false, "skipped": "policy" }), None));
+        return Some((json!({ "bid_basis": "single_est", "ok": false, "skipped": "policy" }), None));
     };
     let bid_wei = U256::from((bid_usd / eth_usd.max(1.0) * 1e18) as u128);
     let venue = atlas_venue::AtlasBid { solver, bid_wei };
@@ -1212,10 +1228,69 @@ async fn solver_op<P: Provider>(
             let net_after_bid = math::units(s.profit, m.meta.loan_decimals);
             let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, m.meta.params.loanToken, eth_usd).unwrap_or(0.0);
             let cand = (!s.profit.is_zero()).then(|| OpCandidate { market: mi, payload: payload.clone(), bid_wei, profit: s.profit, gas_used: s.gas_used, profit_usd: net_after_bid * loan_usd });
-            (json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used }), cand)
+            (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used }), cand)
         }
-        Err(e) => (json!({ "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() }), None),
+        Err(e) => (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() }), None),
     })
+}
+
+/// A batch solver op over a bundle's whole plan: the bid comes from the estimate (gross minus the
+/// whole metacall gas Atlas charges, decision 3), and the simulation only gates the send (its
+/// profit, gas and the gap to the estimate are journaled to recalibrate the gas constants).
+#[allow(clippy::too_many_arguments)]
+async fn batch_op<P: Provider>(
+    provider: &P,
+    parts: &PlannerParts,
+    mi: usize,
+    m: &AuctionMarket,
+    bundle: &planner::BundleQuote,
+    plan: &planner::BundlePlan,
+    solver: &atlas_venue::AtlasSolver,
+    overrides: &StateOverride,
+    block: u64,
+    sim_time: u64,
+    deadline: u64,
+    atlas_gas_usd: f64,
+    eth_usd: f64,
+) -> (serde_json::Value, Option<OpCandidate>) {
+    let loan = m.meta.params.loanToken;
+    let bid_basis = bundle.gross_usd - (plan.gas_est + atlas_venue::METACALL_FIXED_GAS) as f64 * atlas_gas_usd;
+    let row = |extra: serde_json::Value| {
+        let mut base = json!({ "bid_basis": "batch_est", "positions": plan.items.len(), "router": plan.router, "bid_basis_usd": bid_basis, "est_gas": plan.gas_est });
+        base.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        base
+    };
+    // Gas floor: the estimated metacall gas already costs more than the gross -> do not bid.
+    if bid_basis <= 0.0 {
+        return (row(json!({ "ok": false, "skipped": "gas_floor" })), None);
+    }
+    let Some(bid_usd) = parts.auction.bid_usd(Some(&m.meta.name), bid_basis, eth_usd) else {
+        return (row(json!({ "ok": false, "skipped": "policy" })), None);
+    };
+    let bid_wei = U256::from((bid_usd / eth_usd.max(1.0) * 1e18) as u128);
+    let inner = solver.batch_inner(&m.meta, plan, deadline);
+    let calldata = solver.calldata(loan, &inner, bid_wei, U256::ZERO);
+    let venue = atlas_venue::AtlasBid { solver, bid_wei };
+    let at = Some(venue::SimAt { number: block + 1, time: sim_time });
+    let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
+    match r {
+        Ok(s) => {
+            let net_after_bid = math::units(s.profit, m.meta.loan_decimals);
+            let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, loan, eth_usd).unwrap_or(0.0);
+            // Candidate when the op nets positive after the bid; the minProfit (profit x keep) that
+            // protects it against state drift is patched in at submit, as for the single-position op.
+            let cand = (!s.profit.is_zero()).then(|| OpCandidate {
+                market: mi,
+                payload: executor::Payload { to: solver.solver, calldata: inner, min_profit: atlas_venue::SOLVER_MIN_PROFIT },
+                bid_wei,
+                profit: s.profit,
+                gas_used: s.gas_used,
+                profit_usd: net_after_bid * loan_usd,
+            });
+            (row(json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used })), cand)
+        }
+        Err(e) => (row(json!({ "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() })), None),
+    }
 }
 
 /// Signs and submits the simulated solver op `c` for auction `a` (see solver_op): minProfit after
@@ -1295,10 +1370,10 @@ async fn valuation<P: Provider>(
         overrides.insert(m.meta.params.oracle, AccountOverride { code: Some(sim::constant_price_oracle(m.snap.price)), ..Default::default() });
         // One solver op holds only so many liquidations: bundle the largest that fit (liq is sorted
         // by bonus) instead of pricing an op that cannot exist.
-        let fit = &m.liq[..m.liq.len().min(atlas_venue::bundle_capacity(atlas.solver_gas_limit))];
+        let fit = &m.liq[..m.liq.len().min(atlas_venue::bundle_capacity(atlas.solver_gas_limit, atlas.max_bundle_positions))];
         let bundle = match fit.is_empty() {
             true => None,
-            false => Some(planner.quote_bundle(provider, &m.meta, &m.snap, fit, head.number, &overrides, head.base_fee, eth_usd, atlas_venue::bundle_swap_budget(atlas.solver_gas_limit, fit.len()), atlas_venue::ATLAS_BUNDLE_GAS, live).await),
+            false => Some(planner.quote_bundle(provider, &m.meta, &m.snap, fit, head.number, &overrides, head.base_fee, eth_usd, atlas_venue::bundle_swap_budget(atlas.solver_gas_limit, fit.len()), atlas_venue::ATLAS_BUNDLE_GAS, live, atlas.flash_headroom_bps).await),
         };
         let bundle_ms = a.seen.elapsed().as_millis() as u64;
         let ctxs: Vec<PlanCtx<Morpho>> = m
@@ -1318,7 +1393,7 @@ async fn valuation<P: Provider>(
     // What Atlas charges a solver op for its gas: the metacall's gas price (the auction's
     // maxFeePerGas) plus the escrow's surcharge, per gas unit, in USD.
     let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
-    let ops = futures::future::join_all(markets.iter().zip(&valued).enumerate().map(|(mi, (m, (_, _, ov, plans)))| solver_op(provider, parts, mi, m, plans.first().map(|(_, p)| p), ov, head.number, sim_time, atlas_gas_usd, eth_usd))).await;
+    let ops = futures::future::join_all(markets.iter().zip(&valued).enumerate().map(|(mi, (m, (bundle, _, ov, plans)))| solver_op(provider, parts, mi, m, bundle.as_ref(), plans.first().map(|(_, p)| p), ov, head.number, sim_time, a.deadline, atlas.min_bonus_usd, atlas_gas_usd, eth_usd))).await;
     let (mut solvers, cands): (Vec<Option<serde_json::Value>>, Vec<Option<OpCandidate>>) = ops.into_iter().map(|o| o.map_or((None, None), |(row, c)| (Some(row), c))).unzip();
     // Atlas takes one op per block from an EOA: the auction's candidates are tried most profitable
     // first (live + `submit`), regardless of which market's simulation finished first, until one
@@ -1350,9 +1425,10 @@ async fn valuation<P: Provider>(
         let bonus: f64 = m.liq.iter().map(|v| v.bonus).sum();
         n_liq += m.liq.len();
         bonus_sum += bonus;
-        // The bid basis: the bundle's exit gain minus its whole gas as Atlas charges it (not the
-        // planner's own gas price), so a bid never spends what the solver owes Atlas.
-        let atlas_net = bundle.as_ref().and_then(|b| b.net_usd.map(|_| b.gross_usd - b.gas_units as f64 * atlas_gas_usd));
+        // The bid basis ("batch_est"): the bundle's exit gain minus the whole metacall gas Atlas
+        // charges (the solver op's estimate plus the fixed metacall overhead), at the auction's gas
+        // price, so a bid never spends what the solver owes Atlas.
+        let atlas_net = bundle.as_ref().and_then(|b| b.net_usd.map(|_| b.gross_usd - (b.gas_units + atlas_venue::METACALL_FIXED_GAS) as f64 * atlas_gas_usd));
         bundle_net += atlas_net.unwrap_or(0.0).max(0.0);
         if bundle.is_some() {
             bundle_ms_max = bundle_ms_max.max(bundle_ms);
