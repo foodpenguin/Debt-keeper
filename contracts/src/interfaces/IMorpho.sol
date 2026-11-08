@@ -36,6 +36,10 @@ interface IMorpho {
         bytes memory data
     ) external returns (uint256 seized, uint256 repaid);
 
+    /// @dev Flash loan (fixed amount, 0 fee): sends `assets` of `token`, calls back
+    ///      `onMorphoFlashLoan(assets, data)` on the caller, then pulls `assets` back.
+    function flashLoan(address token, uint256 assets, bytes calldata data) external;
+
     function idToMarketParams(Id id) external view returns (MarketParams memory);
     function position(Id id, address user) external view returns (Position memory);
     function market(Id id) external view returns (Market memory);
@@ -44,6 +48,10 @@ interface IMorpho {
 
 interface IMorphoLiquidateCallback {
     function onMorphoLiquidate(uint256 repaidAssets, bytes calldata data) external;
+}
+
+interface IMorphoFlashLoanCallback {
+    function onMorphoFlashLoan(uint256 assets, bytes calldata data) external;
 }
 
 interface IOracle {

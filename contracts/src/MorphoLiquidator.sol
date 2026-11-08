@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 pragma solidity 0.8.28;
 
-import {IMorpho, IMorphoLiquidateCallback, MarketParams} from "./interfaces/IMorpho.sol";
+import {IMorpho, IMorphoLiquidateCallback, IMorphoFlashLoanCallback, MarketParams} from "./interfaces/IMorpho.sol";
 import {IV3Pool, MIN_SQRT_PRICE_LIMIT, MAX_SQRT_PRICE_LIMIT} from "./interfaces/IV3Pool.sol";
 
 interface IERC20Min {
@@ -41,7 +41,15 @@ struct SwapStep {
 ///      Two exit modes: aggregator steps (`liquidate`, allowlisted targets + exact approvals) and a
 ///      direct V3-pool route (`liquidateRoute`, no approvals: pools are paid inside their own swap
 ///      callback, which only the pool currently being swapped may trigger, for at most its input).
-contract MorphoLiquidator is IMorphoLiquidateCallback {
+///
+///      Batch mode (`liquidateBatch`, Atlas solver): one Morpho `flashLoan` funds N `liquidate` calls
+///      (with no callback data, so Morpho pulls each repayment through the standing allowance) on the
+///      same market, then a single exit (either mode) sells all the seized collateral. The flash
+///      callback only runs inside our own batch (transient `inBatch` flag + Morpho sender, once); a
+///      funder that never calls back reverts (`NotFunded`). The received collateral must match the
+///      sum of what was seized, and the same minimum-profit, allowlist and no-funds-at-rest
+///      guarantees apply.
+contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback {
     IMorpho public immutable MORPHO;
     /// @notice Where every profit goes (cold wallet). Immutable to keep a cold SLOAD off the hot
     ///         path; changing it means deploying a new liquidator (cheap on Base).
@@ -68,6 +76,9 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
     /// @dev Route mode: the pooled connector token split by share across sink hops (bit2), whose
     ///      rounding remainder is swept after the liquidation.
     address private transient connectorInFlight;
+    /// @dev Set only while our own liquidateBatch() flash loan is in flight, so onMorphoFlashLoan
+    ///      cannot be triggered by anyone else and runs once (cleared on entry).
+    bool private transient inBatch;
 
     /// @dev Packed production entry (see fallback): tag(1) loan(20) collateral(20) oracle(20) irm(20)
     ///      lltv(8) borrower(20) seized(16) minProfit(16) deadlineBlock(4) | route...
@@ -81,6 +92,18 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
     ///             token (pooled intermediate token split across several pools; 10000 = all).
     uint256 private constant HOP_LEN = 37;
     bytes1 private constant MODE_ROUTE = 0x01;
+    /// @dev Batch exit encoded as abi.encode(SwapStep[]) after this mode byte (see `exit` below).
+    bytes1 private constant MODE_STEPS = 0x02;
+
+    /// @dev One batch item: borrower(20) | seizedAssets(16).
+    uint256 private constant ITEM_LEN = 36;
+    /// @dev Packed batch entry (fallback tag 0x01): tag(1) loan(20) collateral(20) oracle(20) irm(20)
+    ///      lltv(8) flashAssets(16) minProfit(16) deadlineBlock(4) nItems(2) | items | exit.
+    bytes1 private constant PACKED_BATCH_TAG = 0x01;
+    uint256 private constant PACKED_BATCH_HEAD = 127;
+    /// @dev Flash-loan callback blob: loan(20) collateral(20) oracle(20) irm(20) lltv(8) nItems(2) |
+    ///      items | exit. The market head is 90 bytes; items and exit follow as calldata.
+    uint256 private constant CALLBACK_HEAD = 90;
 
     error Unauthorized();
     error Expired();
@@ -93,6 +116,8 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
     error TokenCallFailed(address token);
     error BadRoute();
     error RouteSpendMismatch(uint256 spent, uint256 seized);
+    error BadBatch();
+    error NotFunded();
 
     event ExecutorSet(address executor);
     event OwnershipTransferStarted(address indexed pendingOwner);
@@ -148,12 +173,40 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
         );
     }
 
+    /// @notice Liquidate several positions of the same market in one Morpho flash loan, then sell all
+    ///         the seized collateral in a single exit. For an Atlas solver op.
+    /// @param items Per position borrower(20) | seizedAssets(16), packed (36 bytes each).
+    /// @param flashAssets Loan-token amount to flash-borrow: the sum of the repayments (rounded up by
+    ///        the caller) plus headroom; unspent headroom ends up in the profit.
+    /// @param exit The single exit over all the collateral: MODE_ROUTE ‖ packed hops (direct V3
+    ///        route, must spend exactly the sum seized), or MODE_STEPS ‖ abi.encode(SwapStep[])
+    ///        (allowlisted aggregator targets).
+    /// @param minProfit Minimum loan-token gain after the flash loan is repaid; reverts below it.
+    /// @param deadlineBlock Reverts if included after this block (stale opportunity).
+    function liquidateBatch(
+        MarketParams calldata marketParams,
+        bytes calldata items,
+        uint256 flashAssets,
+        bytes calldata exit,
+        uint256 minProfit,
+        uint256 deadlineBlock
+    ) external returns (uint256 profit) {
+        return _batch(marketParams, items, flashAssets, exit, minProfit, deadlineBlock);
+    }
+
     /// @notice Packed production entry: same as `liquidateRoute` with ~1/3 of the calldata
     ///         (no ABI padding; lltv as uint64, amounts as uint128, deadline as uint32). Layout:
     ///         0x00 | loan | collateral | oracle | irm | lltv(8) | borrower | seized(16) |
     ///         minProfit(16) | deadlineBlock(4) | route (37-byte hops)
     fallback() external {
         bytes calldata d = msg.data;
+        if (d.length != 0 && d[0] == PACKED_BATCH_TAG) {
+            uint256 batchProfit = _packedBatch(d);
+            assembly ("memory-safe") {
+                mstore(0, batchProfit)
+                return(0, 32)
+            }
+        }
         if (d.length < PACKED_HEAD + HOP_LEN || d[0] != PACKED_TAG || (d.length - PACKED_HEAD) % HOP_LEN != 0) {
             revert BadRoute();
         }
@@ -238,6 +291,109 @@ contract MorphoLiquidator is IMorphoLiquidateCallback {
         // Morpho now pulls repaidAssets using the standing allowance (see approveMorpho).
         loanToken;
         repaidAssets;
+    }
+
+    function _batch(
+        MarketParams memory marketParams,
+        bytes calldata items,
+        uint256 flashAssets,
+        bytes calldata exit,
+        uint256 minProfit,
+        uint256 deadlineBlock
+    ) private returns (uint256 profit) {
+        // Cheapest checks first so a stale or unwanted call fails for minimal gas.
+        if (msg.sender != executor) revert Unauthorized();
+        if (block.number > deadlineBlock) revert Expired();
+        if (paused) revert IsPaused();
+        if (items.length == 0 || items.length % ITEM_LEN != 0 || exit.length == 0) revert BadBatch();
+
+        uint256 n = items.length / ITEM_LEN;
+        uint256 totalSeized;
+        for (uint256 i; i < n; ++i) {
+            totalSeized += uint128(bytes16(items[i * ITEM_LEN + 20:i * ITEM_LEN + ITEM_LEN]));
+        }
+
+        inBatch = true;
+        collateralInFlight = marketParams.collateralToken;
+        expectedCollateral = totalSeized;
+        // Transient state lives for the whole tx; a fresh batch must not inherit a stale connector.
+        connectorInFlight = address(0);
+
+        // One blob the flash callback parses by hand, so the exit stays calldata for _runRoute:
+        // loan | collateral | oracle | irm | lltv | nItems | items | exit (see CALLBACK_HEAD).
+        bytes memory data = abi.encodePacked(
+            marketParams.loanToken,
+            marketParams.collateralToken,
+            marketParams.oracle,
+            marketParams.irm,
+            uint64(marketParams.lltv),
+            uint16(n),
+            items,
+            exit
+        );
+        MORPHO.flashLoan(marketParams.loanToken, flashAssets, data);
+        // The callback clears inBatch; if Morpho never called back, nothing was borrowed or seized.
+        if (inBatch) revert NotFunded();
+
+        profit = _settle(marketParams.loanToken, marketParams.collateralToken, minProfit);
+        address connector = connectorInFlight;
+        if (connector != address(0) && connector != marketParams.loanToken) {
+            uint256 rest = IERC20Min(connector).balanceOf(address(this));
+            if (rest > 0) _safeTransfer(connector, PROFIT_RECEIVER, rest);
+        }
+    }
+
+    /// @dev Parses the packed batch entry (fallback tag 0x01) and runs it. Layout at PACKED_BATCH_TAG.
+    function _packedBatch(bytes calldata d) private returns (uint256) {
+        if (d.length < PACKED_BATCH_HEAD + ITEM_LEN + 1) revert BadBatch();
+        MarketParams memory mp = MarketParams({
+            loanToken: address(bytes20(d[1:21])),
+            collateralToken: address(bytes20(d[21:41])),
+            oracle: address(bytes20(d[41:61])),
+            irm: address(bytes20(d[61:81])),
+            lltv: uint64(bytes8(d[81:89]))
+        });
+        uint256 flashAssets = uint128(bytes16(d[89:105]));
+        uint256 minProfit = uint128(bytes16(d[105:121]));
+        uint256 deadlineBlock = uint32(bytes4(d[121:125]));
+        uint256 itemsEnd = PACKED_BATCH_HEAD + uint256(uint16(bytes2(d[125:127]))) * ITEM_LEN;
+        if (itemsEnd >= d.length) revert BadBatch(); // items must fit and leave at least one exit byte
+        return _batch(mp, d[PACKED_BATCH_HEAD:itemsEnd], flashAssets, d[itemsEnd:], minProfit, deadlineBlock);
+    }
+
+    /// @dev Morpho sent `flashAssets` of the loan token and pulls them back after this returns. Runs
+    ///      only inside our own batch, once: liquidate every item (no callback data, so the
+    ///      repayments come from the standing allowance), then a single exit over all the collateral.
+    function onMorphoFlashLoan(uint256, bytes calldata data) external {
+        if (msg.sender != address(MORPHO) || !inBatch) revert Unauthorized();
+        inBatch = false;
+
+        MarketParams memory mp = MarketParams({
+            loanToken: address(bytes20(data[0:20])),
+            collateralToken: address(bytes20(data[20:40])),
+            oracle: address(bytes20(data[40:60])),
+            irm: address(bytes20(data[60:80])),
+            lltv: uint64(bytes8(data[80:88]))
+        });
+        uint256 n = uint16(bytes2(data[88:CALLBACK_HEAD]));
+        for (uint256 i; i < n; ++i) {
+            uint256 o = CALLBACK_HEAD + i * ITEM_LEN;
+            MORPHO.liquidate(mp, address(bytes20(data[o:o + 20])), uint128(bytes16(data[o + 20:o + ITEM_LEN])), 0, "");
+        }
+        // Everything the liquidations seized must actually be here before the single exit.
+        uint256 have = IERC20Min(mp.collateralToken).balanceOf(address(this));
+        if (have < expectedCollateral) revert CollateralShortfall(have, expectedCollateral);
+
+        bytes calldata exit = data[CALLBACK_HEAD + n * ITEM_LEN:];
+        if (exit[0] == MODE_ROUTE) {
+            uint256 spent = _runRoute(exit[1:]);
+            if (spent != expectedCollateral) revert RouteSpendMismatch(spent, expectedCollateral);
+        } else if (exit[0] == MODE_STEPS) {
+            SwapStep[] memory swaps = abi.decode(exit[1:], (SwapStep[]));
+            _runSteps(swaps);
+        } else {
+            revert UnsupportedMode();
+        }
     }
 
     function _runSteps(SwapStep[] memory swaps) private {

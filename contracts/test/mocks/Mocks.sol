@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 pragma solidity 0.8.28;
 
-import {MarketParams, IMorphoLiquidateCallback} from "../../src/interfaces/IMorpho.sol";
+import {MarketParams, IMorphoLiquidateCallback, IMorphoFlashLoanCallback} from "../../src/interfaces/IMorpho.sol";
 import {MorphoLiquidator, SwapStep} from "../../src/MorphoLiquidator.sol";
 
 contract MockERC20 {
@@ -50,10 +50,24 @@ contract MockMorpho {
     MockERC20 public immutable collateral;
     /// repaid = seized * repayBps / 10_000 (e.g. 9_000 = 10% liquidation bonus at a 1:1 price)
     uint256 public repayBps = 9_000;
+    /// @dev Misbehaviour flags for the batch tests: force the liquidate callback even with empty
+    ///      data; skip the flash callback (NotFunded); call the flash callback twice.
+    bool public forceLiqCb;
+    bool public muteFlash;
+    bool public doubleFlash;
 
     constructor(MockERC20 loan_, MockERC20 collateral_) {
         loan = loan_;
         collateral = collateral_;
+    }
+
+    function setForceLiqCb(bool v) external {
+        forceLiqCb = v;
+    }
+
+    function setFlashMode(bool mute, bool double_) external {
+        muteFlash = mute;
+        doubleFlash = double_;
     }
 
     function liquidate(MarketParams memory, address, uint256 seized, uint256, bytes memory data)
@@ -62,9 +76,19 @@ contract MockMorpho {
     {
         uint256 repaid = seized * repayBps / 10_000;
         collateral.transfer(msg.sender, seized);
-        IMorphoLiquidateCallback(msg.sender).onMorphoLiquidate(repaid, data);
+        // Real Morpho only calls back when data is non-empty (the batch path passes "").
+        if (data.length > 0 || forceLiqCb) IMorphoLiquidateCallback(msg.sender).onMorphoLiquidate(repaid, data);
         loan.transferFrom(msg.sender, address(this), repaid);
         return (seized, repaid);
+    }
+
+    /// @dev Lends `assets` of `token`, calls back, pulls them back (0 fee). Needs a loan-token balance.
+    function flashLoan(address token, uint256 assets, bytes calldata data) external {
+        require(token == address(loan), "flash token");
+        loan.transfer(msg.sender, assets);
+        if (!muteFlash) IMorphoFlashLoanCallback(msg.sender).onMorphoFlashLoan(assets, data);
+        if (doubleFlash) IMorphoFlashLoanCallback(msg.sender).onMorphoFlashLoan(assets, data);
+        loan.transferFrom(msg.sender, address(this), assets);
     }
 }
 
