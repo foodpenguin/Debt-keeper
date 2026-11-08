@@ -253,22 +253,35 @@ fn auctions(db: &Connection, clock: &Clock, since: f64, eth_usd_now: f64) -> Res
 /// auction. P&L of a win = bundle net - our bid (what our own exit would have left).
 /// An auction valuation with the winning bid: (head, bundle_net_usd, eth_usd, value_ms, json,
 /// win_bid_eth, winner).
-type PaperRow = (i64, f64, f64, Option<i64>, String, f64, Option<String>);
+/// (head, bid basis net USD, eth_usd, value_ms, auction json, winning bid ETH, winner, bonus USD).
+type PaperRow = (i64, f64, f64, Option<i64>, String, f64, Option<String>, f64);
 
 fn paper(db: &Connection, clock: &Clock, since: f64, cfg: &Config) -> Result<Value> {
+    let since_block = clock.block_at(db, since);
+    // The executable basis (v0.3.0): the batch solver op's estimate. Pre-v0.3.0 journals carry the
+    // old, non-executable `bundle_net` / `per_position_sum` basis; those are counted apart (legacy)
+    // so the paper table is not mixed with auctions no op could actually have won.
     let mut q = db.prepare(
-        "SELECT a.head, a.bundle_net_usd, a.eth_usd, a.value_ms, a.json, t.win_bid_eth, t.winner
+        "SELECT a.head, a.bundle_net_usd, a.eth_usd, a.value_ms, a.json, t.win_bid_eth, t.winner, a.bonus_usd
          FROM atlas_auctions a JOIN liq_txs t ON t.user_op_hash = a.user_op_hash
-         WHERE a.liquidatable > 0 AND a.bid_basis = 'bundle_net' AND t.win_bid_eth IS NOT NULL AND a.head >= ?1 ORDER BY a.head",
+         WHERE a.liquidatable > 0 AND a.bid_basis = 'batch_est' AND t.win_bid_eth IS NOT NULL AND a.head >= ?1 ORDER BY a.head",
     )?;
     let rows: Vec<PaperRow> = q
-        .query_map(params![clock.block_at(db, since)], |r| Ok((r.get(0)?, r.get::<_, Option<f64>>(1)?.unwrap_or(0.0), r.get::<_, Option<f64>>(2)?.unwrap_or(0.0), r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
+        .query_map(params![since_block], |r| {
+            Ok((r.get(0)?, r.get::<_, Option<f64>>(1)?.unwrap_or(0.0), r.get::<_, Option<f64>>(2)?.unwrap_or(0.0), r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get::<_, Option<f64>>(7)?.unwrap_or(0.0)))
+        })?
         .collect::<rusqlite::Result<_>>()?;
+    let legacy: i64 = db.query_row(
+        "SELECT count(*) FROM atlas_auctions a JOIN liq_txs t ON t.user_op_hash = a.user_op_hash
+         WHERE a.liquidatable > 0 AND a.bid_basis != 'batch_est' AND t.win_bid_eth IS NOT NULL AND a.head >= ?1",
+        params![since_block],
+        |r| r.get(0),
+    )?;
     let deadline = cfg.atlas.paper_deadline_ms as i64;
     let mut margins = vec![];
     for &m in &cfg.atlas.paper_margins {
         let (mut wins, mut pnl, mut wins_t, mut pnl_t, mut won_usd) = (0, 0.0, 0, 0.0, 0.0);
-        for (_, net, eth, ms, _, win_eth, _) in &rows {
+        for (_, net, eth, ms, _, win_eth, _, _) in &rows {
             let bid = net * (1.0 - m);
             if *eth <= 0.0 || bid / eth <= *win_eth {
                 continue;
@@ -283,32 +296,57 @@ fn paper(db: &Connection, clock: &Clock, since: f64, cfg: &Config) -> Result<Val
         }
         margins.push(json!({ "m": m, "wins": wins, "pnl": pnl, "wins_t": wins_t, "pnl_t": pnl_t, "won_usd": won_usd }));
     }
-    // Per market and per day at the first margin of 1% or more (the realistic bid).
+    // Per market, per day and per bonus band at the first margin of 1% or more (the realistic bid);
+    // plus batch-sim success and the sim-gas vs estimate ratio (to recalibrate the gas constants).
     let m1 = cfg.atlas.paper_margins.iter().copied().find(|m| *m >= 0.01).unwrap_or(0.01);
     let mut markets: std::collections::BTreeMap<String, (i64, i64, f64, f64, f64)> = Default::default();
     let mut days: std::collections::BTreeMap<i64, (i64, i64, f64)> = Default::default();
-    for (head, net, eth, ms, js, win_eth, _) in &rows {
+    // Bonus bands: <$50, $50-1k, $1k-5k, >$5k. Each: (n, wins, ours pnl).
+    let mut bands = [(0i64, 0i64, 0.0f64); 4];
+    let band_of = |b: f64| if b < 50.0 { 0 } else if b < 1_000.0 { 1 } else if b < 5_000.0 { 2 } else { 3 };
+    let (mut sim_total, mut sim_ok) = (0i64, 0i64);
+    let mut ratios: Vec<f64> = vec![];
+    for (head, net, eth, ms, js, win_eth, _, bonus) in &rows {
         let j: Value = serde_json::from_str(js).unwrap_or_default();
         let name = j["markets"].as_array().into_iter().flatten().filter(|m| m["liquidatable"].as_i64().unwrap_or(0) > 0).filter_map(|m| m["market"].as_str()).collect::<Vec<_>>().join("+");
         let win_usd = win_eth * eth;
         let won = *eth > 0.0 && net * (1.0 - m1) / eth > *win_eth && ms.is_some_and(|ms| ms <= deadline);
         let e = markets.entry(name).or_default();
-        e.0 += 1;
-        e.1 += i64::from(won);
-        e.2 += if won { net * m1 } else { 0.0 };
-        e.3 += net;
-        e.4 += win_usd;
+        (e.0, e.1, e.2, e.3, e.4) = (e.0 + 1, e.1 + i64::from(won), e.2 + if won { net * m1 } else { 0.0 }, e.3 + net, e.4 + win_usd);
+        let b = &mut bands[band_of(*bonus)];
+        (b.0, b.1, b.2) = (b.0 + 1, b.1 + i64::from(won), b.2 + if won { net * m1 } else { 0.0 });
         let day = ((clock.ts(db, *head) + tz_offset()) / 86_400.0).floor() as i64;
         let d = days.entry(day).or_default();
-        d.0 += 1;
-        d.1 += i64::from(won);
-        d.2 += if won { net * m1 } else { 0.0 };
+        (d.0, d.1, d.2) = (d.0 + 1, d.1 + i64::from(won), d.2 + if won { net * m1 } else { 0.0 });
+        // Batch-sim stats: solver rows that actually simulated (ok, or failed with an error).
+        for mrow in j["markets"].as_array().into_iter().flatten() {
+            let s = &mrow["solver"];
+            if s["bid_basis"].as_str() != Some("batch_est") {
+                continue;
+            }
+            let simmed = s["ok"].as_bool() == Some(true) || s.get("error").is_some();
+            if !simmed {
+                continue;
+            }
+            sim_total += 1;
+            if s["ok"].as_bool() == Some(true) {
+                sim_ok += 1;
+                if let (Some(est), Some(used)) = (s["est_gas"].as_u64().filter(|e| *e > 0), s["gas_used"].as_u64()) {
+                    ratios.push(used as f64 / est as f64);
+                }
+            }
+        }
     }
+    ratios.sort_by(|a, b| a.total_cmp(b));
+    let pct = |p: f64| (!ratios.is_empty()).then(|| ratios[((ratios.len() as f64 * p) as usize).min(ratios.len() - 1)]);
     let fast = rows.iter().filter(|r| r.3.is_some_and(|ms| ms <= deadline)).count();
+    let band_names = ["<$50", "$50-1k", "$1k-5k", ">$5k"];
     Ok(json!({
-        "auctions": rows.len(), "in_time": fast, "deadline_ms": deadline, "m1": m1, "margins": margins,
+        "auctions": rows.len(), "legacy_auctions": legacy, "in_time": fast, "deadline_ms": deadline, "m1": m1, "margins": margins,
         "markets": markets.iter().map(|(k, v)| json!({ "market": k, "n": v.0, "wins": v.1, "pnl": v.2, "ours": v.3, "win_usd": v.4 })).collect::<Vec<_>>(),
         "days": days.iter().map(|(d, v)| json!([d, v.0, v.1, v.2])).collect::<Vec<_>>(),
+        "bands": bands.iter().zip(band_names).map(|(v, n)| json!({ "band": n, "n": v.0, "wins": v.1, "pnl": v.2 })).collect::<Vec<_>>(),
+        "sim": { "total": sim_total, "ok": sim_ok, "gas_ratio_p50": pct(0.5), "gas_ratio_p90": pct(0.9) },
         "first_head": rows.first().map(|r| r.0),
     }))
 }

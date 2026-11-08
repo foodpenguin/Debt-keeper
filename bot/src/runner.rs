@@ -1154,7 +1154,7 @@ async fn value_auction<P: Provider>(
     info!(auction = %a.id, aggregator = %a.aggregator, deadline = a.deadline, liquidatable = %v["liquidatable"], bonus_usd = %v["bonus_usd"], bundle_net_usd = bundle_net, net_usd = %v["net_usd"], bid_usd = bid_usd.unwrap_or(0.0), bundle_ms = %v["bundle_ms"], value_ms, shared = %v["shared"], "ATLAS auction valued (observe only)");
     let mut row = json!({ "kind": "atlas_auction", "auction_id": a.id, "user_op_hash": a.user_op_hash, "aggregator": a.aggregator, "median": a.median.to_string(),
                           "deadline": a.deadline, "head": head.number, "max_fee_gwei": a.max_fee_per_gas as f64 / 1e9, "bid_usd": bid_usd, "bid_eth": bid_usd.map(|b| b / eth_usd.max(1.0)),
-                          "eth_usd": eth_usd, "bid_basis": "bundle_net", "bid_margin": atlas.margin, "queued_ms": queued_ms, "value_ms": value_ms });
+                          "eth_usd": eth_usd, "bid_basis": "batch_est", "bid_margin": atlas.margin, "queued_ms": queued_ms, "value_ms": value_ms });
     for k in ["markets", "positions", "liquidatable", "bonus_usd", "bundle_net_usd", "net_usd", "bundle_ms", "shared"] {
         row[k] = v[k].clone();
     }

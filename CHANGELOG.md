@@ -1,6 +1,39 @@
 # Changelog
 
-## v0.2.4 (unreleased)
+## v0.3.0 (unreleased)
+
+Atlas batch solver: one solver op liquidates several positions of a market in one Morpho flash loan
+and sells all the seized collateral in a single exit, so the bid and the op finally match the bundle
+the valuation prices (before, the op carried only the first position's single-route liquidation, so
+none of the multi-position auctions paper trading "won" could actually have been won).
+
+- Contract (`MorphoLiquidator.liquidateBatch`, ABI + packed fallback tag 0x01): a Morpho `flashLoan`
+  funds N `liquidate` calls (empty data, repaid through the standing allowance) on one market, then
+  one exit (direct route, must spend exactly the sum seized; or allowlisted aggregator steps) sells
+  all the collateral. The flash callback is guarded like `FlashLiquidator` (an `inBatch` transient
+  flag, the Morpho sender, once, `NotFunded`); the received collateral must equal the sum seized;
+  the same minProfit, allowlist and no-funds-at-rest guarantees as the single-position paths. New
+  batch security tests; existing ones stay green.
+- Gas (measured on the 2026-11-07 02:53 cbXRP auction, archive fork, `AtlasBundleGas.fork.t.sol`):
+  a 30-position batch op costs **1.53M gas minus the exit swap** (~34k per extra position), vs 6.19M
+  for the old per-position design (over the 6M `solverGasLimit`); with a real 2-hop cbXRP exit, 1 →
+  773k, 30 → 1.76M. Constants recalibrated: `BUNDLE_OVERHEAD_GAS` 600k → 500k,
+  `BUNDLE_GAS_PER_POSITION` 110k → 40k, new `METACALL_FIXED_GAS` 430k (the metacall gas outside the
+  solver call that Atlas still charges the winner — a cost, not part of `solverGasLimit`).
+- Bot: the valuation now builds an executable `BundlePlan` (positions at full seize, flash-loan
+  size, one full-size exit) and the solver op is the batch op. The bid is the estimate
+  (`bid_basis = "batch_est"`: gross − (gas estimate + metacall fixed) × the auction's gas price);
+  the simulation only gates the send and its gas/profit are journaled to recalibrate the constants.
+  Bonus floor (`[atlas] min_bonus_usd`, default 0 = off) and a gas floor (skip when the estimated
+  gas already exceeds the gross); the exits are weighed at the auction's gas price, where gas
+  dominates. New `[atlas]` keys: `max_bundle_positions` (20), `flash_headroom_bps` (5),
+  `min_bonus_usd` (0). v1 does not partial-liquidate and does not merge markets.
+- Kyber routing: the dead 100-gwei ladder rung becomes a forcing ~1000-gwei penalty that reliably
+  collapses a split route to one path fitting the Atlas cap (at the real ~15 gwei auction price the
+  old rung was too weak, and whether a route collapses turned out to depend mostly on transient
+  `pmm-19` RFQ depth); `gasInclude=true` on every `/routes` call.
+
+## v0.2.4 (2026-11-08)
 
 - Dashboard backlog drain: `bot dashboard --drain` keeps looking up liquidation txs until the
   backlog is cleared, instead of one `LOOKUPS_PER_PASS` (40) batch. A busy day leaves hundreds of
