@@ -65,7 +65,7 @@
 - **以 fee 計價的模擬**：每個計畫的模擬（以及 direct 路由的每次 grid 報價）都帶上不加價送出時的 fee：`Planner::sim_fee` = max fee 為 2 × base fee + `priority_fee_wei`、priority 為 `priority_fee_wei`。會讀 `tx.gasprice` 的 venue（priority fee 稅、動態手續費）回應的就是實際交易會拿到的結果。
 - **以 USD 記帳**：`Plan::sim_profit` 是借款代幣單位；`profit_usd` = 它 × `loan_usd`；`gas_cost_usd` = 以規劃 priority 計的 L2 gas + L1 data fee（`l1_fee_usd` 單獨列出）；`net_usd` = `profit_usd - gas_cost_usd`。沒有借款代幣價格的市場會成為計畫錯誤。
 - 對模擬結果做**合理性檢查**（利潤和報價的差距、節點實際模擬的區塊）。
-- `quote_bundle` 把一個市場在同一個組合上的所有可清算倉位當成一次出場來估值（Atlas 估值用；一筆 solver 交易會清算全部）；`gross_usd` 以 USD 計，`gas_units` 是整個操作的估計 gas（清算 + swap + 固定開銷，來自呼叫者傳入的 `BundleGas`：Atlas solver op 用 `atlas_venue::ATLAS_BUNDLE_GAS`）。
+- `quote_bundle` 把一個市場在同一個組合上的所有可清算倉位當成一次出場來估值（Atlas 估值用；一個 batch solver op 會清算全部）；`gross_usd` 以 USD 計，`gas_units` 是整個操作的估計 gas（清算 + swap + 固定開銷，來自呼叫者傳入的 `BundleGas`：Atlas solver op 用 `atlas_venue::ATLAS_BUNDLE_GAS`）。它同時產出一份可執行的 `BundlePlan`（部位全額 seize、flash loan 金額，以及單一的全額出場），由 `atlas_venue::AtlasSolver::batch_inner` 轉成 solver op 內層的 `liquidateBatch` 呼叫。v1 每個部位都全額清算、賣 100%，所以 direct 路線只有在它的配置能賣掉全部時才會被選（route 模式要剛好花掉 seize 的量）；出場路線用拍賣的 gas 價格比較（gas 在這裡是主導因素）。出價就是這個估計值（`batch_est`：gross 減去整筆 metacall 的 gas，含 `METACALL_FIXED_GAS`）；op 的模擬只用來把關送單。gas 以 `contracts/test/AtlasBundleGas.fork.t.sol` 校正（30 個部位的 batch 扣掉出場 swap 約 1.5M gas，每多一個約 34k）。
 
 ### `LiquidationVenue<L>`（`bot/src/venue.rs`）
 
@@ -105,6 +105,7 @@
 
 - `liquidate(params, borrower, seizedAssets, repaidShares, swaps, minProfit, deadlineBlock)`（ABI 入口，聚合器 swap）、`liquidateRoute` 和 packed `fallback`（direct 路線，精簡 calldata）。只有 `executor` 能呼叫。
 - Morpho 先轉出抵押品，再呼叫 `onMorphoLiquidate(repaidAssets, data)`，swap 在這裡執行；之後 Morpho 收回還款（由 `approveMorpho` 設定的常設授權）。
+- `liquidateBatch(params, items, flashAssets, exit, minProfit, deadlineBlock)`（ABI 入口和 packed `fallback` tag `0x01`），給 Atlas solver op 用：一次 Morpho `flashLoan` 資助同一個市場的 N 筆 `liquidate`（callback data 是空的，所以 Morpho 透過常設授權收回每一筆還款），最後一次 `exit`（direct 路線必須剛好賣掉全部 seize，或走白名單的聚合器步驟）把所有抵押品賣掉。`onMorphoFlashLoan` 只在我們自己的 batch 執行中有效（`inBatch` transient flag、Morpho 是 sender、只執行一次，否則 `NotFunded`），而且收到的抵押品必須等於 seize 的總和。
 - callback 結束後，合約檢查借款代幣的增加量 ≥ `minProfit`，把利潤送到 immutable 的 `PROFIT_RECEIVER`，平常不留存任何資金。
 - 管理功能：`setExecutor`、`setAllowedTarget`、`approveMorpho`、`pause`（owner 或 executor）/ `unpause`（owner）、兩步驟的 `transferOwnership` / `acceptOwnership`、`rescue`。
 
@@ -125,6 +126,8 @@
 | 池子回報正的產出 | 每一跳的產出必須是負的 delta（`BadRoute`） | `test_route_positiveOutputRejected` |
 | 格式錯誤的 packed calldata | 嚴格解碼，不和 ABI 入口的 selector 衝突 | `test_packed_malformedRejected`、`test_packed_noSelectorCollision`、`test_packedEntry_equalsAbiEntry` |
 | 緊急狀況 | executor（熱錢包）或 owner 可以 `pause`（給操作者手動停用；bot 本身從不呼叫，它的緊急停止是一個檔案），只有 owner 能恢復 | `test_pauseKillSwitch` |
+| 偽造／時機錯誤／重複呼叫 batch flash callback | `onMorphoFlashLoan` 需要 `msg.sender == MORPHO` 且我們自己的 batch 正在執行（`inBatch`，進來就清掉，所以只執行一次）；batch 模式下 `onMorphoLiquidate` 仍然被擋（它自己的 in-flight flag 不會被設） | `test_batch_flashCallbackAuth`、`test_batch_secondCallbackBlocked`、`test_batch_notFunded`、`test_batch_onMorphoLiquidateBlockedInBatch` |
+| batch seize 到的比付出的少，或出場賣不夠 | 收到的抵押品必須等於 seize 總和（`CollateralShortfall`）；route 出場必須剛好花掉這個量（`RouteSpendMismatch`）；`minProfit`、白名單、結束不留存資金都和單筆路徑一樣 | `test_batch_collateralShortfall`、`test_batch_routeSpendMismatch`、`test_batch_minProfitEnforced`、`test_batch_swapTargetNotAllowlisted`、`test_batch_happyPath_steps` |
 
 鏈下的防護：聚合器的 target 必須在 `allowed_targets` 裡；啟動時從 params 重新推出市場 id；不合理的模擬（利潤和報價差太多）會被拒絕；RPC 錯誤訊息會改寫，含 API key 的 URL 不會進 log（`errors_never_contain_urls`）；風控閘門（`bot/src/risk.rs`）負責緊急停止檔案、最低淨利、依淨利比例出價且有硬上限的 priority fee，以及失敗交易的每日 gas 預算。它估計的成本是以出價計的 L2 gas 加上計畫的 L1 data fee，再和 `profit_usd` 比較。
 
