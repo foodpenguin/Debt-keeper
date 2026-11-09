@@ -3073,7 +3073,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "liquidation-framework"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3268,8 +3268,8 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onchain-core"
-version = "0.1.2"
-source = "git+https://github.com/foodpenguin/bot-onchain-core?tag=v0.1.2#87268ef4ef05ca9d748a0145274869b7f15a9422"
+version = "0.1.3"
+source = "git+https://github.com/foodpenguin/bot-onchain-core?tag=v0.1.3#43373a33cc4e1fbfb7b52ec0f0526b2d0032b905"
 dependencies = [
  "alloy",
  "anyhow",
