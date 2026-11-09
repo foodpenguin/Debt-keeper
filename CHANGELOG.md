@@ -1,7 +1,8 @@
 # Changelog
 
-## v0.3.1 (unreleased)
+## v0.3.1 (2026-11-09)
 
+- onchain-core v0.1.3: a reverted simulation now reports its revert data (it read as a bare "0x").
 - Atlas batch op: the aggregator (Kyber) exit route is built for the solver's own MorphoLiquidator,
   where the batch swaps, instead of the planner's main venue. Built for the main venue, the proceeds
   landed in another contract and Morpho could not pull the flash loan back, so every batch with an
