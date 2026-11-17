@@ -17,7 +17,11 @@ use alloy::{
 };
 use anyhow::Result;
 use futures::future::BoxFuture;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Attempts to read a market's parameters at startup before giving up (a desynced endpoint can
+/// return empty/garbage data the pool does not failover; retrying lets it land on a healthy one).
+const MARKET_LOAD_ATTEMPTS: u32 = 5;
 
 use self::{
     math::{Health, LiquidationQuote, ORACLE_PRICE_SCALE},
@@ -88,10 +92,27 @@ impl LendingProtocol for Morpho {
     async fn load_markets<P: Provider>(&self, p: &P) -> Result<Vec<MarketMeta>> {
         let mut metas = Vec::with_capacity(self.markets.len());
         for (name, id) in &self.markets {
-            let meta = onchain::load_market_meta(p, self.address, *id, name).await?;
-            // The id is keccak256(abi.encode(params)); a mismatch means a wrong id or a lying RPC.
-            let computed = alloy::primitives::keccak256(alloy::sol_types::SolValue::abi_encode(&meta.params));
-            anyhow::ensure!(computed == *id, "market {name}: params hash {computed} != configured id");
+            // A desynced endpoint can return empty/garbage market data (seen 2026-11-13: symbols read
+            // as "?", decode buffer-overrun) with a 200, which the pool does not failover. Retry so a
+            // healthy endpoint can serve it instead of failing startup over one bad RPC.
+            let mut attempt = 0;
+            let meta = loop {
+                attempt += 1;
+                // The id is keccak256(abi.encode(params)); a mismatch means a wrong id or a lying RPC.
+                let loaded = match onchain::load_market_meta(p, self.address, *id, name).await {
+                    Ok(m) if alloy::primitives::keccak256(alloy::sol_types::SolValue::abi_encode(&m.params)) == *id => Ok(m),
+                    Ok(m) => Err(anyhow::anyhow!("params hash {} != configured id", alloy::primitives::keccak256(alloy::sol_types::SolValue::abi_encode(&m.params)))),
+                    Err(e) => Err(e),
+                };
+                match loaded {
+                    Ok(m) => break m,
+                    Err(e) if attempt < MARKET_LOAD_ATTEMPTS => {
+                        warn!(market = %name, attempt, error = format!("{e:#}"), "market load returned bad data; retrying (bad/desynced RPC?)");
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    Err(e) => return Err(e.context(format!("market {name} after {attempt} attempts"))),
+                }
+            };
             info!(market = %meta.name, loan = %meta.loan_symbol, collateral = %meta.collateral_symbol, lltv = math::units(meta.params.lltv, 18), "market loaded");
             metas.push(meta);
         }
@@ -242,5 +263,44 @@ mod tests {
         // A token calling itself "USDC" at another address, or the same address on another chain.
         assert_eq!(loan_usd_model(8453, Address::repeat_byte(0x11), 2400.0), None);
         assert_eq!(loan_usd_model(1, usdc, 2400.0), None);
+    }
+
+    /// A desynced endpoint (empty/garbage market data, or a multicall failure) must be retried, not
+    /// exit startup. Removing the retry in `load_markets` makes the first bad response propagate and
+    /// this `.expect` panics.
+    #[tokio::test]
+    async fn load_markets_retries_bad_rpc_data_instead_of_failing() {
+        use alloy::{
+            primitives::{Bytes, U256, keccak256},
+            providers::ProviderBuilder,
+            sol_types::SolValue,
+            transports::mock::Asserter,
+        };
+        use onchain::MarketParams;
+
+        let params = MarketParams {
+            loanToken: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+            collateralToken: Address::repeat_byte(0xc0),
+            oracle: Address::repeat_byte(0x0a),
+            irm: Address::repeat_byte(0x1a),
+            lltv: U256::from(860_000_000_000_000_000u64),
+        };
+        let id = keccak256(params.abi_encode());
+        // aggregate3's return: Result[] == (bool success, bytes returnData)[].
+        let agg = |rows: Vec<(bool, Bytes)>| -> Bytes { rows.abi_encode().into() };
+
+        let asserter = Asserter::new();
+        // First attempt: the idToMarketParams multicall fails on a flaky endpoint -> retry.
+        asserter.push_failure_msg("header not found");
+        // Second attempt: both multicalls succeed. The metadata calls are left failed (symbols read
+        // as "?", decimals default) — load_market_meta tolerates that, the params hash is what gates.
+        asserter.push_success(&agg(vec![(true, params.abi_encode().into())]));
+        asserter.push_success(&agg(vec![(false, Bytes::new()); 4]));
+
+        let p = ProviderBuilder::new().disable_recommended_fillers().connect_mocked_client(asserter);
+        let morpho = Morpho { address: Address::repeat_byte(0xbb), api_url: String::new(), chain_id: 8453, markets: vec![("X".into(), id)], log_chunk: 1000 };
+        let metas = morpho.load_markets(&p).await.expect("load_markets retries past the bad response");
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].params.loanToken, params.loanToken);
     }
 }

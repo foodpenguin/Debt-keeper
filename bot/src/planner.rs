@@ -37,6 +37,9 @@ const GAS_PER_EXTRA_PATH: u64 = 60_000;
 pub struct BundleGas {
     pub per_position: u64,
     pub overhead: u64,
+    /// Extra safety applied to an aggregator exit's swap gas (not the exact direct route's): the
+    /// aggregator's estimate is less reliable, so its bid and budget use a conservative figure.
+    pub agg_swap_safety: f64,
 }
 
 /// Gas of one liquidation outside its swap (protocol liquidate, callback, checks, transfers): what a
@@ -65,6 +68,10 @@ pub struct BundleQuote {
     pub kyber_net_usd: Option<f64>,
     pub error: Option<String>,
     pub quote_ms: u64,
+    /// The Kyber /routes and /route/build times (0 when Kyber was not used), to see where a slow
+    /// valuation went (2026-11-13: Kyber quotes up to 12 s).
+    pub kyber_quote_ms: u64,
+    pub kyber_build_ms: u64,
     /// The executable form of this bundle (positions, flash-loan size, the one full-size exit),
     /// built when a 100 %-size exit is available. Not journaled.
     #[serde(skip)]
@@ -440,16 +447,24 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             if !use_kyber {
                 return Err(format!("off ({agg_name} quotes the current market only)"));
             }
+            let kt = Instant::now();
             let k = self.aggregator.quote_within(collateral, loan, total_seize, swap_gas_budget).await.map_err(|e| e.to_string())?;
+            let quote_ms = kt.elapsed().as_millis() as u64;
             let g = gross(self.aggregator.amount_out(&k), total_seize);
-            Ok(((agg_name, 10_000u64, g, self.aggregator.swap_gas(&k).unwrap_or(swap_gas_budget)), k))
+            Ok(((agg_name, 10_000u64, g, self.aggregator.swap_gas(&k).unwrap_or(swap_gas_budget)), k, quote_ms))
         };
         let (direct, kyber) = tokio::join!(direct, kyber);
         q.quote_ms = t0.elapsed().as_millis() as u64;
+        q.kyber_quote_ms = kyber.as_ref().ok().map(|x| x.2).unwrap_or(0);
         // Route selection weighs the exits at the auction's gas price when given (gas dominates at
         // 15 gwei: a lower-gas exit can beat a higher-output one), else the planner's own.
         let gas_price = gas_price_wei.map(|w| w as f64).unwrap_or_else(|| self.route_gas_price(base_fee_wei));
-        let gas_units = |e: &BundleExit| e.3 + bundle_gas.per_position * views.len() as u64 + bundle_gas.overhead;
+        // The direct route's swap gas is an exact quote; an aggregator's is its own (looser)
+        // estimate, so it carries extra safety — a conservative bid, and over-budget routes rejected.
+        let gas_units = |e: &BundleExit| {
+            let swap = if e.0 == "direct" { e.3 } else { (e.3 as f64 * bundle_gas.agg_swap_safety) as u64 };
+            swap + bundle_gas.per_position * views.len() as u64 + bundle_gas.overhead
+        };
         let net = |e: &BundleExit| e.2 - gas_units(e) as f64 * gas_price / 1e18 * eth_usd;
         let de = direct.as_ref().ok().map(|x| &x.0);
         let ke = kyber.as_ref().ok().map(|x| &x.0);
@@ -473,8 +488,19 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             Some((ExitRoute::Packed(self.v3.expect("direct needs v3").encode(pair, grid, a)), "direct"))
         } else {
             let holder = exit_holder.unwrap_or_else(|| self.venue.swap_recipient());
-            match self.aggregator.build(&kyber.as_ref().expect("kyber won").1, holder, holder, self.cfg.slippage_bps).await {
-                Ok(b) => Some((ExitRoute::Call { target: b.target, calldata: b.calldata }, agg_name)),
+            let bt = Instant::now();
+            let built = self.aggregator.build(&kyber.as_ref().expect("kyber won").1, holder, holder, self.cfg.slippage_bps).await;
+            q.kyber_build_ms = bt.elapsed().as_millis() as u64;
+            match built {
+                Ok(b) => {
+                    // A build fallback (e.g. a pool-only re-quote after an RFQ failure) is journaled
+                    // as on the single-position path; the route differs from the quote priced above,
+                    // so the batch op's simulation is what prices it.
+                    if let Some(note) = b.note {
+                        q.router = format!("{} ({note})", q.router);
+                    }
+                    Some((ExitRoute::Call { target: b.target, calldata: b.calldata }, agg_name))
+                }
                 Err(err) => {
                     q.error = Some(format!("{agg_name} build failed: {err}"));
                     None
@@ -597,6 +623,10 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         if !self.cfg.allowed_targets.contains(&built.target) {
             plan.error = Some(format!("router {} not allowlisted", built.target));
             return Ok(plan);
+        }
+        // Record a build fallback (e.g. the aggregator re-quoted over pools after an RFQ failure).
+        if let Some(note) = built.note {
+            plan.router = format!("{} ({note})", plan.router);
         }
         let route = ExitRoute::Call { target: built.target, calldata: built.calldata };
         let payload = self.venue.encode(c.meta, c.view.user, pair, seize, repaid, &route, U256::ZERO, c.deadline_block);
@@ -727,7 +757,7 @@ mod generic_tests {
         assert_eq!(v.max_seize, U256::from(90u64));
 
         let planner = Planner { protocol: &toy, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000 }, false, 5, None, None).await;
+        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000, agg_swap_safety: 1.3 }, false, 5, None, None).await;
         assert_eq!(q.positions, 1);
         let err = q.error.unwrap();
         assert!(err.contains("no direct pools") && err.contains("mockdex: off (mockdex quotes"), "{err}");
@@ -779,11 +809,48 @@ mod generic_tests {
         for (exit_holder, want) in [(Some(holder), holder), (None, LiquidationVenue::<Toy>::target(&venue))] {
             let dex = HolderDex::default();
             let planner = Planner { protocol: &toy, aggregator: &dex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-            let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000 }, true, 5, None, exit_holder).await;
+            let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 }, true, 5, None, exit_holder).await;
             assert_eq!(q.router, "holderdex", "{:?}", q.error);
             assert!(q.plan.as_ref().is_some_and(|p| matches!(p.exit, ExitRoute::Call { .. })), "{:?}", q.error);
             assert_eq!(*dex.0.lock().unwrap(), vec![(want, want)]);
         }
+    }
+
+    /// An aggregator whose build took a fallback route (SwapCall.note).
+    struct NoteDex;
+
+    impl Dex for NoteDex {
+        type Quote = U256;
+        fn name(&self) -> &'static str {
+            "notedex"
+        }
+        async fn quote_within(&self, token_in: Address, token_out: Address, amount_in: U256, gas_budget: u64) -> Result<U256> {
+            MockDex.quote_within(token_in, token_out, amount_in, gas_budget).await
+        }
+        fn amount_out(&self, quote: &U256) -> U256 {
+            MockDex.amount_out(quote)
+        }
+        fn swap_gas(&self, quote: &U256) -> Option<u64> {
+            MockDex.swap_gas(quote)
+        }
+        async fn build(&self, quote: &U256, sender: Address, recipient: Address, slippage_bps: u32) -> Result<crate::dex::SwapCall> {
+            let call = MockDex.build(quote, sender, recipient, slippage_bps).await?;
+            Ok(crate::dex::SwapCall { note: Some("fallback"), ..call })
+        }
+    }
+
+    #[tokio::test]
+    async fn bundle_exit_journals_a_build_fallback() {
+        // The single-position path tags plan.router with the build's note; the bundle exit must too,
+        // or a fallback route (priced only by the batch sim) is invisible in the journal.
+        let provider = ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap());
+        let (toy, venue, cfg) = (Toy::default(), MockVenue, cfg());
+        let m = Mk { key: key(1), name: "alpha".into() };
+        let v = view(&toy, 0, user(1), &m, &1.0, &(100, 90));
+        let planner = Planner { protocol: &toy, aggregator: &NoteDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
+        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 }, true, 5, None, None).await;
+        assert_eq!(q.router, "notedex (fallback)", "{:?}", q.error);
+        assert_eq!(q.plan.as_ref().map(|p| p.router), Some("notedex"), "the executable plan keeps the venue name");
     }
 
     #[tokio::test]

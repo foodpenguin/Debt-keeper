@@ -35,6 +35,12 @@ pub struct Config {
     /// Max block range for one getLogs call; a bigger gap triggers a full borrower reload instead.
     #[serde(default = "default_log_range")]
     pub max_log_range: u64,
+    /// A head reported more than this many blocks ahead of our last block is cross-checked against
+    /// the provider's tip before it is trusted: a single endpoint can report a wildly wrong block
+    /// number (seen 2026-11-13, ~8.7M ahead), which must not trip a full reload and crash loop. The
+    /// head is dropped only if it is also this far beyond the freshly read tip.
+    #[serde(default = "default_head_sanity_gap")]
+    pub head_sanity_gap: u64,
     pub journal_path: String,
     /// The lending protocol this bot tracks (Morpho Blue, the first impl). Another protocol gets
     /// its own section and `LendingProtocol` impl (the README lists the keys still Morpho-bound).
@@ -177,6 +183,17 @@ pub struct AtlasConfig {
     /// Skip auctions whose total bonus is below this (USD). 0 = off (the real floor is private).
     #[serde(default)]
     pub min_bonus_usd: f64,
+    /// Fraction of `solver_gas_limit` a batch op's SIMULATED gas may use before it is not sent: the
+    /// aggregator exit's gas estimate is unreliable near the limit (seen 2026-11-13: a Kyber-exit
+    /// batch used 5.95M against a 4.9M estimate, almost the 6M cap). Leaves headroom for state drift.
+    #[serde(default = "default_bundle_gas_headroom")]
+    pub bundle_gas_headroom: f64,
+    /// Valuation simulations (`eth_simulateV1`) hedged to a second endpoint at once rather than
+    /// after ~2x the first one's latency, at most this many in flight (each is a duplicate request);
+    /// the rest hedge after the usual delay, so a crash burst does not double the pool's load. The
+    /// batch op's simulation starts first in each market, so it is the one that gets a slot. 0 = off.
+    #[serde(default = "default_eager_hedge_max")]
+    pub eager_hedge_max_in_flight: usize,
     /// Auction valuations running at once. They share an RPC pool: a crash brings dozens of
     /// auctions within seconds, and unbounded valuations would starve it.
     #[serde(default = "default_atlas_concurrent")]
@@ -198,7 +215,7 @@ pub struct AtlasConfig {
 
 impl Default for AtlasConfig {
     fn default() -> Self {
-        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
+        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, bundle_gas_headroom: default_bundle_gas_headroom(), eager_hedge_max_in_flight: default_eager_hedge_max(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
     }
 }
 
@@ -224,9 +241,17 @@ pub struct SolverConfig {
     /// Uniswap V3-style router (exactOutputSingle) that buys the ETH bid with the loan token.
     #[serde(default = "default_bid_router")]
     pub bid_router: Address,
-    /// Fee tier of the bid swap pool (loan token / WETH).
+    /// Fee tier of the bid swap pool (loan token / WETH): the fallback when no `bid_fee_tiers` pool
+    /// exists for a loan token.
     #[serde(default = "default_bid_fee")]
     pub bid_fee: u32,
+    /// Uniswap V3 factory used to find the deepest loan-token/WETH pool for the bid swap at startup,
+    /// so it does not fail on a thin or missing pool at a single fixed fee (2026-11-13 BidSwapFailed).
+    #[serde(default = "default_bid_factory")]
+    pub bid_factory: Address,
+    /// Candidate bid-swap fee tiers probed for the deepest loan-token/WETH pool at startup.
+    #[serde(default = "default_bid_fee_tiers")]
+    pub bid_fee_tiers: Vec<u32>,
     #[serde(default = "default_solver_artifact")]
     pub artifact: String,
     #[serde(default = "default_atlas_stub_artifact")]
@@ -257,6 +282,8 @@ impl Default for SolverConfig {
             weth: default_weth(),
             bid_router: default_bid_router(),
             bid_fee: default_bid_fee(),
+            bid_factory: default_bid_factory(),
+            bid_fee_tiers: default_bid_fee_tiers(),
             artifact: default_solver_artifact(),
             stub_artifact: default_atlas_stub_artifact(),
             submit: false,
@@ -287,6 +314,13 @@ fn default_bid_router() -> Address {
 }
 fn default_bid_fee() -> u32 {
     500
+}
+fn default_bid_factory() -> Address {
+    // Uniswap V3 factory on Base.
+    "0x33128a8fC17869897dcE68Ed026d694621f6FDfD".parse().unwrap()
+}
+fn default_bid_fee_tiers() -> Vec<u32> {
+    vec![500, 3000, 100, 10000]
 }
 fn default_solver_artifact() -> String {
     "../contracts/out/AtlasLiquidationSolver.sol/AtlasLiquidationSolver.json".into()
@@ -629,6 +663,16 @@ pub struct ExecConfig {
     pub liquidator_artifact: String,
     pub kyber_api: String,
     pub kyber_client_id: String,
+    /// Kyber source ids (comma-separated) excluded when a build fails on an RFQ/PMM route (the
+    /// signed quote expired or the maker declined, e.g. "pmm RFQ failed" / HTTP 403): the route is
+    /// re-quoted over pools only. Public Kyber source ids, not strategy.
+    #[serde(default = "default_kyber_rfq_exclude")]
+    pub kyber_rfq_exclude: String,
+    /// Time budget (ms) for a single Kyber /routes or /route/build call: past it the call is
+    /// abandoned (a timeout error), so the valuation falls back to the direct route or skips instead
+    /// of waiting (seen 2026-11-13: a Kyber quote took up to 12 s).
+    #[serde(default = "default_kyber_timeout_ms")]
+    pub kyber_timeout_ms: u64,
     pub slippage_bps: u32,
     pub priority_fee_wei: u128,
     /// How long a liquidation tx stays valid. 4 s = 2 blocks today, 20 blocks after Denim.
@@ -731,6 +775,23 @@ pub struct MarketEntry {
 
 fn default_poll_ms() -> u64 {
     1000
+}
+fn default_kyber_rfq_exclude() -> String {
+    "pmm-19,bebop".into()
+}
+fn default_kyber_timeout_ms() -> u64 {
+    700
+}
+fn default_bundle_gas_headroom() -> f64 {
+    0.9
+}
+fn default_eager_hedge_max() -> usize {
+    2
+}
+fn default_head_sanity_gap() -> u64 {
+    // A chain never advances this many blocks between heads; only a lying endpoint does. Still small
+    // enough that a genuine catch-up after a pause (confirmed against the tip) is never dropped.
+    500
 }
 fn default_refresh_secs() -> u64 {
     // Events catch new borrowers; the full API walk (~20 s) is only a safety net.

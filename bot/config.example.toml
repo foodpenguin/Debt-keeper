@@ -3,6 +3,7 @@
 # endpoints, gas and markets before going live.
 chain_id = 8453
 poll_ms = 1000
+head_sanity_gap = 500          # a head more than this far beyond the freshly read tip is dropped (bad endpoint)
 borrower_refresh_secs = 21600
 watch_hf = 1.02
 min_bonus = 1.0
@@ -54,6 +55,8 @@ executor = "0x000000000000000000000000000000000000dEaD"   # hot wallet ADDRESS o
 liquidator_artifact = "../contracts/out/MorphoLiquidator.sol/MorphoLiquidator.json"
 kyber_api = "https://aggregator-api.kyberswap.com/base/api/v1"
 kyber_client_id = "liquidation-framework"   # free-text client id KyberSwap asks integrators to send
+kyber_rfq_exclude = "pmm-19,bebop"          # sources dropped when a build fails on an RFQ/PMM route (re-quote over pools)
+kyber_timeout_ms = 700                       # per Kyber /routes or /route/build call; past it, fall back to direct or skip
 slippage_bps = 50
 priority_fee_wei = 1000000     # 0.001 gwei
 deadline_secs = 4.0            # tx valid this long; converted to blocks with the observed block time
@@ -155,6 +158,8 @@ solver_gas_limit = 6000000     # the DappControl's solverGasLimit: liquidations 
 max_bundle_positions = 20      # most positions one batch solver op liquidates together (also gas-capped)
 flash_headroom_bps = 5         # extra loan token the batch flash-borrows over the sum of the repayments
 min_bonus_usd = 0              # skip auctions below this total bonus (USD); 0 = off (real floor is private)
+bundle_gas_headroom = 0.9      # a batch op whose simulated gas exceeds this x solver_gas_limit is not sent
+eager_hedge_max_in_flight = 2  # valuation sims hedged to a 2nd endpoint at once (duplicates), at most this many; 0 = off
 max_concurrent = 1             # valuations at once (they share the RPC pool)
 paper_margins = [0.01, 0.05, 0.1]   # dashboard paper trading: bid = bundle net x (1 - m) vs the decoded winning bid
 paper_deadline_ms = 2000       # a valuation later than this after the auction could not have bid in time
@@ -170,7 +175,9 @@ simulate = false
 # liquidator = "0x..."         # deployed MorphoLiquidator owned by the solver (executor = receiver = solver)
 # signer = "0x..."             # the solver operation signer; default: exec.executor
 # bid_router = "0x2626664c2603336E57B271c5C0b26F421741e481"   # Uniswap V3 SwapRouter02 (exactOutputSingle) for the ETH bid
-# bid_fee = 500                # fee tier of the loan token / WETH pool the bid is bought in
+# bid_fee = 500                # fallback fee tier of the loan token / WETH pool the bid is bought in
+# bid_factory = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"   # Uni V3 factory: probed for the deepest bid pool per loan token
+# bid_fee_tiers = [500, 3000, 100, 10000]   # candidate bid-pool fee tiers probed at startup (deepest wins)
 # min_bond_eth = 0.01          # below this atlETH bond no op is submitted (checked at start and every 50 heads)
 # atlas_bond_budget_usd = 2.0  # most the bond may shrink in a UTC day before ops stop until the next day
 

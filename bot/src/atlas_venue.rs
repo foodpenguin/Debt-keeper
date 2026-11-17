@@ -10,9 +10,11 @@
 //! and signing the `SolverOperation` (EIP-712 over Atlas's typehash) and submitting it to the
 //! auction endpoint; those are a later step.
 
+use std::collections::{HashMap, HashSet};
+
 use alloy::{
     eips::BlockId,
-    primitives::{Address, Bytes, U256, address},
+    primitives::{Address, Bytes, U256, address, aliases::U24},
     providers::Provider,
     rpc::types::state::{AccountOverride, StateOverride},
     sol,
@@ -23,7 +25,7 @@ use anyhow::{Context, Result};
 use crate::{
     dex::ExitRoute,
     executor::{MinProfitSlot, Payload},
-    morpho::{Morpho, onchain::MarketMeta},
+    morpho::{Morpho, onchain::MarketMeta, onchain::multicall},
     protocol::Pair,
     sim::{self, LiquidatorCode, Simulator},
     venue::{LiquidationVenue, SimAt, SimFee, SimResult},
@@ -34,6 +36,43 @@ use crate::contracts::{IAtlasSolver, SolverCall, SwapStep};
 sol! {
     struct ExactOutputSingleParams { address tokenIn; address tokenOut; uint24 fee; address recipient; uint256 amountOut; uint256 amountInMaximum; uint160 sqrtPriceLimitX96; }
     interface IBidRouter { function exactOutputSingle(ExactOutputSingleParams params) external payable returns (uint256 amountIn); }
+    interface IV3Factory { function getPool(address a, address b, uint24 fee) external view returns (address); }
+    interface IV3Pool { function liquidity() external view returns (uint128); }
+}
+
+/// The deepest loan-token/WETH Uniswap-V3 pool's fee tier per loan token, probed at startup so the
+/// bid swap does not fail on a thin or missing pool at one fixed fee (2026-11-13: BidSwapFailed). A
+/// WETH loan needs no swap and is skipped; a token with no pool at any `tiers` is absent (the bid
+/// swap falls back to the configured `bid_fee`).
+pub async fn probe_bid_fees<P: Provider>(p: &P, factory: Address, weth: Address, loan_tokens: &[Address], tiers: &[u32]) -> HashMap<Address, u32> {
+    let tokens: Vec<Address> = loan_tokens.iter().copied().filter(|t| *t != weth).collect::<HashSet<_>>().into_iter().collect();
+    if tokens.is_empty() || tiers.is_empty() {
+        return HashMap::new();
+    }
+    let pool_calls: Vec<(Address, Bytes)> =
+        tokens.iter().flat_map(|t| tiers.iter().map(move |fee| (factory, IV3Factory::getPoolCall { a: *t, b: weth, fee: U24::from(*fee) }.abi_encode().into()))).collect();
+    let pools: Vec<Option<Address>> = match multicall(p, &pool_calls, BlockId::latest()).await {
+        Ok(r) => r.iter().map(|b| b.as_ref().and_then(|b| IV3Factory::getPoolCall::abi_decode_returns(b).ok()).filter(|a| !a.is_zero())).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "bid-fee probe: getPool failed; bid swap uses the default fee");
+            return HashMap::new();
+        }
+    };
+    let targets: Vec<(usize, Address)> = pools.iter().enumerate().filter_map(|(i, a)| a.map(|a| (i, a))).collect();
+    let liq_calls: Vec<(Address, Bytes)> = targets.iter().map(|(_, a)| (*a, IV3Pool::liquidityCall {}.abi_encode().into())).collect();
+    let liqs = multicall(p, &liq_calls, BlockId::latest()).await.unwrap_or_default();
+    let mut liquidity = vec![0u128; pool_calls.len()];
+    for ((i, _), r) in targets.iter().zip(liqs) {
+        liquidity[*i] = r.and_then(|b| IV3Pool::liquidityCall::abi_decode_returns(&b).ok()).unwrap_or(0);
+    }
+    let mut out = HashMap::new();
+    for (ti, t) in tokens.iter().enumerate() {
+        let base = ti * tiers.len();
+        if let Some((best, _)) = (0..tiers.len()).map(|k| (tiers[k], liquidity[base + k])).filter(|(_, l)| *l > 0).max_by_key(|(_, l)| *l) {
+            out.insert(*t, best);
+        }
+    }
+    out
 }
 
 /// minProfit inside `atlasSolverCall` calldata: selector + 6 head words, solverOpData's length
@@ -54,6 +93,9 @@ pub struct AtlasSolver {
     pub weth: Address,
     pub bid_router: Address,
     pub bid_fee: u32,
+    /// Per loan-token bid-swap fee tier (the deepest loan/WETH pool), probed at startup; a token not
+    /// here uses `bid_fee`.
+    bid_fees: HashMap<Address, u32>,
     /// The MorphoLiquidator the solver liquidates through.
     pub liquidator: Simulator,
     solver_code: Option<LiquidatorCode>,
@@ -63,7 +105,13 @@ pub struct AtlasSolver {
 impl AtlasSolver {
     #[allow(clippy::too_many_arguments)]
     pub fn new(atlas: Address, solver: Option<Address>, signer: Address, weth: Address, bid_router: Address, bid_fee: u32, liquidator: Simulator, solver_code: Option<LiquidatorCode>, stub: Bytes) -> Self {
-        Self { atlas, solver: solver.unwrap_or(SIM_SOLVER), signer, weth, bid_router, bid_fee, liquidator, solver_code: if solver.is_some() { None } else { solver_code }, stub }
+        Self { atlas, solver: solver.unwrap_or(SIM_SOLVER), signer, weth, bid_router, bid_fee, bid_fees: HashMap::new(), liquidator, solver_code: if solver.is_some() { None } else { solver_code }, stub }
+    }
+
+    /// Sets the per-loan-token bid-swap fee tiers from `probe_bid_fees`.
+    pub fn with_bid_fees(mut self, bid_fees: HashMap<Address, u32>) -> Self {
+        self.bid_fees = bid_fees;
+        self
     }
 
     /// `atlasSolverCall` for one liquidation (`inner` = MorphoLiquidator calldata) that repays in
@@ -98,7 +146,7 @@ impl AtlasSolver {
             params: ExactOutputSingleParams {
                 tokenIn: loan_token,
                 tokenOut: self.weth,
-                fee: alloy::primitives::Uint::from(self.bid_fee),
+                fee: alloy::primitives::Uint::from(self.bid_fees.get(&loan_token).copied().unwrap_or(self.bid_fee)),
                 recipient: self.solver,
                 amountOut: bid_wei,
                 amountInMaximum: U256::from(u128::MAX),
@@ -197,6 +245,19 @@ pub fn bundle_swap_budget(solver_gas_limit: u64, n: usize) -> u64 {
     solver_gas_limit.saturating_sub(BUNDLE_OVERHEAD_GAS + BUNDLE_GAS_PER_POSITION * n as u64)
 }
 
+/// Extra safety on an *aggregator* exit's gas in the bundle estimate (on top of KYBER_GAS_SAFETY):
+/// the aggregator's own estimate is less reliable than the self-built direct router's (seen
+/// 2026-11-13, a Kyber-exit batch ran ~1.2x its estimate), so its bid is priced and its budget
+/// checked more conservatively. The direct route (exact quoter) takes no extra factor.
+pub const BUNDLE_AGG_SWAP_SAFETY: f64 = 1.3;
+
+/// Whether a batch op's simulated gas leaves enough headroom under `solver_gas_limit` to send: the
+/// real sim gas (not the estimate) is gated so an under-estimated aggregator exit that would run
+/// close to the cap is not sent (it risks running out of gas on-chain or being rejected by Atlas).
+pub fn fits_solver_gas(gas_used: u64, solver_gas_limit: u64, headroom: f64) -> bool {
+    (gas_used as f64) <= solver_gas_limit as f64 * headroom
+}
+
 /// Exit modes in the batch liquidator's `exit` bytes (match MorphoLiquidator MODE_ROUTE/MODE_STEPS).
 const EXIT_MODE_ROUTE: u8 = 0x01;
 const EXIT_MODE_STEPS: u8 = 0x02;
@@ -224,7 +285,7 @@ fn batch_exit_bytes(exit: &ExitRoute, collateral: Address, total_seize: U256) ->
 
 
 /// What `Planner::quote_bundle` charges a solver op besides its swap.
-pub const ATLAS_BUNDLE_GAS: crate::planner::BundleGas = crate::planner::BundleGas { per_position: BUNDLE_GAS_PER_POSITION, overhead: BUNDLE_OVERHEAD_GAS };
+pub const ATLAS_BUNDLE_GAS: crate::planner::BundleGas = crate::planner::BundleGas { per_position: BUNDLE_GAS_PER_POSITION, overhead: BUNDLE_OVERHEAD_GAS, agg_swap_safety: BUNDLE_AGG_SWAP_SAFETY };
 
 #[cfg(test)]
 mod tests {
@@ -257,6 +318,15 @@ mod tests {
         // A 10-position bundle leaves 6M - 500k - 400k = 5.1M for the swap.
         assert_eq!(bundle_swap_budget(6_000_000, 10), 5_100_000);
         assert_eq!(bundle_capacity(1_000_000, 20), 0);
+    }
+
+    #[test]
+    fn gas_send_guard_rejects_ops_near_the_solver_limit() {
+        // 6M limit, 0.9 headroom: send up to 5.4M of real sim gas, not beyond.
+        assert!(fits_solver_gas(4_000_000, 6_000_000, 0.9));
+        assert!(fits_solver_gas(5_400_000, 6_000_000, 0.9));
+        // The 2026-11-13 case: a Kyber-exit batch that really used 5.95M is not sent.
+        assert!(!fits_solver_gas(5_950_000, 6_000_000, 0.9));
     }
 
     #[test]

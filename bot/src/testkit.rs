@@ -275,7 +275,7 @@ impl Dex for MockDex {
         Some(100_000)
     }
     async fn build(&self, quote: &U256, _sender: Address, _recipient: Address, _slippage_bps: u32) -> Result<SwapCall> {
-        Ok(SwapCall { target: Address::repeat_byte(0x22), calldata: Bytes::from(quote.to_be_bytes::<32>().to_vec()) })
+        Ok(SwapCall { target: Address::repeat_byte(0x22), calldata: Bytes::from(quote.to_be_bytes::<32>().to_vec()), note: None })
     }
 }
 

@@ -124,7 +124,10 @@ impl Runner<()> {
             None
         } else {
             info!(rpc = ?atlas_specs.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), "atlas valuation endpoints");
-            let p = rpc::RpcPool::new(atlas_specs)?;
+            // Hedge the valuation sim immediately: the first endpoint often lags a block, and the
+            // extra request is worth racing on this latency-critical path (S6) — for a few sims at a
+            // time, so a burst does not double the pool's load.
+            let p = rpc::RpcPool::new(atlas_specs)?.with_eager_hedge(["eth_simulateV1".to_string()], cfg.atlas.eager_hedge_max_in_flight);
             Some((ProviderBuilder::new().connect_client(alloy::rpc::client::RpcClient::new(p.clone(), false)), p))
         };
         let morpho = Morpho::from_config(&cfg);
@@ -253,7 +256,7 @@ impl venue::LiquidationVenue<Morpho> for Venue {
 /// standing Morpho allowance on every loan token, from the discovered storage slot).
 async fn build_planner_parts<P: Provider>(engine: &MorphoEngine<P>) -> Result<(Kyber, Venue)> {
     let cfg = &engine.cfg;
-    let kyber = Kyber::new(engine.http.clone(), &cfg.exec.kyber_api, &cfg.exec.kyber_client_id);
+    let kyber = Kyber::new(engine.http.clone(), &cfg.exec.kyber_api, &cfg.exec.kyber_client_id, &cfg.exec.kyber_rfq_exclude, cfg.exec.kyber_timeout_ms);
     if cfg.exec.venue == "flash" {
         return Ok((kyber, Venue::Flash(build_flash_venue(engine).await?)));
     }
@@ -341,8 +344,12 @@ async fn build_atlas_solver<P: Provider>(engine: &MorphoEngine<P>) -> Result<Opt
     }
     let art: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&c.stub_artifact).with_context(|| format!("reading {} (run `forge build` in contracts/)", c.stub_artifact))?)?;
     let stub: alloy::primitives::Bytes = art["deployedBytecode"]["object"].as_str().context("atlas stub: no deployedBytecode")?.parse()?;
-    info!(%solver, %signer, "atlas: solver operations are simulated (never signed or sent)");
-    Ok(Some(atlas_venue::AtlasSolver::new(atlas, c.address, signer, c.weth, c.bid_router, c.bid_fee, liq, solver_code, stub)))
+    // The deepest loan/WETH pool per loan token, so the bid swap does not fail on a thin/missing
+    // pool at one fixed fee (2026-11-13: BidSwapFailed).
+    let loan_tokens: Vec<Address> = engine.metas.iter().map(|m| m.params.loanToken).collect();
+    let bid_fees = atlas_venue::probe_bid_fees(p, c.bid_factory, c.weth, &loan_tokens, &c.bid_fee_tiers).await;
+    info!(%solver, %signer, bid_fee_overrides = bid_fees.len(), "atlas: solver operations are simulated (never signed or sent)");
+    Ok(Some(atlas_venue::AtlasSolver::new(atlas, c.address, signer, c.weth, c.bid_router, c.bid_fee, liq, solver_code, stub).with_bid_fees(bid_fees)))
 }
 
 /// FlashLiquidator over Morpho: the repayment is flash-borrowed (exec.flash_funding) and Morpho's
@@ -743,6 +750,14 @@ const BOND_CHECK_HEADS: u64 = 500;
 /// `snapshot_max_age`; otherwise the prices are still current and the snapshot is reused.
 fn must_refetch_snapshots(has_prev: bool, oracle_updated: bool, touched_any: bool, fresh_enough: bool) -> bool {
     !has_prev || oracle_updated || touched_any || !fresh_enough
+}
+
+/// Whether a reported head block number is plausible. A head far ahead of our last processed block
+/// is only trusted when it is within `sanity_gap` of the freshly read chain tip: a single endpoint
+/// can report a wildly wrong number (2026-11-13, ~8.7M ahead), which, left unchecked, is passed as
+/// the query block and makes every multicall fail "from block is greater than latest".
+fn head_plausible(head: u64, last_block: u64, tip: u64, sanity_gap: u64) -> bool {
+    head <= last_block + sanity_gap || head <= tip + sanity_gap
 }
 
 /// The chain's block time from the last BLOCK_CLOCK_HEADS heads: follows a block-time change (Base
@@ -1147,10 +1162,10 @@ async fn value_auction<P: Provider>(
     // The journaled bid: the policy's bid on the bundle net (default: x (1 - atlas.margin)); the
     // dashboard's paper table tries the atlas.paper_margins ladder around it. None = no bid.
     let bid_usd = parts.auction.bid_usd(None, bundle_net, eth_usd);
-    // From this auction's arrival to the end of the valuation proper (before any solver-op
-    // simulation, see valuation()).
-    let since_valued = v["valued_unix_ms"].as_u64().map_or(0, |t| gates::unix_ms().saturating_sub(t));
-    let value_ms = (a.seen.elapsed().as_millis() as u64).saturating_sub(since_valued);
+    // From THIS auction's arrival to the op being sendable (the valuation and the overlapped batch-op
+    // simulation are done; see valuation()). A shared valuation is timed per sibling: each one's own
+    // arrival, not the first auction's. Paper trading times with it.
+    let value_ms = arrival_to_valued_ms(a.seen.elapsed().as_millis() as u64, v["valued_unix_ms"].as_u64(), gates::unix_ms());
     info!(auction = %a.id, aggregator = %a.aggregator, deadline = a.deadline, liquidatable = %v["liquidatable"], bonus_usd = %v["bonus_usd"], bundle_net_usd = bundle_net, net_usd = %v["net_usd"], bid_usd = bid_usd.unwrap_or(0.0), bundle_ms = %v["bundle_ms"], value_ms, shared = %v["shared"], "ATLAS auction valued (observe only)");
     let mut row = json!({ "kind": "atlas_auction", "auction_id": a.id, "user_op_hash": a.user_op_hash, "aggregator": a.aggregator, "median": a.median.to_string(),
                           "deadline": a.deadline, "head": head.number, "max_fee_gwei": a.max_fee_per_gas as f64 / 1e9, "bid_usd": bid_usd, "bid_eth": bid_usd.map(|b| b / eth_usd.max(1.0)),
@@ -1159,6 +1174,13 @@ async fn value_auction<P: Provider>(
         row[k] = v[k].clone();
     }
     let _ = journal.send(row.to_string());
+}
+
+/// Milliseconds from an auction's arrival to when the (possibly shared) valuation finished: the
+/// auction's age now minus how long ago the valuation finished (`valued_unix_ms`, wall clock). A
+/// sibling that arrived after the first auction gets its own shorter latency.
+fn arrival_to_valued_ms(age_ms: u64, valued_unix_ms: Option<u64>, now_unix_ms: u64) -> u64 {
+    age_ms.saturating_sub(valued_unix_ms.map_or(0, |t| now_unix_ms.saturating_sub(t)))
 }
 
 /// The valuation proper (see value_auction): per-market rows, positions and totals, timed from
@@ -1182,35 +1204,66 @@ struct OpCandidate {
 /// bid, the candidate for submission (`valuation` submits the auction's best one). None: solver
 /// venue off, or no direct-router plan to wrap (an aggregator route is built for the direct
 /// liquidator's address).
+/// What `batch_solver_op` decided for a market: a journal row (handled), nothing (no solver venue),
+/// or "value the single-position op instead" (no executable bundle plan; that needs the plans).
+enum BatchOutcome {
+    Row(serde_json::Value, Option<OpCandidate>),
+    NoRow,
+    NeedSingle,
+}
+
+/// The batch solver op for a market, needing ONLY the bundle, so it runs concurrently with the
+/// per-position plans (S1): those plans are diagnostics plus the single-position fallback and must
+/// not delay the batch op that is what actually gets sent (2026-11-13: 38 of 80 slow auctions had
+/// their bundle ready in < 1.5 s but were late waiting on the per-position plans).
 #[allow(clippy::too_many_arguments)]
-async fn solver_op<P: Provider>(
+async fn batch_solver_op<P: Provider>(
     provider: &P,
     parts: &PlannerParts,
     mi: usize,
     m: &AuctionMarket,
     bundle: Option<&planner::BundleQuote>,
-    top: Option<&Result<planner::Plan>>,
     overrides: &StateOverride,
     block: u64,
     sim_time: u64,
     deadline: u64,
     min_bonus_usd: f64,
+    solver_gas_limit: u64,
+    gas_headroom: f64,
+    atlas_gas_usd: f64,
+    eth_usd: f64,
+) -> BatchOutcome {
+    let (Some(solver), Venue::Callback(_)) = (&parts.solver, &parts.venue) else { return BatchOutcome::NoRow };
+    // Below the bonus floor: do not value a solver op for this market.
+    let bonus: f64 = m.liq.iter().map(|v| v.bonus).sum();
+    if bonus < min_bonus_usd {
+        return BatchOutcome::Row(json!({ "ok": false, "skipped": "min_bonus", "bonus_usd": bonus }), None);
+    }
+    if let Some(b) = bundle
+        && let Some(plan) = &b.plan
+    {
+        let (row, cand) = batch_op(provider, parts, mi, m, b, plan, solver, overrides, block, sim_time, deadline, solver_gas_limit, gas_headroom, atlas_gas_usd, eth_usd).await;
+        return BatchOutcome::Row(row, cand);
+    }
+    BatchOutcome::NeedSingle
+}
+
+/// The single-position solver op: the fallback when a market has no executable bundle plan. Wraps the
+/// top position's direct-route plan, so it needs the per-position plans (hence it runs after them).
+#[allow(clippy::too_many_arguments)]
+async fn single_solver_op<P: Provider>(
+    provider: &P,
+    parts: &PlannerParts,
+    mi: usize,
+    m: &AuctionMarket,
+    top: Option<&Result<planner::Plan>>,
+    overrides: &StateOverride,
+    block: u64,
+    sim_time: u64,
     atlas_gas_usd: f64,
     eth_usd: f64,
 ) -> Option<(serde_json::Value, Option<OpCandidate>)> {
     let (Some(solver), Venue::Callback(_)) = (&parts.solver, &parts.venue) else { return None };
-    // Below the bonus floor: do not value a solver op for this market.
-    let bonus: f64 = m.liq.iter().map(|v| v.bonus).sum();
-    if bonus < min_bonus_usd {
-        return Some((json!({ "ok": false, "skipped": "min_bonus", "bonus_usd": bonus }), None));
-    }
-    // A batch op over the whole bundle when it has an executable plan; otherwise the single top plan.
-    if let Some(b) = bundle
-        && let Some(plan) = &b.plan
-    {
-        return Some(batch_op(provider, parts, mi, m, b, plan, solver, overrides, block, sim_time, deadline, atlas_gas_usd, eth_usd).await);
-    }
-
     let Some(Ok(plan)) = top else { return None };
     let payload = plan.payload.as_ref().filter(|_| plan.router == "direct")?;
     // Net of the op's gas as Atlas charges it (see valuation()).
@@ -1230,7 +1283,7 @@ async fn solver_op<P: Provider>(
             let cand = (!s.profit.is_zero()).then(|| OpCandidate { market: mi, payload: payload.clone(), bid_wei, profit: s.profit, gas_used: s.gas_used, profit_usd: net_after_bid * loan_usd });
             (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used }), cand)
         }
-        Err(e) => (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() }), None),
+        Err(e) => (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": false, "error": crate::revert::explain(&e) }), None),
     })
 }
 
@@ -1250,6 +1303,8 @@ async fn batch_op<P: Provider>(
     block: u64,
     sim_time: u64,
     deadline: u64,
+    solver_gas_limit: u64,
+    gas_headroom: f64,
     atlas_gas_usd: f64,
     eth_usd: f64,
 ) -> (serde_json::Value, Option<OpCandidate>) {
@@ -1272,9 +1327,17 @@ async fn batch_op<P: Provider>(
     let calldata = solver.calldata(loan, &inner, bid_wei, U256::ZERO);
     let venue = atlas_venue::AtlasBid { solver, bid_wei };
     let at = Some(venue::SimAt { number: block + 1, time: sim_time });
+    let t_sim = std::time::Instant::now();
     let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
+    let batch_sim_ms = t_sim.elapsed().as_millis() as u64;
     match r {
         Ok(s) => {
+            // The real sim gas is the hard safety (an aggregator exit can run well above its
+            // estimate): too close to the DappControl's solverGasLimit and the op risks running out
+            // of gas on-chain, so it is not sent even though the sim passed.
+            if !atlas_venue::fits_solver_gas(s.gas_used, solver_gas_limit, gas_headroom) {
+                return (row(json!({ "ok": false, "skipped": "gas_near_limit", "gas_used": s.gas_used, "limit": solver_gas_limit, "batch_sim_ms": batch_sim_ms })), None);
+            }
             let net_after_bid = math::units(s.profit, m.meta.loan_decimals);
             let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, loan, eth_usd).unwrap_or(0.0);
             // Candidate when the op nets positive after the bid; the minProfit (profit x keep) that
@@ -1287,9 +1350,9 @@ async fn batch_op<P: Provider>(
                 gas_used: s.gas_used,
                 profit_usd: net_after_bid * loan_usd,
             });
-            (row(json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used })), cand)
+            (row(json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used, "batch_sim_ms": batch_sim_ms })), cand)
         }
-        Err(e) => (row(json!({ "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() })), None),
+        Err(e) => (row(json!({ "bid_usd": bid_usd, "ok": false, "error": crate::revert::explain(&e), "batch_sim_ms": batch_sim_ms })), None),
     }
 }
 
@@ -1372,7 +1435,13 @@ async fn valuation<P: Provider>(
     // that contract (built for the main venue, the proceeds land elsewhere and the flash loan
     // cannot be repaid).
     let exit_holder = parts.solver.as_ref().map(|s| s.liquidator.liquidator);
-    let valued = futures::future::join_all(markets.iter().map(|m| async {
+    // What Atlas charges a solver op's gas (metacall gas price + surcharge, per unit, USD); the batch
+    // op needs it, and it runs inside the future (S1) concurrently with the per-position plans.
+    let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
+    // Borrow the planners so each market's `async move` future moves a copy of the reference (not the
+    // Planner itself); join_all awaits them all before this function returns.
+    let (planner, planner_top) = (&planner, &planner_top);
+    let valued = futures::future::join_all(markets.iter().enumerate().map(|(mi, m)| async move {
         let mut overrides = StateOverride::default();
         overrides.insert(m.meta.params.oracle, AccountOverride { code: Some(sim::constant_price_oracle(m.snap.price)), ..Default::default() });
         // One solver op holds only so many liquidations: bundle the largest that fit (liq is sorted
@@ -1389,19 +1458,34 @@ async fn valuation<P: Provider>(
             .take(atlas.max_plans)
             .map(|v| PlanCtx { meta: &m.meta, snap: &m.snap, view: v, block: head.number, base_fee_wei: head.base_fee, eth_usd, overrides: overrides.clone(), deadline_block: a.deadline, sim_time, pending: false, price_probe: None })
             .collect();
-        let plans = futures::future::join_all(ctxs.iter().enumerate().map(|(i, c)| if i == 0 { planner_top.plan(provider, c) } else { planner.plan(provider, c) })).await;
-        (bundle, bundle_ms, overrides, ctxs.iter().map(|c| c.view).zip(plans).map(|(v, p)| (v.clone(), p)).collect::<Vec<_>>())
+        // The batch op (bundle only) runs concurrently with the per-position plans (diagnostics + the
+        // single-position fallback), so slow plans do not delay the op that gets sent.
+        let batch_fut = batch_solver_op(provider, parts, mi, m, bundle.as_ref(), &overrides, head.number, sim_time, a.deadline, atlas.min_bonus_usd, atlas.solver_gas_limit, atlas.bundle_gas_headroom, atlas_gas_usd, eth_usd);
+        let plans_fut = futures::future::join_all(ctxs.iter().enumerate().map(|(i, c)| if i == 0 { planner_top.plan(provider, c) } else { planner.plan(provider, c) }));
+        let (outcome, plans) = tokio::join!(batch_fut, plans_fut);
+        let plans: Vec<_> = ctxs.iter().map(|c| c.view).zip(plans).map(|(v, p)| (v.clone(), p)).collect();
+        let op = match outcome {
+            BatchOutcome::Row(r, c) => Some((r, c)),
+            BatchOutcome::NoRow => None,
+            BatchOutcome::NeedSingle => single_solver_op(provider, parts, mi, m, plans.first().map(|(_, p)| p), &overrides, head.number, sim_time, atlas_gas_usd, eth_usd).await,
+        };
+        (bundle, bundle_ms, overrides, plans, op)
     }))
     .await;
-    // The valuation (what paper trading times against the auction deadline) is complete here; the
-    // optional solver-op simulations below are diagnostics and must not count towards it. Wall-clock,
-    // because a shared valuation is timed against each sibling auction's own arrival.
+    // Valuation + the overlapped batch sim are complete here: the op is sendable. Wall clock, so a
+    // shared valuation is timed against each sibling auction's own arrival (value_auction).
     let valued_unix_ms = gates::unix_ms();
-    // What Atlas charges a solver op for its gas: the metacall's gas price (the auction's
-    // maxFeePerGas) plus the escrow's surcharge, per gas unit, in USD.
-    let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
-    let ops = futures::future::join_all(markets.iter().zip(&valued).enumerate().map(|(mi, (m, (bundle, _, ov, plans)))| solver_op(provider, parts, mi, m, bundle.as_ref(), plans.first().map(|(_, p)| p), ov, head.number, sim_time, a.deadline, atlas.min_bonus_usd, atlas_gas_usd, eth_usd))).await;
-    let (mut solvers, cands): (Vec<Option<serde_json::Value>>, Vec<Option<OpCandidate>>) = ops.into_iter().map(|o| o.map_or((None, None), |(row, c)| (Some(row), c))).unzip();
+    // Split each market's op into its journal row and its submission candidate (moved, not cloned).
+    let mut solvers: Vec<Option<serde_json::Value>> = Vec::with_capacity(valued.len());
+    let mut cands: Vec<Option<OpCandidate>> = Vec::with_capacity(valued.len());
+    let mut valued_rest = Vec::with_capacity(valued.len());
+    for (bundle, bundle_ms, overrides, plans, op) in valued {
+        let (row, cand) = op.map_or((None, None), |(r, c)| (Some(r), c));
+        solvers.push(row);
+        cands.push(cand);
+        valued_rest.push((bundle, bundle_ms, overrides, plans));
+    }
+    let valued = valued_rest;
     // Atlas takes one op per block from an EOA: the auction's candidates are tried most profitable
     // first (live + `submit`), regardless of which market's simulation finished first, until one
     // is accepted; a refused one (budget, endpoint) leaves the slot to the next.
@@ -1907,6 +1991,19 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                 continue;
             }
         };
+        // A single endpoint can report a wildly wrong block number (seen 2026-11-13, ~8.7M ahead):
+        // confirm a head far ahead of our last block against a fresh tip read before trusting it. A
+        // bogus number, left unchecked, is passed as the query block and makes every multicall fail
+        // "from block is greater than latest" on all endpoints, which exits the bot.
+        if !replaying
+            && h.number > last_block + engine.cfg.head_sanity_gap
+            && let Ok(tip) = engine.provider.get_block_number().await
+            && !head_plausible(h.number, last_block, tip, engine.cfg.head_sanity_gap)
+        {
+            warn!(head = h.number, tip, last = last_block, "head block number implausibly far ahead of the tip; dropping this head (bad endpoint?)");
+            tokio::time::sleep(Duration::from_millis(engine.cfg.poll_ms)).await;
+            continue;
+        }
         known_tip = known_tip.max(h.number);
         let number = h.number;
         // The executor task checks its txs in flight on this block, alongside the fetch below.
@@ -1927,7 +2024,13 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             // Too far behind for one getLogs: liquidations in the gap are not analysed.
             warn!(gap, "fell behind; full reload");
             engine.positions.clear();
-            engine.refresh_borrowers(number.into()).await?;
+            // Not fatal: a transient RPC failure here must retry (last_block unchanged), not exit the
+            // bot. Positions stay empty until a reload succeeds (the head cross-check above already
+            // rejects the bogus-number trigger, so this is a genuine transient fetch error).
+            if let Err(e) = engine.refresh_borrowers(number.into()).await {
+                warn!(block = number, error = format!("{e:#}"), "full reload failed; retrying next head");
+                continue;
+            }
             last_refresh = Instant::now();
             last_block = number - 1;
             prev_snaps = None;
@@ -2407,6 +2510,36 @@ mod tests {
         assert!(must_refetch_snapshots(true, true, false, true), "oracle updated");
         assert!(must_refetch_snapshots(true, false, true, true), "a market was touched");
         assert!(must_refetch_snapshots(true, false, false, false), "snapshot too old");
+    }
+
+    #[test]
+    fn head_plausibility_rejects_a_number_far_beyond_the_tip() {
+        let gap = 500;
+        // Normal: the head is at or just past our last block.
+        assert!(head_plausible(1_000, 1_000, 1_000, gap));
+        assert!(head_plausible(1_050, 1_000, 1_050, gap));
+        // A genuine catch-up after a pause: far ahead of last_block, but the tip confirms it.
+        assert!(head_plausible(5_000, 1_000, 5_001, gap), "tip agrees we fell behind");
+        // A lying endpoint: ~8.7M ahead of both our last block and the real tip -> rejected.
+        assert!(!head_plausible(8_699_503, 1_000, 1_002, gap), "number far beyond the real tip");
+        // Just past the tip by more than the gap is rejected; within the gap is kept.
+        assert!(!head_plausible(2_000 + gap + 1, 1_000, 2_000, gap));
+        assert!(head_plausible(2_000 + gap, 1_000, 2_000, gap));
+    }
+
+    #[test]
+    fn a_shared_valuation_is_timed_from_each_siblings_own_arrival() {
+        // The first auction arrived at t=0; the shared valuation finished at t=1800 (unix ms 10_800);
+        // it is now t=2000 (unix 11_000).
+        let (valued, now) = (Some(10_800), 11_000);
+        assert_eq!(arrival_to_valued_ms(2_000, valued, now), 1_800, "first auction: arrival -> valued");
+        // A sibling that arrived at t=1500 waited on the same valuation for 300 ms, not 1800: a
+        // paper deadline judged on the first auction's latency would wrongly mark it as missed.
+        assert_eq!(arrival_to_valued_ms(500, valued, now), 300);
+        // A sibling arriving after the valuation finished was ready at once.
+        assert_eq!(arrival_to_valued_ms(100, valued, now), 0);
+        // No timestamp (old row): the auction's age.
+        assert_eq!(arrival_to_valued_ms(700, None, now), 700);
     }
 
     #[test]
