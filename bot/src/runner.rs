@@ -1194,14 +1194,25 @@ struct OpCandidate {
 /// bid, the candidate for submission (`valuation` submits the auction's best one). None: solver
 /// venue off, or no direct-router plan to wrap (an aggregator route is built for the direct
 /// liquidator's address).
+/// What `batch_solver_op` decided for a market: a journal row (handled), nothing (no solver venue),
+/// or "value the single-position op instead" (no executable bundle plan; that needs the plans).
+enum BatchOutcome {
+    Row(serde_json::Value, Option<OpCandidate>),
+    NoRow,
+    NeedSingle,
+}
+
+/// The batch solver op for a market, needing ONLY the bundle, so it runs concurrently with the
+/// per-position plans (S1): those plans are diagnostics plus the single-position fallback and must
+/// not delay the batch op that is what actually gets sent (2026-11-13: 38 of 80 slow auctions had
+/// their bundle ready in < 1.5 s but were late waiting on the per-position plans).
 #[allow(clippy::too_many_arguments)]
-async fn solver_op<P: Provider>(
+async fn batch_solver_op<P: Provider>(
     provider: &P,
     parts: &PlannerParts,
     mi: usize,
     m: &AuctionMarket,
     bundle: Option<&planner::BundleQuote>,
-    top: Option<&Result<planner::Plan>>,
     overrides: &StateOverride,
     block: u64,
     sim_time: u64,
@@ -1211,20 +1222,38 @@ async fn solver_op<P: Provider>(
     gas_headroom: f64,
     atlas_gas_usd: f64,
     eth_usd: f64,
-) -> Option<(serde_json::Value, Option<OpCandidate>)> {
-    let (Some(solver), Venue::Callback(_)) = (&parts.solver, &parts.venue) else { return None };
+) -> BatchOutcome {
+    let (Some(solver), Venue::Callback(_)) = (&parts.solver, &parts.venue) else { return BatchOutcome::NoRow };
     // Below the bonus floor: do not value a solver op for this market.
     let bonus: f64 = m.liq.iter().map(|v| v.bonus).sum();
     if bonus < min_bonus_usd {
-        return Some((json!({ "ok": false, "skipped": "min_bonus", "bonus_usd": bonus }), None));
+        return BatchOutcome::Row(json!({ "ok": false, "skipped": "min_bonus", "bonus_usd": bonus }), None);
     }
-    // A batch op over the whole bundle when it has an executable plan; otherwise the single top plan.
     if let Some(b) = bundle
         && let Some(plan) = &b.plan
     {
-        return Some(batch_op(provider, parts, mi, m, b, plan, solver, overrides, block, sim_time, deadline, solver_gas_limit, gas_headroom, atlas_gas_usd, eth_usd).await);
+        let (row, cand) = batch_op(provider, parts, mi, m, b, plan, solver, overrides, block, sim_time, deadline, solver_gas_limit, gas_headroom, atlas_gas_usd, eth_usd).await;
+        return BatchOutcome::Row(row, cand);
     }
+    BatchOutcome::NeedSingle
+}
 
+/// The single-position solver op: the fallback when a market has no executable bundle plan. Wraps the
+/// top position's direct-route plan, so it needs the per-position plans (hence it runs after them).
+#[allow(clippy::too_many_arguments)]
+async fn single_solver_op<P: Provider>(
+    provider: &P,
+    parts: &PlannerParts,
+    mi: usize,
+    m: &AuctionMarket,
+    top: Option<&Result<planner::Plan>>,
+    overrides: &StateOverride,
+    block: u64,
+    sim_time: u64,
+    atlas_gas_usd: f64,
+    eth_usd: f64,
+) -> Option<(serde_json::Value, Option<OpCandidate>)> {
+    let (Some(solver), Venue::Callback(_)) = (&parts.solver, &parts.venue) else { return None };
     let Some(Ok(plan)) = top else { return None };
     let payload = plan.payload.as_ref().filter(|_| plan.router == "direct")?;
     // Net of the op's gas as Atlas charges it (see valuation()).
@@ -1396,7 +1425,13 @@ async fn valuation<P: Provider>(
     // that contract (built for the main venue, the proceeds land elsewhere and the flash loan
     // cannot be repaid).
     let exit_holder = parts.solver.as_ref().map(|s| s.liquidator.liquidator);
-    let valued = futures::future::join_all(markets.iter().map(|m| async {
+    // What Atlas charges a solver op's gas (metacall gas price + surcharge, per unit, USD); the batch
+    // op needs it, and it runs inside the future (S1) concurrently with the per-position plans.
+    let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
+    // Borrow the planners so each market's `async move` future moves a copy of the reference (not the
+    // Planner itself); join_all awaits them all before this function returns.
+    let (planner, planner_top) = (&planner, &planner_top);
+    let valued = futures::future::join_all(markets.iter().enumerate().map(|(mi, m)| async move {
         let mut overrides = StateOverride::default();
         overrides.insert(m.meta.params.oracle, AccountOverride { code: Some(sim::constant_price_oracle(m.snap.price)), ..Default::default() });
         // One solver op holds only so many liquidations: bundle the largest that fit (liq is sorted
@@ -1413,22 +1448,36 @@ async fn valuation<P: Provider>(
             .take(atlas.max_plans)
             .map(|v| PlanCtx { meta: &m.meta, snap: &m.snap, view: v, block: head.number, base_fee_wei: head.base_fee, eth_usd, overrides: overrides.clone(), deadline_block: a.deadline, sim_time, pending: false, price_probe: None })
             .collect();
-        let plans = futures::future::join_all(ctxs.iter().enumerate().map(|(i, c)| if i == 0 { planner_top.plan(provider, c) } else { planner.plan(provider, c) })).await;
-        (bundle, bundle_ms, overrides, ctxs.iter().map(|c| c.view).zip(plans).map(|(v, p)| (v.clone(), p)).collect::<Vec<_>>())
+        // The batch op (bundle only) runs concurrently with the per-position plans (diagnostics + the
+        // single-position fallback), so slow plans do not delay the op that gets sent.
+        let batch_fut = batch_solver_op(provider, parts, mi, m, bundle.as_ref(), &overrides, head.number, sim_time, a.deadline, atlas.min_bonus_usd, atlas.solver_gas_limit, atlas.bundle_gas_headroom, atlas_gas_usd, eth_usd);
+        let plans_fut = futures::future::join_all(ctxs.iter().enumerate().map(|(i, c)| if i == 0 { planner_top.plan(provider, c) } else { planner.plan(provider, c) }));
+        let (outcome, plans) = tokio::join!(batch_fut, plans_fut);
+        let plans: Vec<_> = ctxs.iter().map(|c| c.view).zip(plans).map(|(v, p)| (v.clone(), p)).collect();
+        let op = match outcome {
+            BatchOutcome::Row(r, c) => Some((r, c)),
+            BatchOutcome::NoRow => None,
+            BatchOutcome::NeedSingle => single_solver_op(provider, parts, mi, m, plans.first().map(|(_, p)| p), &overrides, head.number, sim_time, atlas_gas_usd, eth_usd).await,
+        };
+        (bundle, bundle_ms, overrides, plans, op)
     }))
     .await;
-    // The valuation (what paper trading times against the auction deadline) is complete here; the
-    // optional solver-op simulations below are diagnostics and must not count towards it. Wall-clock,
-    // because a shared valuation is timed against each sibling auction's own arrival.
+    // Valuation + the overlapped batch sim are complete here (wall-clock, since a shared valuation is
+    // timed against each sibling auction's own arrival). ready_ms is from the auction's arrival to
+    // the op being sendable; paper trading times with it.
     let valued_unix_ms = gates::unix_ms();
-    // What Atlas charges a solver op for its gas: the metacall's gas price (the auction's
-    // maxFeePerGas) plus the escrow's surcharge, per gas unit, in USD.
-    let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
-    let ops = futures::future::join_all(markets.iter().zip(&valued).enumerate().map(|(mi, (m, (bundle, _, ov, plans)))| solver_op(provider, parts, mi, m, bundle.as_ref(), plans.first().map(|(_, p)| p), ov, head.number, sim_time, a.deadline, atlas.min_bonus_usd, atlas.solver_gas_limit, atlas.bundle_gas_headroom, atlas_gas_usd, eth_usd))).await;
-    // From the auction's arrival to the batch op being sendable (valuation + the batch sim): the true
-    // send latency, longer than value_ms (which stops before the sims). Paper trading times with this.
     let ready_ms = a.seen.elapsed().as_millis() as u64;
-    let (mut solvers, cands): (Vec<Option<serde_json::Value>>, Vec<Option<OpCandidate>>) = ops.into_iter().map(|o| o.map_or((None, None), |(row, c)| (Some(row), c))).unzip();
+    // Split each market's op into its journal row and its submission candidate (moved, not cloned).
+    let mut solvers: Vec<Option<serde_json::Value>> = Vec::with_capacity(valued.len());
+    let mut cands: Vec<Option<OpCandidate>> = Vec::with_capacity(valued.len());
+    let mut valued_rest = Vec::with_capacity(valued.len());
+    for (bundle, bundle_ms, overrides, plans, op) in valued {
+        let (row, cand) = op.map_or((None, None), |(r, c)| (Some(r), c));
+        solvers.push(row);
+        cands.push(cand);
+        valued_rest.push((bundle, bundle_ms, overrides, plans));
+    }
+    let valued = valued_rest;
     // Atlas takes one op per block from an EOA: the auction's candidates are tried most profitable
     // first (live + `submit`), regardless of which market's simulation finished first, until one
     // is accepted; a refused one (budget, endpoint) leaves the slot to the next.
