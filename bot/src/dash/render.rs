@@ -353,22 +353,31 @@ fn paper(db: &Connection, clock: &Clock, since: f64, cfg: &Config) -> Result<Val
     }))
 }
 
-/// The paper result at the bid we actually journaled, with the simulated solver ops' net as the
-/// profit: since v0.4.0 the op pays its own gas, so `net_after_bid_usd` is the real net after the
-/// bid AND the gas (the margin table is net-estimate minus a hypothetical bid). Won = our journaled
-/// bid beats the winning one. Only auctions whose ops simulated with that field count (`n`), so
-/// older journals are left out rather than mixed in.
+/// The paper result of the op we would actually send, with its simulated net as the profit: since
+/// v0.4.0 the op pays its own gas, so `net_after_bid_usd` is the real net after the bid AND the gas
+/// (the margin table is net-estimate minus a hypothetical bid). An auction gets ONE op (one per
+/// block per EOA): the one submitted if the row says so, else the market whose simulated op nets
+/// the most. Won = that op's own bid beats the winning one. Only auctions with such an op (a v0.4.0+
+/// valuation) count (`n`), so older journals are left out rather than mixed in.
 fn paper_real(rows: &[PaperRow], deadline_ms: i64) -> Value {
     let (mut n, mut wins, mut pnl, mut wins_t, mut pnl_t) = (0i64, 0i64, 0.0f64, 0i64, 0.0f64);
-    for (_, _, _, ms, js, win_eth, _, _) in rows {
+    for (_, _, eth_usd, ms, js, win_eth, _, _) in rows {
         let j: Value = serde_json::from_str(js).unwrap_or_default();
-        let nets: Vec<f64> = j["markets"].as_array().into_iter().flatten().filter(|m| m["solver"]["ok"].as_bool() == Some(true)).filter_map(|m| m["solver"]["net_after_bid_usd"].as_f64()).collect();
-        let Some(bid_eth) = j["bid_eth"].as_f64().filter(|_| !nets.is_empty()) else { continue };
+        // (net, bid USD, submitted) of each market's simulated op that would pay.
+        let ops: Vec<(f64, f64, bool)> = j["markets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| &m["solver"])
+            .filter(|s| s["ok"].as_bool() == Some(true))
+            .filter_map(|s| Some((s["net_after_bid_usd"].as_f64()?, s["bid_usd"].as_f64()?, s["submitted"]["ok"].as_bool() == Some(true))))
+            .collect();
+        let op = ops.iter().find(|o| o.2).or_else(|| ops.iter().max_by(|a, b| a.0.total_cmp(&b.0)));
+        let Some(&(net, bid_usd, _)) = op.filter(|_| *eth_usd > 0.0) else { continue };
         n += 1;
-        if bid_eth <= *win_eth {
+        if bid_usd / eth_usd <= *win_eth {
             continue;
         }
-        let net: f64 = nets.iter().sum();
         wins += 1;
         pnl += net;
         if ms.is_some_and(|ms| ms <= deadline_ms) {
@@ -562,23 +571,29 @@ mod tests {
     }
 
     #[test]
-    fn real_paper_pnl_is_the_simulated_net_after_bid_and_gas() {
-        let auction = |bid_eth: f64, net: Option<f64>| {
-            let solver = match net {
-                Some(n) => json!({ "ok": true, "net_after_bid_usd": n }),
-                None => json!({ "ok": true, "net_after_bid": 5.0 }), // pre-v0.4.0: no gas paid in it
-            };
-            json!({ "bid_eth": bid_eth, "markets": [{ "solver": solver }] }).to_string()
-        };
+    fn real_paper_pnl_is_the_one_op_we_would_send() {
+        // A market's simulated op: (net after bid and gas, its own bid in USD).
+        let op = |net: f64, bid_usd: f64| json!({ "solver": { "ok": true, "net_after_bid_usd": net, "bid_usd": bid_usd } });
+        let auction = |markets: Vec<Value>| json!({ "markets": markets }).to_string();
+        // ETH at $3000, winning bid 0.01 ETH = $30.
         let rows: Vec<PaperRow> = vec![
-            (1, 100.0, 3000.0, Some(500), auction(0.02, Some(12.0)), 0.01, None, 50.0),  // won in time
-            (2, 100.0, 3000.0, Some(5000), auction(0.02, Some(8.0)), 0.01, None, 50.0),  // won, late
-            (3, 100.0, 3000.0, Some(500), auction(0.005, Some(30.0)), 0.01, None, 50.0), // outbid
-            (4, 100.0, 3000.0, Some(500), auction(0.02, None), 0.01, None, 50.0),        // old row: left out
+            (1, 100.0, 3000.0, Some(500), auction(vec![op(12.0, 60.0)]), 0.01, None, 50.0), // won in time
+            (2, 100.0, 3000.0, Some(5000), auction(vec![op(8.0, 60.0)]), 0.01, None, 50.0), // won, late
+            (3, 100.0, 3000.0, Some(500), auction(vec![op(30.0, 15.0)]), 0.01, None, 50.0), // outbid
+            // Three markets: only ONE op goes (the best, net 9 at a $45 bid), not the three summed
+            // (review A#3/B#9).
+            (4, 100.0, 3000.0, Some(500), auction(vec![op(5.0, 20.0), op(9.0, 45.0), op(4.0, 10.0)]), 0.01, None, 50.0),
+            // The best market's op bids too little: the auction is lost even though the summed bid
+            // (or another market's) would have won.
+            (5, 100.0, 3000.0, Some(500), auction(vec![op(9.0, 20.0), op(3.0, 50.0)]), 0.01, None, 50.0),
+            // A submitted op is the one that counts, whatever the others net.
+            (6, 100.0, 3000.0, Some(500), auction(vec![op(20.0, 20.0), json!({ "solver": { "ok": true, "net_after_bid_usd": 2.0, "bid_usd": 40.0, "submitted": { "ok": true } } })]), 0.01, None, 50.0),
+            // Pre-v0.4.0 row (no net_after_bid_usd): left out.
+            (7, 100.0, 3000.0, Some(500), json!({ "markets": [{ "solver": { "ok": true, "net_after_bid": 5.0 } }] }).to_string(), 0.01, None, 50.0),
         ];
         let r = paper_real(&rows, 2000);
-        assert_eq!((r["n"].as_i64(), r["wins"].as_i64(), r["wins_t"].as_i64()), (Some(3), Some(2), Some(1)));
-        assert_eq!((r["pnl"].as_f64(), r["pnl_t"].as_f64()), (Some(20.0), Some(12.0)));
+        assert_eq!((r["n"].as_i64(), r["wins"].as_i64(), r["wins_t"].as_i64()), (Some(6), Some(4), Some(3)));
+        assert_eq!((r["pnl"].as_f64(), r["pnl_t"].as_f64()), (Some(12.0 + 8.0 + 9.0 + 2.0), Some(12.0 + 9.0 + 2.0)));
     }
 
     #[test]

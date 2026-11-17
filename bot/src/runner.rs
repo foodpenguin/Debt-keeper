@@ -1281,11 +1281,34 @@ struct OpCost {
 }
 
 impl OpCost {
+    /// From one per-gas price (max fee + Atlas's and the bundler's surcharges): the bid basis, the
+    /// gas pay and the liability all price gas the same way.
+    fn new(price: atlas_venue::OpGasPrice, non_solver: u64, eth_usd: f64) -> Self {
+        Self { price, non_solver, gas_usd: price.max_fee_wei as f64 * (1.0 + price.surcharge_bps as f64 / 10_000.0) / 1e18 * eth_usd }
+    }
+
     /// The stand-in's gas liability for an op whose gas is about `op_gas`: Atlas's maximum for it
     /// (always above the gas pay, so the simulated op pays its whole gas pay).
     fn liability(&self, op_gas: u64) -> U256 {
         self.price.liability_wei(op_gas, self.non_solver)
     }
+
+    /// The bid basis of an op of `op_gas` grossing `gross_usd`: what is left after the whole gas
+    /// Atlas charges the winner (the op's own plus the metacall's fixed gas) — exactly what the op
+    /// pays in ETH (`OpGasPrice::gas_pay_wei`), so a bid on it leaves the op its margin.
+    fn bid_basis(&self, gross_usd: f64, op_gas: u64) -> f64 {
+        gross_usd - (op_gas + atlas_venue::METACALL_FIXED_GAS) as f64 * self.gas_usd
+    }
+}
+
+/// What a solver op is sent with: its gas limit (simulated gas x `gas_limit_buffer`, within the
+/// DappControl's limit), the gas it pays in ETH — Atlas's expected charge for the gas it really uses
+/// (the simulated gas plus the metacall's fixed gas, NOT the buffered limit: the proceeds must buy
+/// it, and Atlas credits any excess back to the bond and takes any shortfall from it) — and its
+/// maximum liability, which Atlas computes from the gas limit.
+fn send_terms(price: &atlas_venue::OpGasPrice, non_solver: u64, gas_used: u64, gas_limit_buffer: f64, solver_gas_limit: u64) -> (u64, U256, U256) {
+    let gas = ((gas_used as f64 * gas_limit_buffer) as u64).min(solver_gas_limit);
+    (gas, price.gas_pay_wei(gas_used), price.liability_wei(gas, non_solver))
 }
 
 /// The solver gas a valuation may plan an op for: the DappControl's limit, or less when the bond
@@ -1362,7 +1385,7 @@ async fn single_solver_op<P: Provider>(
     let payload = plan.payload.as_ref().filter(|_| plan.router == "direct")?;
     // Net of the op's gas as Atlas charges it (see valuation()).
     let op_gas = plan.gas_used.unwrap_or(0);
-    let net = plan.profit_usd.unwrap_or(0.0) - op_gas as f64 * cost.gas_usd;
+    let net = cost.bid_basis(plan.profit_usd.unwrap_or(0.0), op_gas);
     let Some(bid_usd) = parts.auction.bid_usd(Some(&m.meta.name), net.max(0.0), eth_usd) else {
         return Some((json!({ "bid_basis": "single_est", "ok": false, "skipped": "policy" }), None));
     };
@@ -1419,7 +1442,7 @@ async fn batch_op<P: Provider>(
     eth_usd: f64,
 ) -> (serde_json::Value, Option<OpCandidate>) {
     let loan = m.meta.params.loanToken;
-    let bid_basis = bundle.gross_usd - (plan.gas_est + atlas_venue::METACALL_FIXED_GAS) as f64 * cost.gas_usd;
+    let bid_basis = cost.bid_basis(bundle.gross_usd, plan.gas_est);
     let gas_pay_wei = cost.price.gas_pay_wei(plan.gas_est);
     let gas_pay_eth = math::units(gas_pay_wei, 18);
     let row = |extra: serde_json::Value| {
@@ -1511,8 +1534,9 @@ fn profit_at_gas_pay(profit: U256, sim_pay: U256, send_pay: U256, eth_usd: f64, 
 }
 
 /// Signs and submits the simulated solver op `c` for auction `a` (see solver_op): gas = simulated x
-/// gas_limit_buffer (within the DappControl's limit); the gas it pays in ETH recomputed from that
-/// gas (the valuation priced the estimate) and any increase taken out of its profit; minProfit = that
+/// gas_limit_buffer (within the DappControl's limit); the gas it pays in ETH recomputed from the
+/// simulated gas without the buffer (the valuation priced the estimate; see send_terms) and any
+/// increase taken out of its profit; minProfit = that
 /// net x min_profit_keep; the auction's own max fee and deadline. Refused when the kill switch is on,
 /// when this EOA already bid for that block, when the bond is below `bond_min_eth`, or when the op's
 /// maximum liability (its gas + the metacall's non-solver gas, at the max fee + surcharges) exceeds
@@ -1525,9 +1549,7 @@ async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, s
     if gates::kill_switch_on(&e.kill_switch_file) {
         return refused("kill switch file present".into());
     }
-    let gas = ((c.gas_used as f64 * e.gas_limit_buffer) as u64).min(sub.gas_limit);
-    let price = parts.op_gas_price(a);
-    let liability = price.liability_wei(gas, parts.non_solver_gas(a));
+    let (gas, gas_pay, liability) = send_terms(&parts.op_gas_price(a), parts.non_solver_gas(a), c.gas_used, e.gas_limit_buffer, sub.gas_limit);
     let bonded = parts.ledger.lock().unwrap().bond_wei();
     let min = parts.bond_band.map_or(U256::ZERO, |b| b.min_wei);
     match bond_allows(bonded, min, liability) {
@@ -1538,8 +1560,8 @@ async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, s
             return (false, json!({ "ok": false, "skipped": "bond_insufficient", "liability_eth": math::units(liability, 18), "bonded_eth": math::units(bonded, 18), "gas": gas }));
         }
     }
-    // The gas paid in ETH, from the gas the op is sent with (erring high is credited to the bond).
-    let gas_pay = price.gas_pay_wei(gas);
+    // The gas paid in ETH, from the gas the simulation used (see send_terms): an increase over what
+    // the simulation paid comes out of the profit.
     let profit = profit_at_gas_pay(c.profit, c.gas_pay_wei, gas_pay, eth_usd, c.loan_usd, c.loan_decimals);
     if profit.is_zero() {
         return refused(format!("no profit left after paying the op's gas at its simulated gas ({} ETH)", math::units(gas_pay, 18)));
@@ -1593,8 +1615,9 @@ async fn valuation<P: Provider>(
     let planner = parts.planner("direct");
     let planner_top = parts.planner(if live { "best" } else { "direct" });
     // The exits are weighed at what Atlas charges a solver op's gas (the auction's max fee plus the
-    // escrow surcharge), where gas dominates, so a lower-gas exit can beat a higher-output one.
-    let auction_gas_wei = (a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge)) as u128;
+    // escrow's surcharges), where gas dominates, so a lower-gas exit can beat a higher-output one.
+    let price = parts.op_gas_price(a);
+    let auction_gas_wei = (price.max_fee_wei as f64 * (1.0 + price.surcharge_bps as f64 / 10_000.0)) as u128;
     // A batch op runs its exit inside the solver's liquidator: an aggregator route must be built for
     // that contract (built for the main venue, the proceeds land elsewhere and the flash loan
     // cannot be repaid).
@@ -1602,7 +1625,7 @@ async fn valuation<P: Provider>(
     // What Atlas charges this auction's solver ops for gas (per unit, with surcharges; in USD for
     // the bid basis) and the non-solver part of their maximum liability. The batch op needs it, and
     // it runs inside the future (S1) concurrently with the per-position plans.
-    let cost = OpCost { price: parts.op_gas_price(a), non_solver: parts.non_solver_gas(a), gas_usd: a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd };
+    let cost = OpCost::new(parts.op_gas_price(a), parts.non_solver_gas(a), eth_usd);
     // Atlas runs an op only if the bond covers its maximum liability, so the bond caps how large an
     // op can be: bundles are sized to what it affords (the op is submitted with the simulated gas x
     // gas_limit_buffer) instead of being priced and then refused whole.
@@ -1689,7 +1712,7 @@ async fn valuation<P: Provider>(
         // The bid basis ("batch_est"): the bundle's exit gain minus the whole metacall gas Atlas
         // charges (the solver op's estimate plus the fixed metacall overhead), at the auction's gas
         // price, so a bid never spends what the solver owes Atlas.
-        let atlas_net = bundle.as_ref().and_then(|b| b.net_usd.map(|_| b.gross_usd - (b.gas_units + atlas_venue::METACALL_FIXED_GAS) as f64 * cost.gas_usd));
+        let atlas_net = bundle.as_ref().and_then(|b| b.net_usd.map(|_| cost.bid_basis(b.gross_usd, b.gas_units)));
         bundle_net += atlas_net.unwrap_or(0.0).max(0.0);
         if bundle.is_some() {
             bundle_ms_max = bundle_ms_max.max(bundle_ms);
@@ -1944,7 +1967,7 @@ fn on_settled(s: actor::Settled, block: u64, now_unix: u64, eth_usd: f64, cooldo
 }
 
 /// Blocks a bond tx (unbond / withdraw / ETH sent on) stays valid before it counts as dropped.
-const BOND_TX_DEADLINE_BLOCKS: u64 = 150;
+const BOND_TX_DEADLINE_BLOCKS: u64 = 50;
 
 /// Our ops' Atlas results since the last check: journaled and counted (won, failed); a won op that
 /// matches one we submitted (same bid, deadline not before its block: one op per block per EOA)
@@ -1974,9 +1997,10 @@ fn record_op_results(parts: &PlannerParts, results: &[atlas_bond::OpResult], now
 }
 
 /// Sends the bond's next tx (unbond, withdraw, or the withdrawn ETH on to PROFIT_RECEIVER) through
-/// the executor at the normal priority fee, one at a time (its key group is exclusive). Returns the
-/// step's tag and amount when it was sent.
-async fn send_bond_tx(e: &ExecHandle, step: &atlas_bond::BondStep, atlas: Address, receiver: Address, block: u64, base_fee_wei: u128, priority_fee_wei: u128) -> Result<Option<(u8, U256)>> {
+/// the executor at the normal priority fee: one at a time, and only while nothing else is in flight
+/// (a bond tx must not hold the executor's in-flight slot a liquidation needs, nor drag later
+/// liquidation nonces down if it is dropped). Returns the record to keep until it settles.
+async fn send_bond_tx(e: &ExecHandle, step: &atlas_bond::BondStep, atlas: Address, receiver: Address, block: u64, base_fee_wei: u128, priority_fee_wei: u128) -> Result<Option<crate::ledger::BondTx>> {
     use atlas_bond::BondStep;
     let (tag, to, calldata, value, gas_limit, amount) = match *step {
         BondStep::Unbond(x) => (atlas_bond::TAG_UNBOND, atlas, atlas_bond::unbond_calldata(x), U256::ZERO, atlas_bond::BOND_TX_GAS, x),
@@ -1984,7 +2008,7 @@ async fn send_bond_tx(e: &ExecHandle, step: &atlas_bond::BondStep, atlas: Addres
         BondStep::Send(x) => (atlas_bond::TAG_SEND, receiver, alloy::primitives::Bytes::new(), x, atlas_bond::SEND_GAS, x),
         _ => return Ok(None),
     };
-    if e.is_group_inflight(atlas_bond::BOND_TX_GROUP) {
+    if !e.view().inflight.is_empty() {
         return Ok(None);
     }
     let req = executor::SendRequest {
@@ -1998,20 +2022,21 @@ async fn send_bond_tx(e: &ExecHandle, step: &atlas_bond::BondStep, atlas: Addres
         block,
         deadline_block: block + BOND_TX_DEADLINE_BLOCKS,
     };
-    e.send_with_value(req, value).await?;
-    Ok(Some((tag, amount)))
+    let inflight = e.send_with_value(req, value).await?;
+    Ok(Some(crate::ledger::BondTx { tag, amount, hash: inflight.hash, sent_block: block, deadline_block: inflight.deadline_block }))
 }
 
-/// A settled bond tx: an unbond moves that much out of the bond (not a loss), a withdrawal leaves
-/// ETH to send on (kept across restarts), the send clears it. A failed or dropped one changes
-/// nothing: the next bond check decides again from the chain.
-fn on_bond_tx_settled(ledger: &mut Ledger, tag: u8, amount: U256, success: bool, now_unix: u64) {
+/// A bond tx that settled (seen by the executor, or from its receipt): a withdrawal leaves ETH to
+/// send on, the send clears it, and the record is dropped. An unbond needs nothing here: the next
+/// reading sees bonded move to unbonding (ledger.rs). A failed one changes nothing; the next bond
+/// check decides again from the chain.
+fn on_bond_tx_settled(ledger: &mut Ledger, tx: crate::ledger::BondTx, success: bool) {
+    ledger.set_bond_tx(None);
     if !success {
         return;
     }
-    match tag {
-        atlas_bond::TAG_UNBOND => ledger.record_unbond(now_unix, amount),
-        atlas_bond::TAG_WITHDRAW => ledger.set_bond_send_pending(Some(amount)),
+    match tx.tag {
+        atlas_bond::TAG_WITHDRAW => ledger.set_bond_send_pending(Some(tx.amount)),
         atlas_bond::TAG_SEND => ledger.set_bond_send_pending(None),
         _ => {}
     }
@@ -2181,9 +2206,9 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     let mut head_ms: Vec<u64> = Vec::new();
     let mut skipped_heads = 0u64;
     let mut heads_since_bond = BOND_CHECK_HEADS;
-    // Where the next scan for our ops' Atlas results starts, and the bond tx in flight (tag, amount).
+    // Where the next scan for our ops' Atlas results starts. (The bond tx in flight is kept in the
+    // ledger, so a restart does not lose it.)
     let mut result_scan_from: Option<u64> = None;
-    let mut bond_tx: Option<(u8, U256)> = None;
     // The out-of-band bond state last warned about (warned once per episode).
     let mut bond_alerted: Option<std::mem::Discriminant<atlas_bond::BondStep>> = None;
     let loan_decimals: HashMap<Address, u8> = engine.metas.iter().map(|m| (m.params.loanToken, m.loan_decimals)).collect();
@@ -2373,18 +2398,26 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         let mut included_txs = vec![];
         if let Some(rx) = settled.as_mut() {
             while let Ok(s) = rx.try_recv() {
-                let key = s.inflight.key;
-                let success = matches!(s.outcome, executor::Outcome::Included { success: true, .. });
+                let (key, hash) = (s.inflight.key, s.inflight.hash);
+                let mined = match s.outcome {
+                    executor::Outcome::Included { success, .. } => Some(success),
+                    executor::Outcome::Dropped => None,
+                };
                 if let Some(t) = on_settled(s, number, h.timestamp, eth_usd, engine.cfg.exec.failure_cooldown_secs, &mut parts.ledger.lock().unwrap(), &mut journal)? {
                     included_txs.push(t);
                 }
-                // One of the bond's own txs (auto-withdraw): its effect on the ledger, then a fresh
-                // reading of the bond decides the next step.
+                // One of the bond's own txs (auto-withdraw): mined -> its effect on the ledger, then a
+                // fresh reading decides the next step. Dropped -> kept: the bond check reconciles it
+                // from its receipt (a "dropped" tx can still land).
                 if key.group == atlas_bond::BOND_TX_GROUP
-                    && let Some((tag, amount)) = bond_tx.take()
+                    && let Some(success) = mined
                 {
-                    on_bond_tx_settled(&mut parts.ledger.lock().unwrap(), tag, amount, success, h.timestamp);
-                    writeln!(journal, "{}", json!({ "kind": "atlas_bond_tx", "block": number, "tag": tag, "amount_eth": math::units(amount, 18), "success": success }))?;
+                    let mut l = parts.ledger.lock().unwrap();
+                    if let Some(tx) = l.bond_tx().filter(|t| t.hash == hash) {
+                        on_bond_tx_settled(&mut l, tx, success);
+                        l.save_or_warn();
+                        writeln!(journal, "{}", json!({ "kind": "atlas_bond_tx", "block": number, "tag": tx.tag, "amount_eth": math::units(tx.amount, 18), "success": success, "tx": hash }))?;
+                    }
                     parts.bond_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -2576,10 +2609,30 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                             }
                         };
                         let (won, failed) = record_op_results(&parts, &results, h.timestamp, number, &mut journal)?;
-                        let pending = {
+                        // A bond tx the executor no longer tracks (a restart, or reported dropped):
+                        // its receipt says whether it landed, so a withdrawal is never left in the hot
+                        // wallet unnoticed and a send never repeated.
+                        let in_flight = parts.ledger.lock().unwrap().bond_tx();
+                        if let Some(tx) = in_flight.filter(|_| !exec.as_ref().is_some_and(|e| e.is_group_inflight(atlas_bond::BOND_TX_GROUP))) {
+                            match engine.provider.get_transaction_receipt(tx.hash).await {
+                                Ok(r) => match atlas_bond::check_bond_tx(r.map(|r| r.status()), tx.deadline_block, number) {
+                                    atlas_bond::BondTxCheck::Settled { success } => {
+                                        on_bond_tx_settled(&mut parts.ledger.lock().unwrap(), tx, success);
+                                        writeln!(journal, "{}", json!({ "kind": "atlas_bond_tx", "block": number, "tag": tx.tag, "amount_eth": math::units(tx.amount, 18), "success": success, "tx": tx.hash, "via": "receipt" }))?;
+                                    }
+                                    atlas_bond::BondTxCheck::Gone => {
+                                        parts.ledger.lock().unwrap().set_bond_tx(None);
+                                        writeln!(journal, "{}", json!({ "kind": "atlas_bond_tx", "block": number, "tag": tx.tag, "amount_eth": math::units(tx.amount, 18), "success": false, "tx": tx.hash, "via": "never landed" }))?;
+                                    }
+                                    atlas_bond::BondTxCheck::Pending => {}
+                                },
+                                Err(e) => warn!(error = %e, tx = %tx.hash, "bond tx receipt lookup failed; retried at the next bond check"),
+                            }
+                        }
+                        let (pending, bond_tx_open) = {
                             let mut l = parts.ledger.lock().unwrap();
-                            l.observe_bond(h.timestamp, state.bonded, won, failed);
-                            l.bond_send_pending()
+                            l.observe_bond(h.timestamp, state.bonded, state.unbonding, won, failed);
+                            (l.bond_send_pending(), l.bond_tx().is_some())
                         };
                         changed = true;
                         let step = atlas_bond::next_step(&state, band.min_wei, band.max_wei, band.auto_withdraw, pending);
@@ -2593,22 +2646,27 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                         // Out of the band: a warning (alerted on by the watchdog) when it starts, then
                         // only an info line while it lasts, so a bond left above the max is not mailed
                         // every ~100 s.
-                        let out_of_band = matches!(step, atlas_bond::BondStep::BelowMin | atlas_bond::BondStep::AboveMax { .. }).then(|| std::mem::discriminant(&step));
+                        let out_of_band = matches!(step, atlas_bond::BondStep::BelowMin | atlas_bond::BondStep::AboveMax { .. } | atlas_bond::BondStep::OperatorFunds { .. }).then(|| std::mem::discriminant(&step));
                         let new_alert = out_of_band.is_some() && out_of_band != bond_alerted;
                         bond_alerted = out_of_band;
                         match &step {
                             atlas_bond::BondStep::BelowMin if new_alert => warn!(bonded_eth = eth(state.bonded), min = eth(band.min_wei), "HALTED: atlETH bond below atlas.solver.bond_min_eth; no solver op is submitted until it is topped up"),
                             atlas_bond::BondStep::AboveMax { excess } if new_alert => warn!(bonded_eth = eth(state.bonded), max = eth(band.max_wei), excess_eth = eth(*excess), "atlETH bond above atlas.solver.bond_max_eth: withdraw the excess to PROFIT_RECEIVER (or set bond_auto_withdraw)"),
-                            atlas_bond::BondStep::BelowMin | atlas_bond::BondStep::AboveMax { .. } => info!(bonded_eth = eth(state.bonded), step = ?step, "atlETH bond still out of its band"),
+                            atlas_bond::BondStep::OperatorFunds { free } if new_alert => warn!(free_eth = eth(*free), "atlETH bond auto-withdraw paused: unbonded atlETH the bot did not unbond (bond or withdraw it by hand)"),
+                            atlas_bond::BondStep::BelowMin | atlas_bond::BondStep::AboveMax { .. } | atlas_bond::BondStep::OperatorFunds { .. } => info!(bonded_eth = eth(state.bonded), step = ?step, "atlETH bond still out of its band"),
                             atlas_bond::BondStep::Wait { until_block } => info!(until_block, unbonding_eth = eth(state.unbonding), "atlETH unbonding: withdrawable after Atlas's escrow wait"),
                             atlas_bond::BondStep::Idle => {}
-                            // An auto-withdraw step: live, kill switch off, one at a time.
+                            // An auto-withdraw step: live, kill switch off, one at a time (none open
+                            // in the ledger, nothing else in flight).
                             _ => match exec.as_ref() {
-                                Some(e) if !gates::kill_switch_on(&engine.cfg.exec.kill_switch_file) && bond_tx.is_none() => {
+                                Some(e) if !gates::kill_switch_on(&engine.cfg.exec.kill_switch_file) && !bond_tx_open => {
                                     match send_bond_tx(e, &step, sub.atlas, band.receiver, number, h.base_fee, engine.cfg.exec.priority_fee_wei).await {
                                         Ok(Some(sent)) => {
-                                            warn!(step = ?step, "atlETH bond auto-withdraw: tx sent");
-                                            bond_tx = Some(sent);
+                                            warn!(step = ?step, tx = %sent.hash, "atlETH bond auto-withdraw: tx sent");
+                                            let mut l = parts.ledger.lock().unwrap();
+                                            l.set_bond_tx(Some(sent));
+                                            // At once: a restart from here on must know this tx exists.
+                                            l.save_or_warn();
                                         }
                                         Ok(None) => {}
                                         Err(err) => warn!(error = %err, step = ?step, "atlETH bond auto-withdraw tx not sent"),
@@ -2866,9 +2924,38 @@ mod tests {
     }
 
     #[test]
+    fn an_op_pays_the_gas_it_uses_not_its_gas_limit() {
+        // 1.5M simulated gas, sent with a 1.5 buffer: the gas limit (and Atlas's liability) is 2.25M,
+        // but the ETH paid is Atlas's expected charge for 1.5M + the metacall's fixed gas. Paying for
+        // the 2.25M limit would take ~0.75M gas worth out of the proceeds for nothing (review B#1).
+        let price = atlas_venue::OpGasPrice::new(15_005_000_000, 0.1);
+        let (gas, pay, liability) = send_terms(&price, 3_000_000, 1_500_000, 1.5, 6_000_000);
+        assert_eq!(gas, 2_250_000);
+        assert_eq!(pay, price.gas_pay_wei(1_500_000), "pay for the gas used");
+        assert_eq!(liability, price.liability_wei(2_250_000, 3_000_000), "liability from the gas limit");
+        // The limit is capped by the DappControl's; the pay is not affected by the cap.
+        let (gas, pay, _) = send_terms(&price, 3_000_000, 5_000_000, 1.5, 6_000_000);
+        assert_eq!((gas, pay), (6_000_000, price.gas_pay_wei(5_000_000)));
+    }
+
+    #[test]
+    fn every_op_bid_basis_leaves_out_the_whole_gas_the_op_pays() {
+        // One price, both surcharges: 10 % Atlas + 5 % bundler at 10 gwei, ETH at $2000.
+        let cost = OpCost::new(atlas_venue::OpGasPrice::new(10_000_000_000, 0.15), 3_000_000, 2000.0);
+        let per_gas_usd = 10e9 * 1.15 / 1e18 * 2000.0;
+        assert!((cost.gas_usd - per_gas_usd).abs() < 1e-15, "the bundler surcharge is in the bid basis too");
+        // The basis subtracts the op's gas AND the metacall's fixed gas (single and batch alike)...
+        let basis = cost.bid_basis(100.0, 400_000);
+        assert!((basis - (100.0 - (400_000 + atlas_venue::METACALL_FIXED_GAS) as f64 * per_gas_usd)).abs() < 1e-9);
+        // ...which is exactly what the op then pays in ETH, so a bid on the basis leaves the margin.
+        let paid_usd = math::units(cost.price.gas_pay_wei(400_000), 18) * 2000.0;
+        assert!((100.0 - basis - paid_usd).abs() < 1e-6, "{} vs {paid_usd}", 100.0 - basis);
+    }
+
+    #[test]
     fn the_bond_sizes_the_bundle_instead_of_refusing_it_whole() {
         // 15.005 gwei, 10 % surcharge, 3M non-solver gas (userOp 0.5M + dappGasLimit 2M + 0.5M).
-        let cost = OpCost { price: atlas_venue::OpGasPrice::new(15_005_000_000, 0.1), non_solver: 3_000_000, gas_usd: 0.0 };
+        let cost = OpCost::new(atlas_venue::OpGasPrice::new(15_005_000_000, 0.1), 3_000_000, 3000.0);
         let milli = |m: u64| U256::from(m) * U256::from(10u64).pow(U256::from(15u64));
         // Not live / not read: the DappControl's limit.
         assert_eq!(bond_capped_solver_gas(6_000_000, None, &cost, 1.2), 6_000_000);

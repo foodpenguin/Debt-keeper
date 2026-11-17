@@ -42,6 +42,12 @@ struct Stored {
     /// ETH withdrawn from the bond and not yet sent on to PROFIT_RECEIVER (decimal wei).
     #[serde(default)]
     bond_send_pending_wei: Option<String>,
+    /// The unbonding atlETH at the last reading (decimal wei).
+    #[serde(default)]
+    unbonding_last_wei: Option<String>,
+    /// A bond tx sent and not yet seen settled.
+    #[serde(default)]
+    bond_tx: Option<BondTx>,
 }
 
 /// The Atlas side of a UTC day, in ETH.
@@ -52,14 +58,31 @@ pub struct AtlasDay {
     pub failed: u32,
     /// Gas won ops paid in ETH out of their proceeds (their gasPayWei).
     pub gas_paid_eth: f64,
-    /// Bond increases between readings: Atlas crediting what won ops overpaid (or a top-up).
+    /// Bond increases in intervals with a won op: Atlas crediting what won ops overpaid.
     pub bond_credit_eth: f64,
-    /// Bond decreases between readings not caused by our own unbonding.
+    /// Bond decreases between readings (not counting atlETH moved to unbonding).
     pub bond_debit_eth: f64,
     /// The part of the debits from intervals with failed ops and no win: failed ops' gas.
     pub failed_gas_eth: f64,
-    /// What the bot unbonded (on its way to PROFIT_RECEIVER): moved out, not lost.
+    /// atlETH moved from bonded to unbonding (by the bot or an operator): moved out, not lost.
     pub unbonded_eth: f64,
+    /// Bond increases in intervals without a won op: a top-up, not income (it does not offset the
+    /// day's debits in the loss stop).
+    #[serde(default)]
+    pub deposit_eth: f64,
+}
+
+/// A bond tx (unbond / withdraw / ETH sent on) sent and not yet seen settled, kept across restarts:
+/// its effect is applied from its receipt even when this process never sees the executor settle it
+/// (a restart, or a tx reported dropped that still landed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BondTx {
+    /// `atlas_bond::TAG_*`.
+    pub tag: u8,
+    pub amount: U256,
+    pub hash: alloy::primitives::B256,
+    pub sent_block: u64,
+    pub deadline_block: u64,
 }
 
 #[derive(Debug, Default)]
@@ -71,9 +94,11 @@ pub struct Ledger {
     pub failed: DailyBudget,
     bond_day_start: Option<U256>,
     bond_now: Option<U256>,
+    unbonding_now: Option<U256>,
     block_pnl_usd: f64,
     pub atlas: AtlasDay,
     bond_send_pending: Option<U256>,
+    bond_tx: Option<BondTx>,
 }
 
 impl Ledger {
@@ -93,7 +118,8 @@ impl Ledger {
         // A ledger from before v0.4.0 has no last reading: start from the day's first one.
         let bond_now = wei(s.bond_last_wei, "bond_last_wei")?.or(bond_day_start);
         let bond_send_pending = wei(s.bond_send_pending_wei, "bond_send_pending_wei")?;
-        Ok(Self { path: Some(path), day: s.day, failed: s.failed, bond_day_start, bond_now, block_pnl_usd: s.block_pnl_usd, atlas: s.atlas, bond_send_pending })
+        let unbonding_now = wei(s.unbonding_last_wei, "unbonding_last_wei")?;
+        Ok(Self { path: Some(path), day: s.day, failed: s.failed, bond_day_start, bond_now, unbonding_now, block_pnl_usd: s.block_pnl_usd, atlas: s.atlas, bond_send_pending, bond_tx: s.bond_tx })
     }
 
     /// An in-memory ledger (shadow mode, tests).
@@ -118,20 +144,33 @@ impl Ledger {
         self.block_pnl_usd += income_usd - cost_usd;
     }
 
-    /// A reading of the atlETH bonded by the solver signer, with how many of our ops won and failed
-    /// since the previous reading (Atlas's results): the change since then is a credit or a debit,
-    /// and a debit with failed ops and no win is failed-op gas.
-    pub fn observe_bond(&mut self, unix_secs: u64, bonded_wei: U256, won: u32, failed: u32) {
+    /// A reading of the signer's bonded and unbonding atlETH, with how many of our ops won and failed
+    /// since the previous reading (Atlas's results). The change is attributed from the chain state
+    /// alone (not from which of our txs this process saw settle): atlETH that moved from bonded to
+    /// unbonding (an unbond, the bot's or an operator's) is not a debit; what is left of a drop is a
+    /// debit, failed-op gas if the interval had failed ops and no win; a rise is a credit (a won op
+    /// overpaid) only in an interval with a win, else a deposit (a top-up does not offset losses).
+    /// Unbonding that leaves (a withdrawal) is not the bond's business. Atlas taking a charge out of
+    /// unbonding (only once bonded is exhausted, far below bond_min_eth) is not counted.
+    pub fn observe_bond(&mut self, unix_secs: u64, bonded_wei: U256, unbonding_wei: U256, won: u32, failed: u32) {
         self.roll(unix_secs);
         if self.bond_day_start.is_none() {
             self.bond_day_start = Some(bonded_wei);
         }
         let eth = |w: U256| crate::morpho::math::units(w, 18);
         if let Some(prev) = self.bond_now {
-            if bonded_wei > prev {
-                self.atlas.bond_credit_eth += eth(bonded_wei - prev);
-            } else if bonded_wei < prev {
-                let d = eth(prev - bonded_wei);
+            let unbonded = unbonding_wei.saturating_sub(self.unbonding_now.unwrap_or(unbonding_wei));
+            self.atlas.unbonded_eth += eth(unbonded);
+            let after = bonded_wei + unbonded;
+            if after > prev {
+                let d = eth(after - prev);
+                if won > 0 {
+                    self.atlas.bond_credit_eth += d;
+                } else {
+                    self.atlas.deposit_eth += d;
+                }
+            } else if after < prev {
+                let d = eth(prev - after);
                 self.atlas.bond_debit_eth += d;
                 if failed > 0 && won == 0 {
                     self.atlas.failed_gas_eth += d;
@@ -141,6 +180,7 @@ impl Ledger {
         self.atlas.won += won;
         self.atlas.failed += failed;
         self.bond_now = Some(bonded_wei);
+        self.unbonding_now = Some(unbonding_wei);
     }
 
     /// A won op paid `gas_pay_wei` of its gas in ETH.
@@ -149,12 +189,13 @@ impl Ledger {
         self.atlas.gas_paid_eth += crate::morpho::math::units(gas_pay_wei, 18);
     }
 
-    /// The bot unbonded `amount_wei` (its unbond tx settled): the next reading's drop by that much
-    /// is not a debit.
-    pub fn record_unbond(&mut self, unix_secs: u64, amount_wei: U256) {
-        self.roll(unix_secs);
-        self.atlas.unbonded_eth += crate::morpho::math::units(amount_wei, 18);
-        self.bond_now = self.bond_now.map(|b| b.saturating_sub(amount_wei));
+    /// The bond tx sent and not yet seen settled (None = none).
+    pub fn bond_tx(&self) -> Option<BondTx> {
+        self.bond_tx
+    }
+
+    pub fn set_bond_tx(&mut self, tx: Option<BondTx>) {
+        self.bond_tx = tx;
     }
 
     /// ETH withdrawn from the bond and not yet sent on to PROFIT_RECEIVER (survives restarts).
@@ -172,8 +213,8 @@ impl Ledger {
     }
 
     /// What the bond lost today on its own account, in USD: debits net of credits (failed ops' gas,
-    /// won ops that paid less than charged). The bot's own unbonding is not a loss; a top-up counts
-    /// as a credit.
+    /// won ops that paid less than charged). Unbonding is not a loss, and a top-up (a rise without a
+    /// win) is a deposit, not a credit: it does not offset the day's losses.
     pub fn atlas_loss_usd(&self, eth_usd: f64) -> f64 {
         (self.atlas.bond_debit_eth - self.atlas.bond_credit_eth).max(0.0) * eth_usd
     }
@@ -198,6 +239,8 @@ impl Ledger {
             bond_last_wei: self.bond_now.map(|w| w.to_string()),
             atlas: self.atlas.clone(),
             bond_send_pending_wei: self.bond_send_pending.map(|w| w.to_string()),
+            unbonding_last_wei: self.unbonding_now.map(|w| w.to_string()),
+            bond_tx: self.bond_tx,
         };
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, format!("{FORMAT}\n{}\n", serde_json::to_string(&s)?)).with_context(|| format!("writing {}", tmp.display()))?;
@@ -249,13 +292,13 @@ mod tests {
         let mut l = Ledger::load(path.clone()).unwrap();
         l.failed.charge(now, 1.5);
         l.record_block_tx(now, 3.0, 0.25);
-        l.observe_bond(now, U256::from(10u64).pow(U256::from(16u64)), 0, 0); // 0.01 ETH
-        l.observe_bond(now + 1, U256::from(9u64) * U256::from(10u64).pow(U256::from(15u64)), 0, 1); // 0.009
+        l.observe_bond(now, U256::from(10u64).pow(U256::from(16u64)), U256::ZERO, 0, 0); // 0.01 ETH
+        l.observe_bond(now + 1, U256::from(9u64) * U256::from(10u64).pow(U256::from(15u64)), U256::ZERO, 0, 1); // 0.009
         l.save().unwrap();
         let mut back = Ledger::load(path.clone()).unwrap();
         assert_eq!(back.failed.spent_usd(now + 2), 1.5, "failed gas survives a restart");
         // The start-of-day bond survives; the current one is read again after the restart.
-        back.observe_bond(now + 2, U256::from(9u64) * U256::from(10u64).pow(U256::from(15u64)), 0, 0);
+        back.observe_bond(now + 2, U256::from(9u64) * U256::from(10u64).pow(U256::from(15u64)), U256::ZERO, 0, 0);
         assert!((back.atlas_loss_usd(2000.0) - 2.0).abs() < 1e-9, "0.001 ETH shrinkage at $2000");
         assert!((back.pnl_usd(now + 3, 2000.0) - (2.75 - 2.0)).abs() < 1e-9);
         let _ = std::fs::remove_file(&path);
@@ -265,13 +308,13 @@ mod tests {
     fn a_new_day_starts_from_the_current_bond() {
         let mut l = Ledger::in_memory();
         let day = 86_400 * 7;
-        l.observe_bond(day, U256::from(100u64), 0, 0);
-        l.observe_bond(day + 10, U256::from(60u64), 0, 0);
+        l.observe_bond(day, U256::from(100u64), U256::ZERO, 0, 0);
+        l.observe_bond(day + 10, U256::from(60u64), U256::ZERO, 0, 0);
         l.record_block_tx(day + 20, 0.0, 1.0);
         assert!(l.pnl_usd(day + 30, 1e18) < 0.0);
         // Next UTC day: the PnL restarts at zero and the bond baseline is the last reading.
         assert_eq!(l.pnl_usd(day + 86_400, 1e18), 0.0);
-        l.observe_bond(day + 86_401, U256::from(60u64), 0, 0);
+        l.observe_bond(day + 86_401, U256::from(60u64), U256::ZERO, 0, 0);
         assert_eq!(l.atlas_loss_usd(1e18), 0.0);
     }
 
@@ -283,17 +326,17 @@ mod tests {
     fn the_bond_side_is_kept_apart() {
         let mut l = Ledger::in_memory();
         let t = 86_400 * 9;
-        l.observe_bond(t, milli(100), 0, 0);
+        l.observe_bond(t, milli(100), U256::ZERO, 0, 0);
         // A win that overpaid: credited. Its gas, paid in ETH, is recorded on its own.
         l.record_gas_paid(t + 1, milli(10));
-        l.observe_bond(t + 2, milli(102), 1, 0);
+        l.observe_bond(t + 2, milli(102), U256::ZERO, 1, 0);
         // A failed op and no win: the drop is failed-op gas.
-        l.observe_bond(t + 3, milli(99), 0, 1);
+        l.observe_bond(t + 3, milli(99), U256::ZERO, 0, 1);
         // A win that underpaid: a debit, but not failed-op gas.
-        l.observe_bond(t + 4, milli(98), 1, 0);
+        l.observe_bond(t + 4, milli(98), U256::ZERO, 1, 0);
         // A win and a failure in one interval: the drop cannot be told apart, so it is a debit but
         // not counted as failed-op gas.
-        l.observe_bond(t + 5, milli(97), 1, 1);
+        l.observe_bond(t + 5, milli(97), U256::ZERO, 1, 1);
         let a = &l.atlas;
         assert_eq!((a.won, a.failed), (3, 2));
         assert!((a.gas_paid_eth - 0.010).abs() < 1e-12);
@@ -302,11 +345,39 @@ mod tests {
         assert!((a.failed_gas_eth - 0.003).abs() < 1e-12, "only the interval with a failure and no win");
         // Net loss: 0.005 debited - 0.002 credited.
         assert!((l.atlas_loss_usd(1000.0) - 3.0).abs() < 1e-9);
-        // The bot's own unbonding moves ETH out without a loss.
-        l.record_unbond(t + 6, milli(20));
-        l.observe_bond(t + 7, milli(77), 0, 0);
+    }
+
+    /// An unbond — the bot's, seen before its tx settled, after a restart, or an operator's by hand —
+    /// moves bonded to unbonding: read from the chain, it is never a loss (review A#1/B#3), and the
+    /// withdrawal that empties the unbonding later is not one either.
+    #[test]
+    fn unbonding_is_never_a_loss_whoever_did_it() {
+        let mut l = Ledger::in_memory();
+        let t = 86_400 * 10;
+        l.observe_bond(t, milli(120), U256::ZERO, 0, 0);
+        l.observe_bond(t + 1, milli(100), milli(20), 0, 0);
+        assert_eq!((l.atlas.bond_debit_eth, l.atlas_loss_usd(1000.0)), (0.0, 0.0));
         assert!((l.atlas.unbonded_eth - 0.020).abs() < 1e-12);
-        assert!((l.atlas_loss_usd(1000.0) - 3.0).abs() < 1e-9, "unbonding is not a loss");
+        // Withdrawn: the unbonding leaves; still no loss.
+        l.observe_bond(t + 2, milli(100), U256::ZERO, 0, 0);
+        assert_eq!(l.atlas_loss_usd(1000.0), 0.0);
+        // An unbond in the same interval as a failed op's charge: only the charge is a debit.
+        l.observe_bond(t + 3, milli(79), milli(20), 0, 1);
+        assert!((l.atlas.bond_debit_eth - 0.001).abs() < 1e-12 && (l.atlas.failed_gas_eth - 0.001).abs() < 1e-12);
+    }
+
+    /// A top-up is a deposit, not income: it cannot hide the day's failed-op losses from the loss
+    /// stop (review B#7). Only a rise in an interval with a won op is a credit.
+    #[test]
+    fn a_top_up_does_not_offset_the_days_losses() {
+        let mut l = Ledger::in_memory();
+        let t = 86_400 * 11;
+        l.observe_bond(t, milli(100), U256::ZERO, 0, 0);
+        l.observe_bond(t + 1, milli(95), U256::ZERO, 0, 2); // failed ops: 0.005
+        l.observe_bond(t + 2, milli(145), U256::ZERO, 0, 0); // operator adds 0.05
+        assert!((l.atlas.deposit_eth - 0.050).abs() < 1e-12);
+        assert_eq!(l.atlas.bond_credit_eth, 0.0);
+        assert!((l.atlas_loss_usd(1000.0) - 5.0).abs() < 1e-9, "the 0.005 loss still counts");
     }
 
     #[test]
@@ -314,12 +385,18 @@ mod tests {
         let path = tmp("pending");
         let _ = std::fs::remove_file(&path);
         let mut l = Ledger::load(path.clone()).unwrap();
-        l.observe_bond(86_400 * 3, milli(90), 0, 0);
+        l.observe_bond(86_400 * 3, milli(90), milli(4), 0, 0);
         l.set_bond_send_pending(Some(milli(25)));
+        let tx = BondTx { tag: 2, amount: milli(25), hash: alloy::primitives::B256::repeat_byte(7), sent_block: 100, deadline_block: 150 };
+        l.set_bond_tx(Some(tx));
         l.save().unwrap();
-        let back = Ledger::load(path.clone()).unwrap();
+        let mut back = Ledger::load(path.clone()).unwrap();
         assert_eq!(back.bond_send_pending(), Some(milli(25)));
+        assert_eq!(back.bond_tx(), Some(tx), "the bond tx in flight survives, to be reconciled from its receipt");
         assert_eq!(back.bond_wei(), Some(milli(90)), "the last reading is kept, not only the day's first");
+        // The unbonding baseline survives too: no false unbond on the first reading after a restart.
+        back.observe_bond(86_400 * 3 + 5, milli(90), milli(4), 0, 0);
+        assert_eq!(back.atlas.unbonded_eth, 0.0);
         let _ = std::fs::remove_file(&path);
     }
 

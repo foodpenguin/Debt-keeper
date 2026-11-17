@@ -621,9 +621,9 @@ submitted to the auction (`submit_solver_op` in `runner.rs`):
   and `deadline` = the auction's, `solver` = the deployed AtlasLiquidationSolver, `control` = the
   DappControl, `userOpHash` = the auction's, `bidToken` = ETH (`address(0)`), `bidAmount` = the bid,
   `data` = the solver's `solverOpData` (`AtlasSolver::op_data`), rebuilt at submission: `gasPayWei`
-  recomputed from the op's gas (simulated x `gas_limit_buffer`) and bought together with the bid,
-  any increase over the simulated gas pay taken out of the profit, and minProfit = that net x
-  `min_profit_keep`;
+  recomputed from the simulated gas (without the `gas_limit_buffer`: see "The bond") and bought
+  together with the bid, any increase over the simulated gas pay taken out of the profit, and
+  minProfit = that net x `min_profit_keep`;
 - the signature: EIP-712 over `SolverOperation(address from,address to,uint256 value,uint256 gas,
   uint256 maxFeePerGas,uint256 deadline,address solver,address control,bytes32 userOpHash,address
   bidToken,uint256 bidAmount,bytes data)` with the domain read at start from the deployed
@@ -671,30 +671,43 @@ Base SVR metacall with our op in the winner's slot):
 What the bot does:
 
 - **Gas pay.** Valuation: `gasPayWei` = (estimated op gas + `METACALL_FIXED_GAS`) x max fee x (1 +
-  surcharges), the same gas the bid basis already subtracts; the bid swap buys bid + gas pay; the
-  contract pays `min(gasPayWei, Atlas's liability)` (a wrong value cannot overpay). Submission:
-  recomputed from the simulated gas x `gas_limit_buffer` (erring high only credits the bond).
-  `gasPayWei = 0` is the previous behavior (all gas from the bond).
+  Atlas's and the bundler's surcharges) — exactly the gas every bid basis (batch and single op)
+  already subtracts, from the same per-gas price; the bid swap buys bid + gas pay; the contract
+  pays `min(gasPayWei, Atlas's liability)` (a wrong value cannot overpay). Submission: recomputed
+  from the simulated gas + `METACALL_FIXED_GAS` — Atlas's expected charge for the gas the op uses,
+  not its gas limit (simulated x `gas_limit_buffer`): the proceeds must buy the gas pay, so paying
+  for the buffered limit would take value out of thin ops for nothing; an overpay is credited to
+  the bond, a small shortfall taken from it. `gasPayWei = 0` is the previous behavior (all gas
+  from the bond).
 - **Bundle size from the bond.** A valuation plans an op for at most what the bond affords
   (`bond_capped_solver_gas`: the largest op gas whose liability the bonded atlETH covers, divided
   by `gas_limit_buffer`), so a market's bundle shrinks to fit the bond instead of being refused
   whole. Only in live mode with `submit` (the bond is read there).
-- **The band.** Below `bond_min_eth`: no op is submitted, an alert is logged. Above `bond_max_eth`
-  (overpaid gas accumulates): an alert, or with `bond_auto_withdraw = true` the hot wallet unbonds
-  the excess, waits until Atlas releases it (`unbondingCompleteBlock()`: ESCROW_DURATION blocks
-  after the last change to the bond, which a charge during the wait restarts), withdraws it and
-  sends the ETH on to the solver's `PROFIT_RECEIVER` — one step at a time (`next_step`), each a tx
-  through the executor at the normal priority fee, in live mode with the kill switch off; the
-  withdrawn amount waiting to be sent survives restarts (ledger). Bonding stays an operator step.
+- **The band.** Below `bond_min_eth`: no op is submitted, an alert is logged, and nothing moves
+  out of the bond. Above `bond_max_eth` (overpaid gas accumulates): an alert, or with
+  `bond_auto_withdraw = true` the hot wallet unbonds the excess, waits until Atlas releases it
+  (`unbondingCompleteBlock()`: ESCROW_DURATION blocks after the last change to the bond, which a
+  charge during the wait restarts, plus a few blocks of margin), withdraws it and sends the ETH on
+  to the solver's `PROFIT_RECEIVER` — one step at a time (`next_step`), each a tx through the
+  executor at the normal priority fee, only while nothing else is in flight, in live mode with the
+  kill switch off. Unbonded atlETH the bot did not unbond (an operator's `deposit` not yet bonded)
+  pauses auto-withdraw with an alert: `withdraw` takes that balance first, so the bot would sweep
+  it. The bond tx in flight (its hash) and the withdrawn amount waiting to be sent are kept in the
+  ledger: a tx the executor stops tracking (a restart, or one reported dropped that still landed)
+  is reconciled from its receipt, so a withdrawal is never left in the hot wallet unnoticed and a
+  send never repeated. Bonding stays an operator step.
 - **Results and the ledger.** At each bond reading the bot reads Atlas's `SolverTxResult` logs for
   its signer (`atlas_op_result`): won ops (and the gas each paid, matched to its submission),
-  failed ones. The ledger's Atlas day keeps apart the gas won ops paid, the bond's credits and
-  debits between readings (a debit in an interval with failed ops and no win counts as failed-op
-  gas) and what the bot unbonded. Journal: `atlas_bond` per reading (bonded, unbonding, the band,
-  the next step), `atlas_bond_tx` per settled bond tx.
+  failed ones. The ledger's Atlas day attributes each reading's change from the chain state alone:
+  atlETH that moved from bonded to unbonding (an unbond, the bot's or an operator's) is not a loss;
+  a remaining drop is a debit (failed-op gas if the interval had failed ops and no win); a rise is a
+  credit (overpaid gas) only in an interval with a won op, else a deposit, which does not offset the
+  day's losses. Journal: `atlas_bond` per reading (bonded, unbonding, the band, the next step),
+  `atlas_bond_tx` per settled bond tx (`via: "receipt"` when reconciled that way).
 - **Dashboard.** The bond card shows the bonded amount against the band and our ops' results; the
-  paper table adds the result at the journaled bid with the simulated net after bid and gas
-  (`net_after_bid_usd`) as the profit.
+  paper table adds the result of the one op an auction gets (the submitted one, else the market
+  whose simulated op nets the most), won if that op's own bid beats the winner's, with its
+  simulated net after bid and gas (`net_after_bid_usd`) as the profit.
 
 ### Bidding in SVR auctions: operator steps
 

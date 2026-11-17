@@ -108,37 +108,76 @@ pub enum BondStep {
     AboveMax { excess: U256 },
     /// Start: unbond this excess.
     Unbond(U256),
-    /// An unbonding is under way and Atlas holds it until after this block.
+    /// An unbonding is under way: withdrawable after this block (Atlas's release block plus a margin).
     Wait { until_block: u64 },
-    /// Withdraw this (every atlETH not bonded) to the hot wallet.
+    /// Withdraw this unbonding atlETH to the hot wallet.
     Withdraw(U256),
     /// Send this ETH, withdrawn earlier, on to PROFIT_RECEIVER.
     Send(U256),
+    /// Auto-withdraw paused: the signer holds unbonded atlETH it did not unbond (an operator's,
+    /// e.g. a `deposit` not yet bonded). `withdraw` takes that balance first, so the bot would sweep
+    /// it; it waits until the operator bonds or withdraws it.
+    OperatorFunds { free: U256 },
 }
+
+/// Blocks waited past Atlas's release block (`unbondingCompleteBlock`) before withdrawing: a charge
+/// to the bond between our reading and the withdraw's inclusion restarts Atlas's wait and makes the
+/// withdraw revert; a small margin makes that unlikely (it costs only a few seconds).
+pub const RELEASE_MARGIN_BLOCKS: u64 = 5;
 
 /// The next step for the bond, given its state, the band and what is pending from an earlier step
 /// (ETH withdrawn but not yet sent on). One step at a time: nothing new starts while an unbonding or
-/// a withdrawn amount is pending. A stale unbonding balance or unbonded atlETH (an operator's) is
-/// withdrawn too: nothing the bot does not bond is useful to it.
+/// a withdrawn amount is pending. Below the min nothing moves out (an operator decides), and atlETH
+/// the bot did not unbond is never swept.
 pub fn next_step(s: &BondState, min_wei: U256, max_wei: U256, auto_withdraw: bool, pending_send: Option<U256>) -> BondStep {
     if let Some(v) = pending_send.filter(|v| !v.is_zero()) {
         return BondStep::Send(v);
     }
-    if auto_withdraw && (!s.unbonding.is_zero() || !s.free.is_zero()) {
-        // `withdraw` takes the unbonded balance first and the unbonding one only after the wait.
-        if !s.unbonding.is_zero() && s.block <= s.complete_block {
-            return BondStep::Wait { until_block: s.complete_block };
-        }
-        return BondStep::Withdraw(s.unbonding + s.free);
-    }
     if s.bonded < min_wei {
         return BondStep::BelowMin;
     }
+    if auto_withdraw && !s.unbonding.is_zero() {
+        if !s.free.is_zero() {
+            return BondStep::OperatorFunds { free: s.free };
+        }
+        let until_block = s.complete_block.saturating_add(RELEASE_MARGIN_BLOCKS);
+        if s.block <= until_block {
+            return BondStep::Wait { until_block };
+        }
+        return BondStep::Withdraw(s.unbonding);
+    }
     if s.bonded > max_wei {
         let excess = s.bonded - max_wei;
-        return if auto_withdraw { BondStep::Unbond(excess) } else { BondStep::AboveMax { excess } };
+        return match (auto_withdraw, s.free.is_zero()) {
+            (true, true) => BondStep::Unbond(excess),
+            (true, false) => BondStep::OperatorFunds { free: s.free },
+            (false, _) => BondStep::AboveMax { excess },
+        };
     }
     BondStep::Idle
+}
+
+/// What to do about a bond tx sent earlier that the executor is no longer tracking (a restart, or
+/// one it reported dropped), from its receipt (`Some(success)` = mined).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BondTxCheck {
+    /// Mined: apply its effect (if it succeeded) and forget it.
+    Settled { success: bool },
+    /// No receipt yet, still within its deadline plus a grace: look again at the next check.
+    Pending,
+    /// No receipt well past its deadline: it never landed (replaced or expired); forget it.
+    Gone,
+}
+
+/// Blocks past a bond tx's deadline after which a missing receipt means it never landed.
+pub const BOND_TX_GRACE_BLOCKS: u64 = 100;
+
+pub fn check_bond_tx(receipt: Option<bool>, deadline_block: u64, block: u64) -> BondTxCheck {
+    match receipt {
+        Some(success) => BondTxCheck::Settled { success },
+        None if block > deadline_block + BOND_TX_GRACE_BLOCKS => BondTxCheck::Gone,
+        None => BondTxCheck::Pending,
+    }
 }
 
 pub fn unbond_calldata(amount: U256) -> Bytes {
@@ -200,18 +239,33 @@ mod tests {
         assert_eq!(next_step(&state(130, 0, 0, 0, 10), min, max, false, None), BondStep::AboveMax { excess: eth(30) });
         // Above, auto on: unbond just the excess.
         assert_eq!(next_step(&state(130, 0, 0, 0, 10), min, max, true, None), BondStep::Unbond(eth(30)));
-        // Unbonding under way: wait for Atlas's release block (strictly after it), then withdraw it.
-        assert_eq!(next_step(&state(100, 30, 0, 74, 74), min, max, true, None), BondStep::Wait { until_block: 74 });
-        assert_eq!(next_step(&state(100, 30, 0, 74, 75), min, max, true, None), BondStep::Withdraw(eth(30)));
+        // Unbonding under way: wait past Atlas's release block plus the margin, then withdraw it.
+        let until = 74 + RELEASE_MARGIN_BLOCKS;
+        assert_eq!(next_step(&state(100, 30, 0, 74, 75), min, max, true, None), BondStep::Wait { until_block: until }, "past the release block but within the margin");
+        assert_eq!(next_step(&state(100, 30, 0, 74, until + 1), min, max, true, None), BondStep::Withdraw(eth(30)));
         // Nothing new starts while unbonding, even if the bond grew above the max again meanwhile.
-        assert_eq!(next_step(&state(140, 30, 0, 74, 70), min, max, true, None), BondStep::Wait { until_block: 74 });
+        assert_eq!(next_step(&state(140, 30, 0, 74, 70), min, max, true, None), BondStep::Wait { until_block: until });
         // Withdrawn ETH waiting to be sent on comes first.
         assert_eq!(next_step(&state(100, 0, 0, 74, 80), min, max, true, Some(eth(30))), BondStep::Send(eth(30)));
-        // Unbonded atlETH (no unbonding) is withdrawn at once, with any unbonding past its wait.
-        assert_eq!(next_step(&state(100, 0, 5, 0, 80), min, max, true, None), BondStep::Withdraw(eth(5)));
-        assert_eq!(next_step(&state(100, 30, 5, 74, 80), min, max, true, None), BondStep::Withdraw(eth(35)));
+        // Unbonded atlETH the bot did not unbond (an operator's deposit) is never swept: withdraw
+        // would take it first, so auto-withdraw pauses (review B#8); alone it is left alone.
+        assert_eq!(next_step(&state(100, 30, 5, 74, 90), min, max, true, None), BondStep::OperatorFunds { free: eth(5) });
+        assert_eq!(next_step(&state(130, 0, 5, 0, 90), min, max, true, None), BondStep::OperatorFunds { free: eth(5) });
+        assert_eq!(next_step(&state(100, 0, 5, 0, 90), min, max, true, None), BondStep::Idle);
+        // Below the min: alerted, and nothing moves out even with an unbonding ready (review B#8).
+        assert_eq!(next_step(&state(50, 30, 0, 74, 90), min, max, true, None), BondStep::BelowMin);
         // Auto off: an operator's unbonding is left alone.
-        assert_eq!(next_step(&state(80, 30, 0, 74, 80), min, max, false, None), BondStep::Idle);
+        assert_eq!(next_step(&state(80, 30, 0, 74, 90), min, max, false, None), BondStep::Idle);
+    }
+
+    #[test]
+    fn a_bond_tx_out_of_the_executors_sight_is_reconciled_from_its_receipt() {
+        // Mined (seen after a restart, or after being reported dropped): its effect applies.
+        assert_eq!(check_bond_tx(Some(true), 100, 120), BondTxCheck::Settled { success: true });
+        assert_eq!(check_bond_tx(Some(false), 100, 120), BondTxCheck::Settled { success: false });
+        // No receipt: wait through the deadline plus the grace, then forget it.
+        assert_eq!(check_bond_tx(None, 100, 100 + BOND_TX_GRACE_BLOCKS), BondTxCheck::Pending);
+        assert_eq!(check_bond_tx(None, 100, 101 + BOND_TX_GRACE_BLOCKS), BondTxCheck::Gone);
     }
 
     #[test]
