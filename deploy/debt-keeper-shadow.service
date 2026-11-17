@@ -22,7 +22,8 @@ ExecStart=@BIN@ -c @CONFIG@ watch
 Environment=NO_COLOR=1
 Environment=RUST_LOG=info
 # Restart after crashes or RPC outages, backing off from 15 s up to 5 min as failures repeat
-# (systemd >= 254; the VM runs 255), so a persistent outage retries slowly instead of giving up.
+# (systemd >= 254; older versions ignore the step keys and keep 15 s), so a persistent outage
+# retries slowly instead of giving up.
 Restart=always
 RestartSec=15
 RestartSteps=5
