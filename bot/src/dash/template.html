@@ -160,6 +160,7 @@ tr.det td { background:var(--bg); white-space:normal; text-align:left; padding:1
       <div class="card w8"><div class="t">Our bundle net vs on-chain winning bid<i class="i" tabindex="0" data-k="scatter">i</i><span class="hint">above the diagonal = winnable · click for details</span></div><div class="ch" id="cScatter"></div></div>
       <div class="card w4"><div class="t">Valuable auctions per day<i class="i" tabindex="0" data-k="adays">i</i></div><div class="ch" id="cADays"></div></div>
       <div class="card w12"><div class="t">Paper trading (simulated bids, nothing sent)<i class="i" tabindex="0" data-k="paper">i</i><span class="hint" id="paperHint"></span></div><div class="tbl" id="paperTbl"></div></div>
+      <div class="card w12"><div class="t">atlETH bond<i class="i" tabindex="0" data-k="bond">i</i><span class="hint" id="bondHint"></span></div><div id="bondBox"></div></div>
     </div></section>
 
     <section id="rivals"><h2>Competitor exits</h2><div class="grid">
@@ -197,7 +198,8 @@ const DEF = {
   market: "Liquidation gross per market in the range, after the range, channel and liquidator filters.",
   atlasWin: "Winnable = our bundle net is above the on-chain winning bid (bidding just above it would have won). Potential profit = the sum of those gaps. Only auctions with a bundle valuation count.",
   scatter: "Each dot is an auction with liquidatable positions. X = on-chain winning bid, Y = our bundle net (older records: per-position sum). Diagonal y = x: above it we could have outbid the winner. Both axes are logarithmic.",
-  paper: "For every auction with a known on-chain winning bid, assume we bid bundle net × (1 − kept margin). Won = our bid (converted to ETH) beats the actual winning bid; in time = the valuation finished within the deadline after the auction opened (later is too late to bid). PnL = bundle net − our bid, i.e. what our own exit estimate says we would keep. Not affected by the range and market filters.",
+  paper: "For every auction with a known on-chain winning bid, assume we bid bundle net × (1 − kept margin). Won = our bid (converted to ETH) beats the actual winning bid; in time = the valuation finished within the deadline after the auction opened (later is too late to bid). PnL = bundle net − our bid, i.e. what our own exit estimate says we would keep. The last line is the real one: at the bid we journaled, PnL = the simulated solver op's net after the bid AND its gas, which the op pays in ETH out of its proceeds (v0.4.0+ valuations only). Not affected by the range and market filters.",
+  bond: "The solver signer's bonded atlETH (read about every 100 s in live mode) against the band bond_min_eth … bond_max_eth: below the min no op is submitted; above the max the excess is due to leave the bond (alert, or auto-withdraw). Won ops pay their own gas in ETH; Atlas credits any excess back to the bond and takes any shortfall from it, and takes failed ops' gas from it. Won / failed / gas paid: our ops' results from Atlas's logs.",
   adays: "Per day, how many valued auctions had liquidatable positions. Hover for the day's total valued auctions and those skipped for queueing too long.",
   actor: "Liquidation gross per liquidator (the caller of Morpho liquidate) in the range, top 12.",
   exitkind: "Gross (bars) and average slippage by exit kind. Slippage = 1 − USDC received ÷ oracle value of the collateral sold; carried positions (collateral re-deposited into Morpho / Aave and borrowed against) have no slippage.",
@@ -670,11 +672,30 @@ document.getElementById("updInfo").dataset.tip = DEF.upd;
   const pct = x => (x * 100).toFixed(1) + "%";
   let h = `<table><thead><tr><th class="l">Kept margin</th><th>Won</th><th>PnL</th><th>Won in time</th><th>PnL in time</th><th>Winning bids of won auctions</th></tr></thead><tbody>`;
   for (const m of P.margins) h += `<tr><td class="l">${pct(m.m)}</td><td>${m.wins}</td><td>${usd(m.pnl)}</td><td>${m.wins_t}</td><td>${usd(m.pnl_t)}</td><td>${usdK(m.won_usd)}</td></tr>`;
+  const R = P.real;
+  if (R && R.n > 0) h += `<tr><td class="l">Our bid, simulated net (bid + gas paid) · ${R.n} auctions</td><td>${R.wins}</td><td>${usd(R.pnl)}</td><td>${R.wins_t}</td><td>${usd(R.pnl_t)}</td><td></td></tr>`;
   h += `</tbody></table><h4 style="margin:12px 0 4px;font-size:12px;color:var(--muted)">By market (kept ${pct(P.m1)}, in time)</h4><table><thead><tr><th class="l">Market</th><th>Auctions</th><th>Won</th><th>PnL</th><th>Our bundle net (sum)</th><th>Winning bids (sum)</th></tr></thead><tbody>`;
   for (const m of P.markets) h += `<tr><td class="l">${esc(m.market)}</td><td>${m.n}</td><td>${m.wins}</td><td>${usd(m.pnl)}</td><td>${usdK(m.ours)}</td><td>${usdK(m.win_usd)}</td></tr>`;
   h += `</tbody></table><h4 style="margin:12px 0 4px;font-size:12px;color:var(--muted)">Daily (kept ${pct(P.m1)}, in time)</h4><table><thead><tr><th class="l">Date</th><th>Auctions</th><th>Won</th><th>PnL</th></tr></thead><tbody>`;
   for (const [d, n, w, p] of P.days.slice().reverse()) { const t = new Date(d * 86400e3); h += `<tr><td class="l">${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}-${pad(t.getUTCDate())}</td><td>${n}</td><td>${w}</td><td>${usd(p)}</td></tr>`; }
   el.innerHTML = h + `</tbody></table>`;
+})();
+// atlETH bond against its band (static: latest reading).
+(function bondGauge() {
+  const B = D.bond, el = document.getElementById("bondBox");
+  if (!el) return;
+  if (!B) { el.innerHTML = `<div class="hint">No bond readings (live mode with [atlas.solver] submit only).</div>`; return; }
+  const top = Math.max(B.max * 1.25, B.bonded * 1.05, 1e-9), at = x => (Math.min(x, top) / top * 100).toFixed(1) + "%";
+  const mark = (x, label) => `<div style="position:absolute;left:${at(x)};top:0;height:22px;border-left:2px solid var(--muted)"></div><div style="position:absolute;left:${at(x)};top:26px;transform:translateX(-50%);font-size:11px;color:var(--muted);white-space:nowrap">${label}</div>`;
+  const color = B.bonded < B.min ? "#d9534f" : B.bonded > B.max ? "#e0a030" : "#3a9d5d";
+  document.getElementById("bondHint").textContent = `block ${B.block} · next step: ${B.step}`;
+  el.innerHTML = `<div style="position:relative;height:46px;margin:6px 8px 4px">
+      <div style="position:absolute;left:0;right:0;top:8px;height:8px;background:var(--grid);border-radius:4px"></div>
+      <div style="position:absolute;left:${at(B.min)};width:calc(${at(B.max)} - ${at(B.min)});top:8px;height:8px;background:rgba(58,157,93,.3)"></div>
+      ${mark(B.min, `min ${B.min.toFixed(4)}`)}${mark(B.max, `max ${B.max.toFixed(4)}`)}
+      <div style="position:absolute;left:${at(B.bonded)};top:3px;width:12px;height:18px;margin-left:-6px;border-radius:3px;background:${color}" title="bonded ${B.bonded}"></div>
+    </div>
+    <div style="font-size:12px;margin:4px 8px">Bonded <b>${B.bonded.toFixed(5)} ETH</b>${B.unbonding > 0 ? ` · unbonding ${B.unbonding.toFixed(5)}` : ""} · our ops won ${B.won}, failed ${B.failed} · gas paid by won ops ${B.gas_paid_eth.toFixed(5)} ETH</div>`;
 })();
 render();
 tick(); setInterval(tick, 5000);

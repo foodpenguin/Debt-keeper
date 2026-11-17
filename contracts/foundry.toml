@@ -10,7 +10,7 @@ via_ir = true
 # storageLayout is read by the bot to build simulation state overrides
 extra_output = ["storageLayout"]
 # Fork tests read their addresses from the bot config
-fs_permissions = [{ access = "read", path = "../bot/config.example.toml" }]
+fs_permissions = [{ access = "read", path = "../bot/config.example.toml" }, { access = "read", path = "./test/fixtures" }]
 
 [rpc_endpoints]
 base = "${BASE_RPC_URL}"

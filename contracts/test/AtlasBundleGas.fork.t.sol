@@ -171,7 +171,7 @@ contract AtlasBundleGasForkTest is Test {
                 (ISwapRouter02B.ExactOutputSingleParams({tokenIn: USDC, tokenOut: WETH, fee: 500, recipient: address(solver), amountOut: bid, amountInMaximum: type(uint128).max, sqrtPriceLimitX96: 0}))
             )
         });
-        return abi.encode(calls, bidSwap, USDC, uint256(0));
+        return abi.encode(calls, bidSwap, USDC, uint256(0), uint256(0));
     }
 
     function _measure(uint256 n) internal {
@@ -256,7 +256,7 @@ contract AtlasBundleGasForkTest is Test {
     function _batchOp(bytes memory packed, uint256 bid) internal view returns (bytes memory) {
         SolverCall[] memory calls = new SolverCall[](1);
         calls[0] = SolverCall({target: address(liq), data: packed});
-        return abi.encode(calls, _bidSwap(bid), USDC, uint256(0));
+        return abi.encode(calls, _bidSwap(bid), USDC, uint256(0), uint256(0));
     }
 
     function _runBatch(bytes memory data) internal returns (uint256 used) {

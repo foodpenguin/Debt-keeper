@@ -52,4 +52,7 @@ first implementation. Read `docs/architecture.md` before changing core code.
 - Before live: priority-fee cap, daily gas cap, market allowlist (exclude markets with untrusted
   tokens or oracles), kill switch.
 - Atlas solver ops are only submitted with `[atlas.solver] submit = true` in live mode; bonding
-  atlETH is an operator step, never automated.
+  atlETH is an operator step, never automated. The only automatic bond move is taking an excess
+  above `bond_max_eth` back out to PROFIT_RECEIVER, and only with `bond_auto_withdraw = true`
+  (off by default; live mode, kill switch off). Solver ops pay their own gas (`gasPayWei`); keep the
+  solver security tests green (`contracts/test/AtlasLiquidationSolver.security.t.sol`).

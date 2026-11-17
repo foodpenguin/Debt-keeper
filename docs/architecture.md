@@ -391,6 +391,7 @@ metacall cannot be replayed (it needs the user's and the DApp's signatures).
 | `flashblocks` | Flashblocks stream decoding: examples only (Denim removes Flashblocks) |
 | `atlas` | Chainlink SVR / Fastlane Atlas auction feed and valuation |
 | `atlas_submit` | solver operations: EIP-712 signing, submission (live, opt-in) |
+| `atlas_bond` | the solver's atlETH bond: state, band, auto-withdraw steps, our ops' Atlas results |
 | `loss` | loss analysis: every on-chain liquidation in tracked markets vs what we saw |
 | `dash/`, `live` | SQLite history + static dashboard; live HF page on localhost |
 
@@ -538,19 +539,22 @@ some pools (Aero) tax the priority fee.
   lose). Checked once, in `send_approved`, after the policy.
 - **Failed gas per UTC day** (`[exec] daily_gas_budget_usd`): a tx in flight holds its worst case;
   a revert charges its real cost.
-- **Atlas bond per UTC day** (`[atlas.solver] atlas_bond_budget_usd`): the bond's shrinkage since
-  the day's first reading (read every 50 heads and after an accepted op), plus the next op's worst
-  case. Below `min_bond_eth` no op is submitted.
+- **Atlas bond band** (`[atlas.solver] bond_min_eth` / `bond_max_eth`, no defaults, required with
+  `submit`): below the min no op is submitted; each op must also have its maximum liability covered
+  by the bond (see "The bond" below). Read every `BOND_CHECK_HEADS` heads and after an accepted op.
 - **Daily loss** (`[exec] daily_loss_limit_usd`): realized PnL = what settled block-path txs paid
   `PROFIT_RECEIVER` (their receipts' ERC20 transfers of the tracked loan tokens) minus their gas,
-  minus the bond's shrinkage. Atlas income is not counted (an op runs inside someone else's
-  metacall), so the PnL is a lower bound and the stop can only fire early. Past the limit the kill
-  switch file is written; sending stops until a person removes it.
+  minus the bond's net debits (failed ops' gas, won ops that paid less gas than charged; the bot's
+  own unbonding is not a loss). Atlas income is not counted (an op's profit goes to
+  `PROFIT_RECEIVER` from inside someone else's metacall), so the PnL is a lower bound and the stop
+  can only fire early. Past the limit the kill switch file is written; sending stops until a person
+  removes it.
 
 Refusals by these limits are journaled (`kind: "refused"`, `reason`, `worst_eth`, `cap_eth`). In
-live mode the day's failed-gas spend, bond baseline and PnL are kept in a ledger file (`v1` line +
-JSON; `[exec] ledger_file`, default next to the shared nonce files) and read back at start; a file
-the bot cannot read refuses live mode.
+live mode the day's failed-gas spend, the Atlas day (below), the last bond reading, ETH withdrawn
+from the bond and not yet sent on, and the PnL are kept in a ledger file (`v1` line + JSON; `[exec]
+ledger_file`, default next to the shared nonce files) and read back at start; a file the bot cannot
+read refuses live mode (a ledger from before v0.4.0 reads with an empty Atlas day).
 
 ### Oracle logs and the price model (`bot/src/oracle_logs.rs`, `bot/src/oracle.rs`)
 
@@ -594,13 +598,16 @@ journaled bid is the auction policy's on that net (default x (1 - `atlas.margin`
 each market of a valued auction also gets a `solver` field in the journal (`solver_op` in
 `runner.rs`): the top position's direct-router plan is wrapped into `atlasSolverCall` with a bid of
 (`profit_usd` minus the op's gas at the Atlas rate above) x (1 - `atlas.margin`), and simulated as
-Atlas would call it, against `AtlasStub.sol` injected at the Atlas address (no gas liability), with
-the solver and its MorphoLiquidator injected unless deployed; the result includes the L1 fee of the
-call. The journal shows the bid, whether the op succeeds and the net after the bid. `solver_op`
+Atlas would call it, against `AtlasStub.sol` injected at the Atlas address (reporting, in its
+storage slot 0, the gas liability the bot computes for the op), with the solver and its
+MorphoLiquidator injected unless deployed; the result includes the L1 fee of the call. The op pays
+its gas in ETH out of the proceeds (`gasPayWei`, see "The bond"), so the journal's net after the bid
+(`net_after_bid`, `net_after_bid_usd`) is also net of the gas (`gas_pay_eth`). `solver_op`
 wraps only direct-router plans (an existing plan's aggregator calldata was built for the direct
 liquidator's address), and nothing when `exec.venue = "flash"`. `AtlasSolver::calldata` builds the
-call (the bid is bought with `exactOutputSingle` on `bid_router` unless the loan token is WETH;
-minProfit at `SOLVER_MIN_PROFIT`); `AtlasBid { solver, bid_wei }` implements
+call (the bid plus the gas pay are bought with one `exactOutputSingle` on `bid_router` unless the
+loan token is WETH; minProfit at `SOLVER_MIN_PROFIT`); `AtlasBid { solver, bid_wei, gas_pay_wei,
+gas_liability_wei }` implements
 `LiquidationVenue<Morpho>` with `swap_recipient()` = the solver's MorphoLiquidator, so the planner can
 also plan through it, aggregator routes included (they are built to deliver to that liquidator). `e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation`
 checks it on an anvil fork.
@@ -613,8 +620,10 @@ submitted to the auction (`submit_solver_op` in `runner.rs`):
   simulated gas x `gas_limit_buffer` within the DappControl's `getSolverGasLimit()`, `maxFeePerGas`
   and `deadline` = the auction's, `solver` = the deployed AtlasLiquidationSolver, `control` = the
   DappControl, `userOpHash` = the auction's, `bidToken` = ETH (`address(0)`), `bidAmount` = the bid,
-  `data` = the solver's `solverOpData` (`AtlasSolver::op_data`) with minProfit = the simulated net
-  after the bid x `min_profit_keep`;
+  `data` = the solver's `solverOpData` (`AtlasSolver::op_data`), rebuilt at submission: `gasPayWei`
+  recomputed from the simulated gas (without the `gas_limit_buffer`: see "The bond") and bought
+  together with the bid, any increase over the simulated gas pay taken out of the profit, and
+  minProfit = that net x `min_profit_keep`;
 - the signature: EIP-712 over `SolverOperation(address from,address to,uint256 value,uint256 gas,
   uint256 maxFeePerGas,uint256 deadline,address solver,address control,bytes32 userOpHash,address
   bidToken,uint256 bidAmount,bytes data)` with the domain read at start from the deployed
@@ -629,37 +638,99 @@ submitted to the auction (`submit_solver_op` in `runner.rs`):
   needs another EOA), so an auction's ops are tried most profitable first (profit after the bid)
   until the endpoint accepts one; a refused op gives the block's slot back to the next, and the
   others are journaled with the op that was submitted; the kill-switch file stops
-  submissions; and an op is only submitted while the bond is at least `min_bond_eth` and today's
-  bond shrinkage plus the op's worst-case charge (all of its gas at the auction's max fee plus the
-  escrow surcharge) fits `[atlas.solver] atlas_bond_budget_usd` (see Spending limits). The
-  journal's `solver` field records what was submitted (`submitted`).
+  submissions; and an op is only submitted while the bond is at least `bond_min_eth` and covers
+  the op's maximum liability (else `skipped: "bond_insufficient"` with the liability and the
+  bonded amount). The journal's `solver` field records what was submitted (`submitted`: gas, gas
+  pay, liability, bonded).
 
 At start (`build_submitter`), the bot refuses to submit unless the solver and its liquidator are
-deployed (`[atlas.solver] address`, `liquidator`), the solver's `executor()` is the hot wallet,
-the hot wallet has at least `min_bond_eth` atlETH bonded (`Atlas.balanceOfBonded`), and the
-Atlas domain and the DappControl's gas limit can be read.
+deployed (`[atlas.solver] address`, `liquidator`), the solver's `executor()` is the hot wallet and
+its `PROFIT_RECEIVER()` is not, the hot wallet has at least `bond_min_eth` atlETH bonded
+(`Atlas.balanceOfBonded`), and the Atlas domain and the DappControl's gas terms (solver and dApp gas
+limits, bundler surcharge) can be read.
+
+### The bond: gas paid from the proceeds (`bot/src/atlas_bond.rs`, v0.4.0)
+
+How Atlas charges a solver (checked on the deployed Atlas, `AtlasBondGas.fork.t.sol` replays a real
+Base SVR metacall with our op in the winner's slot):
+
+- **Before it runs an op**, Atlas requires `bonded >= maximum liability` (else the op is skipped
+  with InsufficientEscrow). The liability is computed from gas *limits*: (the op's `gas` + the
+  userOp's gas + the DappControl's dappGasLimit + the metacall overhead) x (1 + Atlas and bundler
+  surcharges) x the gas price. Paying gas in ETH does not lower it: the bond still has to cover the
+  largest op. The bot computes it (`OpGasPrice::liability_wei`, `non_solver_gas`) at the auction's
+  max fee; the userOp gas comes from the feed (`gas`) or `[atlas] user_op_gas`, the dappGasLimit
+  and bundler surcharge from the DappControl. The overhead constant (`LIABILITY_OVERHEAD_GAS`) is
+  above the one measured on the fork, so the check errs on refusing.
+- **The winning op** settles: it calls `reconcile{value: repay + gasPay}(liability - gasPay)`. At
+  the end of the metacall Atlas charges the real gas (used x surcharges x gas price); the ETH the
+  op paid beyond that is credited to the bond, a shortfall is taken from it. So an op that pays
+  about its real gas leaves the bond where it was (fork: within ~1 % of the charge).
+- **A failed op**'s gas is still taken from the bond.
+
+What the bot does:
+
+- **Gas pay.** Valuation: `gasPayWei` = (estimated op gas + `METACALL_FIXED_GAS`) x max fee x (1 +
+  Atlas's and the bundler's surcharges) — exactly the gas every bid basis (batch and single op)
+  already subtracts, from the same per-gas price; the bid swap buys bid + gas pay; the contract
+  pays `min(gasPayWei, Atlas's liability)` (a wrong value cannot overpay). Submission: recomputed
+  from the simulated gas + `METACALL_FIXED_GAS` — Atlas's expected charge for the gas the op uses,
+  not its gas limit (simulated x `gas_limit_buffer`): the proceeds must buy the gas pay, so paying
+  for the buffered limit would take value out of thin ops for nothing; an overpay is credited to
+  the bond, a small shortfall taken from it. `gasPayWei = 0` is the previous behavior (all gas
+  from the bond).
+- **Bundle size from the bond.** A valuation plans an op for at most what the bond affords
+  (`bond_capped_solver_gas`: the largest op gas whose liability the bonded atlETH covers, divided
+  by `gas_limit_buffer`), so a market's bundle shrinks to fit the bond instead of being refused
+  whole. Only in live mode with `submit` (the bond is read there).
+- **The band.** Below `bond_min_eth`: no op is submitted, an alert is logged, and nothing moves
+  out of the bond. Above `bond_max_eth` (overpaid gas accumulates): an alert, or with
+  `bond_auto_withdraw = true` the hot wallet unbonds the excess, waits until Atlas releases it
+  (`unbondingCompleteBlock()`: ESCROW_DURATION blocks after the last change to the bond, which a
+  charge during the wait restarts, plus a few blocks of margin), withdraws it and sends the ETH on
+  to the solver's `PROFIT_RECEIVER` — one step at a time (`next_step`), each a tx through the
+  executor at the normal priority fee, only while nothing else is in flight, in live mode with the
+  kill switch off. Unbonded atlETH the bot did not unbond (an operator's `deposit` not yet bonded)
+  pauses auto-withdraw with an alert: `withdraw` takes that balance first, so the bot would sweep
+  it. The bond tx in flight (its hash) and the withdrawn amount waiting to be sent are kept in the
+  ledger: a tx the executor stops tracking (a restart, or one reported dropped that still landed)
+  is reconciled from its receipt, so a withdrawal is never left in the hot wallet unnoticed and a
+  send never repeated. Bonding stays an operator step.
+- **Results and the ledger.** At each bond reading the bot reads Atlas's `SolverTxResult` logs for
+  its signer (`atlas_op_result`): won ops (and the gas each paid, matched to its submission),
+  failed ones. The ledger's Atlas day attributes each reading's change from the chain state alone:
+  atlETH that moved from bonded to unbonding (an unbond, the bot's or an operator's) is not a loss;
+  a remaining drop is a debit (failed-op gas if the interval had failed ops and no win); a rise is a
+  credit (overpaid gas) only in an interval with a won op, else a deposit, which does not offset the
+  day's losses. Journal: `atlas_bond` per reading (bonded, unbonding, the band, the next step),
+  `atlas_bond_tx` per settled bond tx (`via: "receipt"` when reconciled that way).
+- **Dashboard.** The bond card shows the bonded amount against the band and our ops' results; the
+  paper table adds the result of the one op an auction gets (the submitted one, else the market
+  whose simulated op nets the most), won if that op's own bid beats the winner's, with its
+  simulated net after bid and gas (`net_after_bid_usd`) as the profit.
 
 ### Bidding in SVR auctions: operator steps
 
-The bot never moves funds for Atlas; the operator does, from their own terminal:
+The bot never puts funds into Atlas; the operator does, from their own terminal (the bot only takes an excess back out of the bond, and only with `bond_auto_withdraw`):
 
 1. Deploy `AtlasLiquidationSolver(atlas, weth, owner, executor = hot wallet, profitReceiver =
    cold wallet)` and a `MorphoLiquidator` whose executor and profit receiver are the solver;
    allowlist the liquidator and the bid router on the solver (`setAllowedTarget`), and the exit
    routers on the liquidator; `approveMorpho` the loan tokens on the liquidator.
-2. Bond atlETH from the hot wallet (the EOA that signs the ops), e.g. 0.1 ETH as Chainlink suggests
-   for Base:
-   `cast send <ATLAS> 'depositAndBond(uint256)' 100000000000000000 --value 0.1ether --account bot-hot`.
-   Check with `cast call <ATLAS> 'balanceOfBonded(address)(uint256)' <HOT>`. Atlas charges each op's
-   gas (at the auction's max fee plus its surcharge) against this bond, also when the op fails.
-3. Set `[atlas.solver] simulate = true`, `submit = true`, `address`, `liquidator`, and
-   `min_bond_eth`; start `watch --live` with `exec.mode = "live"`.
-4. Withdraw: `unbond(amount)`, wait `ESCROW_DURATION()` blocks (64 on Base when checked), then
-   `redeem(amount)`.
+2. Bond atlETH from the hot wallet (the EOA that signs the ops): enough to cover the maximum
+   liability of the largest op you want to send (see "The bond"; a smaller bond means smaller
+   bundles), e.g. `cast send <ATLAS> 'depositAndBond(uint256)' <WEI> --value <WEI> --account bot-hot`.
+   Check with `cast call <ATLAS> 'balanceOfBonded(address)(uint256)' <HOT>`. Won ops pay their own
+   gas; failed ops' gas is taken from the bond.
+3. Set `[atlas.solver] simulate = true`, `submit = true`, `address`, `liquidator`, `bond_min_eth`
+   and `bond_max_eth` (optionally `bond_auto_withdraw`); start `watch --live` with `exec.mode =
+   "live"`.
+4. Withdraw by hand: `unbond(amount)`, wait until `unbondingCompleteBlock(<HOT>)` has passed
+   (`ESCROW_DURATION()` blocks, 64 on Base when checked, after the bond's last change), then
+   `withdraw(amount)` (or `redeem` then `withdraw`).
 
-Results can be traced with Fastlane's query API (`solver_getSolverOperationResult`, see the
-Chainlink searcher docs); the bot does not call it yet (reconciliation is planned: until then the
-bond's shrinkage is the only Atlas cost the bot sees).
+Our ops' results are read from Atlas's `SolverTxResult` logs (see "The bond"); Fastlane's query API
+(`solver_getSolverOperationResult`, see the Chainlink searcher docs) is not used.
 
 ### Dashboard and live page
 

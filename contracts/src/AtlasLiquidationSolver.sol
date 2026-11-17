@@ -27,18 +27,23 @@ struct SolverCall {
 /// @title AtlasLiquidationSolver
 /// @notice Solver contract for Chainlink SVR auctions run by Atlas: in the auction winner's slot it
 ///         runs liquidations (`calls`), converts part of the profit to WETH (`bidSwap`) to pay the ETH
-///         bid to the execution environment, settles its gas with Atlas, and keeps the rest.
+///         bid to the execution environment and its own gas to Atlas, and keeps the rest.
 /// @dev Written against the Atlas solver interface (`atlasSolverCall`), not derived from Atlas code.
+///      Gas: the op pays `gasPayWei` of its gas in ETH out of the proceeds (Atlas credits any excess
+///      over the real charge back to the bonded atlETH and takes any shortfall from it), and approves
+///      the rest of Atlas's maximum liability against the bond. With `gasPayWei = 0` the whole gas is
+///      taken from the bond.
 ///      Security model:
 ///      - only ATLAS may call `atlasSolverCall`, and only for a solver operation signed by `executor`
 ///        (the solver op's `from`, our hot wallet); only `owner` changes settings or moves funds;
 ///      - every call target and the bid-swap router must be owner-allowlisted; the bid-swap
 ///        allowance is exact and reset to zero;
 ///      - bids are in ETH only (SVR); the bid goes to the execution environment Atlas names;
-///      - the whole call reverts unless the profit token this call gained, after paying the bid, is
-///        at least `minProfit` (a balance change: tokens a liquidator left here earlier, e.g. its
-///        leftover collateral, never count); the whole profit-token balance and any leftover WETH
-///        then go to PROFIT_RECEIVER.
+///      - the ETH paid for gas never exceeds the gas liability Atlas reports for this op;
+///      - the whole call reverts unless the profit token this call gained, after paying the bid and
+///        the gas, is at least `minProfit` (a balance change: tokens a liquidator left here earlier,
+///        e.g. its leftover collateral, never count); the whole profit-token balance and any leftover
+///        WETH and ETH then go to PROFIT_RECEIVER.
 ///      `atlasSolverCall` returns the net profit (callers that expect no return value ignore it).
 contract AtlasLiquidationSolver {
     address public immutable ATLAS;
@@ -89,7 +94,9 @@ contract AtlasLiquidationSolver {
     /// @param executionEnvironment Receives the bid.
     /// @param bidToken Must be address(0) (ETH).
     /// @param solverOpData abi.encode(SolverCall[] calls, SwapStep bidSwap, address profitToken,
-    ///        uint256 minProfit). `bidSwap.target` = address(0): no swap (the calls leave WETH).
+    ///        uint256 minProfit, uint256 gasPayWei). `bidSwap` buys the bid plus `gasPayWei` of WETH;
+    ///        `bidSwap.target` = address(0): no swap (the calls leave WETH). `gasPayWei`: ETH paid
+    ///        toward this op's gas (capped at Atlas's gas liability); 0 = all of it from the bond.
     function atlasSolverCall(
         address solverOpFrom,
         address executionEnvironment,
@@ -102,8 +109,8 @@ contract AtlasLiquidationSolver {
         if (solverOpFrom != executor) revert InvalidCaller();
         if (paused) revert IsPaused();
         if (bidToken != address(0)) revert UnsupportedBidToken(bidToken);
-        (SolverCall[] memory calls, SwapStep memory bidSwap, address profitToken, uint256 minProfit) =
-            abi.decode(solverOpData, (SolverCall[], SwapStep, address, uint256));
+        (SolverCall[] memory calls, SwapStep memory bidSwap, address profitToken, uint256 minProfit, uint256 gasPayWei) =
+            abi.decode(solverOpData, (SolverCall[], SwapStep, address, uint256, uint256));
         // The liquidators this solver drives send it their leftover collateral, so a later op's
         // profit token may already sit here: only what this call adds is profit.
         uint256 before = IERC20S(profitToken).balanceOf(address(this));
@@ -115,21 +122,25 @@ contract AtlasLiquidationSolver {
         }
         if (bidSwap.target != address(0)) _swap(bidSwap);
 
-        // What Atlas lent (up to the value it sent) is repaid in ETH below: keep it aside, so the
-        // bid never spends it. Unwrap WETH for whatever the ETH balance cannot cover.
-        (, uint256 borrowLiability) = IAtlasEscrow(ATLAS).shortfall();
+        // Both liabilities are fixed for the whole solver operation: the gas one is Atlas's maximum
+        // for this op (from gas limits, not gas used), the borrow one what it lent. What Atlas lent
+        // (up to the value it sent) is repaid in ETH, so the bid never spends it; the gas paid in ETH
+        // never exceeds the liability (a wrong gasPayWei cannot overpay). Unwrap WETH for whatever
+        // the ETH balance cannot cover.
+        (uint256 gasLiability, uint256 borrowLiability) = IAtlasEscrow(ATLAS).shortfall();
         uint256 repay = borrowLiability < msg.value ? borrowLiability : msg.value;
+        uint256 gasPay = gasPayWei < gasLiability ? gasPayWei : gasLiability;
         uint256 eth = address(this).balance;
-        if (eth < bidAmount + repay) IWETHS(WETH).withdraw(bidAmount + repay - eth);
+        if (eth < bidAmount + repay + gasPay) IWETHS(WETH).withdraw(bidAmount + repay + gasPay - eth);
         if (bidAmount > 0) {
             (bool sent,) = executionEnvironment.call{value: bidAmount}("");
             if (!sent) revert EthTransferFailed();
         }
 
-        // Settle with Atlas: repay the borrowed ETH and approve the gas liability (read now, after
-        // all the work) against the solver's bonded balance.
-        (uint256 gasLiability,) = IAtlasEscrow(ATLAS).shortfall();
-        IAtlasEscrow(ATLAS).reconcile{value: repay}(gasLiability);
+        // Settle with Atlas: repay the borrowed ETH, pay `gasPay` of the gas in ETH, and approve the
+        // rest of the gas liability against the solver's bonded balance. At settlement Atlas credits
+        // the bond with what the ETH paid beyond the real gas charge, or takes the shortfall from it.
+        IAtlasEscrow(ATLAS).reconcile{value: repay + gasPay}(gasLiability - gasPay);
 
         uint256 bal = IERC20S(profitToken).balanceOf(address(this));
         profit = bal > before ? bal - before : 0;

@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.4.0 (2026-11-17)
+
+Atlas solver ops pay their own gas out of their proceeds, so the bond no longer shrinks with every
+win. Needs onchain-core v0.1.5. **Breaking: the solver contract's ABI and the `[atlas.solver]` bond
+keys changed — see Migration.**
+
+- Contract: `AtlasLiquidationSolver`'s `solverOpData` gains a fifth field, `gasPayWei`:
+  `abi.encode(calls, bidSwap, profitToken, minProfit, gasPayWei)`. The bid swap buys the bid plus
+  the gas pay; the solver pays `min(gasPayWei, gasLiability)` in ETH through `reconcile` and approves
+  only the rest of Atlas's liability against the bond, so `minProfit` now guards the real net after
+  the bid AND the gas. Atlas credits the bond with what the op paid beyond its real gas charge and
+  takes any shortfall from it; `gasPayWei = 0` is the previous behavior (all gas from the bond).
+  `AtlasStub` reports a gas liability set in its storage slot 0 and keeps the ETH paid, so the
+  simulated profit is net of the gas. New security tests (overpay capped at the liability, minProfit
+  after the gas, a swap that cannot buy bid + gas reverts, nothing left at rest).
+- Verified against the real Atlas escrow on a Base fork (`AtlasBondGas.fork.t.sol`): a real SVR
+  metacall replayed with our op in the winner's slot and only AtlasVerification (signatures, call
+  chain hash) mocked. The bond threshold Atlas checks before running an op matched the one measured
+  on the original metacall (+0.6 %); paying the real gas charge in ETH moved the bond by 1.2 % of the
+  charge; overpaying credited the bond and underpaying charged it by the difference; `gasPayWei = 0`
+  charged the whole gas to the bond.
+- Bot: the gas pay is estimated as (op gas + `METACALL_FIXED_GAS`) at the auction's max fee and
+  Atlas's and the bundler's surcharges — exactly what every bid basis (batch and single-position op)
+  subtracts, from one per-gas price — and recomputed at submission from the simulated gas plus the
+  fixed gas: Atlas's expected charge, not the op's buffered gas limit, since the proceeds must buy it
+  (any increase comes out of the profit before minProfit; an overpay is credited to the bond, a small
+  shortfall taken from it). Before an op is submitted its maximum
+  liability — (op gas + userOp gas + dappGasLimit + overhead) at the max fee and surcharges, the
+  check Atlas makes before running it — must be covered by the bond (else `skipped:
+  "bond_insufficient"`), replacing the daily bond budget; and valuations size each market's bundle
+  to what the bond affords instead of refusing it whole. The userOp gas comes from the auction feed
+  (`gas`) or `[atlas] user_op_gas`; the dappGasLimit and bundler surcharge are read from the
+  DappControl.
+- The bond band: `[atlas.solver] bond_min_eth` (below it no op is submitted, alert, nothing moves
+  out) and `bond_max_eth` (above it the excess is due out: alert, or with `bond_auto_withdraw = true`
+  the hot wallet unbonds it, waits for Atlas's `unbondingCompleteBlock` plus a margin, withdraws it
+  and sends the ETH to the solver's PROFIT_RECEIVER — one step at a time through the executor, only
+  while nothing else is in flight, live mode and kill switch off; paused while the signer holds
+  unbonded atlETH it did not unbond, which `withdraw` would sweep). The bond tx in flight and the
+  withdrawn amount waiting to be sent survive restarts, and a tx the executor stops tracking is
+  reconciled from its receipt. Bonding stays an operator step.
+- Ledger and dashboard: our ops' results are read from Atlas's `SolverTxResult` logs; the ledger's
+  Atlas day keeps apart the gas won ops paid, the bond's credits and debits, failed ops' gas,
+  deposits and unbonding, attributed from the chain state (bonded moved to unbonding — the bot's or
+  an operator's unbond — is not a loss; a rise is a credit only alongside a won op, otherwise a
+  deposit that does not offset losses). The daily loss stop counts the bond's net debits. The
+  journal gains `atlas_bond`, `atlas_op_result`, `atlas_bond_tx` rows and `gas_pay_eth` /
+  `net_after_bid_usd` in solver rows; the dashboard shows the bond against its band and the paper
+  result of the one op each auction gets, with its simulated net after bid and gas.
+- onchain-core v0.1.5: `send_with_value` (the bond's ETH is sent on through the same executor and
+  nonce as every other hot-wallet tx), and `Inflight.value`, reserved by `spendable()`.
+
+### Migration from v0.3.x
+
+1. Redeploy `AtlasLiquidationSolver` (the `solverOpData` layout changed; a v0.3.x solver cannot
+   decode v0.4.0 ops) and point `[atlas.solver] address` at it; redo its allowlist
+   (`setAllowedTarget`: its MorphoLiquidator and the bid router). The MorphoLiquidator is unchanged.
+2. Config `[atlas.solver]`: remove `min_bond_eth` and `atlas_bond_budget_usd` (the bot refuses to
+   start while they are present, naming the replacement); with `submit = true`, set `bond_min_eth`
+   and `bond_max_eth` (required, no defaults, `0 < min < max`), and optionally `bond_auto_withdraw`.
+   Size the bond to cover the largest op you want to send (see docs/architecture.md, "The bond").
+3. Optional `[atlas] user_op_gas` (default 500000) if your auction feed omits the userOp gas.
+4. An existing ledger file loads as is (its Atlas day starts empty).
+
 ## v0.3.2 (2026-11-17)
 
 Fixes from the v0.3.1 GCP shadow run (2026-11-08..13). Needs onchain-core v0.1.4.

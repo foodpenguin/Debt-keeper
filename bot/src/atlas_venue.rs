@@ -5,10 +5,13 @@
 //! to the execution environment and settles with Atlas.
 //!
 //! What is here: encoding the solver call (`atlasSolverCall` + its solverOpData) and simulating it
-//! against `sim/AtlasStub.sol` standing in for the Atlas escrow (no gas liability), so a valuation
-//! can see whether the op would succeed and what it nets after the bid. What is NOT here: building
-//! and signing the `SolverOperation` (EIP-712 over Atlas's typehash) and submitting it to the
-//! auction endpoint; those are a later step.
+//! against `sim/AtlasStub.sol` standing in for the Atlas escrow, so a valuation can see whether the
+//! op would succeed and what it nets after the bid and its gas. The op pays its gas in ETH out of
+//! the proceeds (`gasPayWei`, bought with the bid in one swap); Atlas credits the bond with any
+//! excess over the real charge and takes any shortfall from it. Also the gas maths of an op in a
+//! metacall (`OpGasPrice`): what to pay, and Atlas's maximum liability that the bonded atlETH must
+//! cover before Atlas runs the op. Building, signing and submitting the `SolverOperation` is in
+//! atlas_submit.rs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -76,8 +79,68 @@ pub async fn probe_bid_fees<P: Provider>(p: &P, factory: Address, weth: Address,
 }
 
 /// minProfit inside `atlasSolverCall` calldata: selector + 6 head words, solverOpData's length
-/// word, then its 4th head word (calls offset, bidSwap offset, profitToken, minProfit).
+/// word, then its 4th head word (calls offset, bidSwap offset, profitToken, minProfit, gasPayWei).
 pub const SOLVER_MIN_PROFIT: MinProfitSlot = MinProfitSlot { offset: 4 + 10 * 32, width: 32 };
+
+/// Metacall gas Atlas counts in a solver's maximum liability besides the solver ops' and userOp's
+/// gas limits and the DappControl's dappGasLimit: the bundler's buffer on the tx gas limit (~406k on
+/// the SVR metacalls) plus Atlas's own fixed terms, less the tx's intrinsic calldata cost. Measured
+/// on a real Base metacall (`AtlasBondGas.fork.t.sol`): 485k for a light solver op calldata (a
+/// heavier calldata leaves less); 500k keeps a margin, so the bond check errs on refusing.
+pub const LIABILITY_OVERHEAD_GAS: u64 = 500_000;
+
+/// The metacall gas outside the solver ops that Atlas counts in a solver's maximum liability.
+pub fn non_solver_gas(user_op_gas: u64, dapp_gas_limit: u64) -> u64 {
+    user_op_gas + dapp_gas_limit + LIABILITY_OVERHEAD_GAS
+}
+
+/// What Atlas charges a solver op per unit of gas: the auction's max fee (the real gas price is at
+/// most that) plus the escrow's surcharges (Atlas's and the bundler's, in basis points).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpGasPrice {
+    pub max_fee_wei: u128,
+    pub surcharge_bps: u64,
+}
+
+impl OpGasPrice {
+    /// `surcharge` as a fraction (0.1 = 10 %).
+    pub fn new(max_fee_wei: u128, surcharge: f64) -> Self {
+        Self { max_fee_wei, surcharge_bps: (surcharge * 10_000.0).round().max(0.0) as u64 }
+    }
+
+    /// One unit of gas with surcharges, in wei, rounded up (so gas derived from a budget never
+    /// charges more than the budget).
+    fn per_gas(&self) -> U256 {
+        (U256::from(self.max_fee_wei) * U256::from(10_000 + self.surcharge_bps)).div_ceil(U256::from(10_000u64))
+    }
+
+    fn charge(&self, gas: u64) -> U256 {
+        U256::from(gas) * U256::from(self.max_fee_wei) * U256::from(10_000 + self.surcharge_bps) / U256::from(10_000u64)
+    }
+
+    /// The ETH an op of `op_gas` pays toward its own gas: its gas plus the metacall's fixed gas that
+    /// Atlas charges the winner (METACALL_FIXED_GAS), as the bid basis prices them. Erring high is
+    /// harmless: Atlas credits the excess back to the bond.
+    pub fn gas_pay_wei(&self, op_gas: u64) -> U256 {
+        self.charge(op_gas + METACALL_FIXED_GAS)
+    }
+
+    /// Atlas's maximum gas liability for an op of `op_gas` (its `solverOp.gas`): what the bonded
+    /// atlETH must cover before Atlas runs the op (else InsufficientEscrow).
+    pub fn liability_wei(&self, op_gas: u64, non_solver_gas: u64) -> U256 {
+        self.charge(op_gas + non_solver_gas)
+    }
+
+    /// The largest `solverOp.gas` whose liability `bonded` covers (0 if none).
+    pub fn affordable_op_gas(&self, bonded: U256, non_solver_gas: u64) -> u64 {
+        let per = self.per_gas();
+        if per.is_zero() {
+            return u64::MAX;
+        }
+        let total: u64 = (bonded / per).try_into().unwrap_or(u64::MAX);
+        total.saturating_sub(non_solver_gas)
+    }
+}
 /// Where the solver lives in simulations when no deployed address is configured.
 pub const SIM_SOLVER: Address = address!("00000000000000000000000000000000000b0773");
 /// Receives the bid in simulations (a real metacall names its own execution environment).
@@ -115,15 +178,16 @@ impl AtlasSolver {
     }
 
     /// `atlasSolverCall` for one liquidation (`inner` = MorphoLiquidator calldata) that repays in
-    /// `loan_token` and bids `bid_wei` in ETH; the bid is bought with the loan token unless it is WETH.
-    /// As Atlas calls it in a simulation (execution environment = a placeholder).
-    pub fn calldata(&self, loan_token: Address, inner: &Bytes, bid_wei: U256, min_profit: U256) -> Bytes {
+    /// `loan_token`, bids `bid_wei` in ETH and pays `gas_pay_wei` of its gas in ETH; both are bought
+    /// with the loan token unless it is WETH. As Atlas calls it in a simulation (execution
+    /// environment = a placeholder).
+    pub fn calldata(&self, loan_token: Address, inner: &Bytes, bid_wei: U256, min_profit: U256, gas_pay_wei: U256) -> Bytes {
         IAtlasSolver::atlasSolverCallCall {
             solverOpFrom: self.signer,
             executionEnvironment: SIM_EXECUTION_ENVIRONMENT,
             bidToken: Address::ZERO,
             bidAmount: bid_wei,
-            solverOpData: self.op_data(loan_token, inner, bid_wei, min_profit),
+            solverOpData: self.op_data(loan_token, inner, bid_wei, min_profit, gas_pay_wei),
             extraReturnData: Bytes::new(),
         }
         .abi_encode()
@@ -131,15 +195,17 @@ impl AtlasSolver {
     }
 
     /// The solver operation's `data` (what Atlas hands the solver as `solverOpData`):
-    /// `(calls, bidSwap, profitToken, minProfit)`.
-    pub fn op_data(&self, loan_token: Address, inner: &Bytes, bid_wei: U256, min_profit: U256) -> Bytes {
+    /// `(calls, bidSwap, profitToken, minProfit, gasPayWei)`. The bid swap buys the bid plus the gas
+    /// pay, so changing `gas_pay_wei` (at submit, from the simulated gas) rebuilds both together.
+    pub fn op_data(&self, loan_token: Address, inner: &Bytes, bid_wei: U256, min_profit: U256, gas_pay_wei: U256) -> Bytes {
         let calls = vec![SolverCall { target: self.liquidator.liquidator, data: inner.clone() }];
-        (calls, self.bid_swap(loan_token, bid_wei), loan_token, min_profit).abi_encode_params().into()
+        (calls, self.bid_swap(loan_token, bid_wei + gas_pay_wei), loan_token, min_profit, gas_pay_wei).abi_encode_params().into()
     }
 
-    /// The bid swap: buy `bid_wei` of WETH with the loan token (none if the loan is WETH or no bid).
-    fn bid_swap(&self, loan_token: Address, bid_wei: U256) -> SwapStep {
-        if loan_token == self.weth || bid_wei.is_zero() {
+    /// The bid swap: buy `eth_wei` (bid + gas pay) of WETH with the loan token (none if the loan is
+    /// WETH, unwrapped by the solver, or nothing to buy).
+    fn bid_swap(&self, loan_token: Address, eth_wei: U256) -> SwapStep {
+        if loan_token == self.weth || eth_wei.is_zero() {
             return SwapStep { target: Address::ZERO, tokenIn: Address::ZERO, amountIn: U256::ZERO, data: Bytes::new() };
         }
         let buy = IBidRouter::exactOutputSingleCall {
@@ -148,7 +214,7 @@ impl AtlasSolver {
                 tokenOut: self.weth,
                 fee: alloy::primitives::Uint::from(self.bid_fees.get(&loan_token).copied().unwrap_or(self.bid_fee)),
                 recipient: self.solver,
-                amountOut: bid_wei,
+                amountOut: eth_wei,
                 amountInMaximum: U256::from(u128::MAX),
                 sqrtPriceLimitX96: Default::default(),
             },
@@ -166,29 +232,37 @@ impl AtlasSolver {
         self.liquidator.calldata_batch(&meta.params, &plan.items, plan.flash_assets, &exit, U256::ZERO, deadline_block)
     }
 
-    /// Atlas stand-in + the solver (if not deployed) + its liquidator (if not deployed).
-    fn overrides(&self, extra: &StateOverride) -> StateOverride {
+    /// Atlas stand-in (reporting `gas_liability_wei`, stub storage slot 0) + the solver (if not
+    /// deployed) + its liquidator (if not deployed).
+    pub(crate) fn overrides(&self, extra: &StateOverride, gas_liability_wei: U256) -> StateOverride {
         let mut ov = self.liquidator.overrides(extra);
-        ov.insert(self.atlas, AccountOverride { code: Some(self.stub.clone()), ..Default::default() });
+        let liability = std::iter::once((alloy::primitives::B256::ZERO, alloy::primitives::B256::from(gas_liability_wei))).collect();
+        ov.insert(self.atlas, AccountOverride { code: Some(self.stub.clone()), state: Some(liability), ..Default::default() });
         if let Some(code) = &self.solver_code {
             ov.insert(self.solver, code.account(self.signer, &[self.liquidator.liquidator, self.bid_router]));
         }
         ov
     }
 
-    /// Runs `calldata` as Atlas would call the solver; the profit is the net after the bid.
-    pub async fn simulate_op<P: Provider>(&self, p: &P, calldata: Bytes, block: BlockId, extra: &StateOverride, at: Option<SimAt>, fee: Option<SimFee>) -> Result<SimResult> {
-        let r = sim::simulate_call(p, self.atlas, self.solver, calldata, block, &self.overrides(extra), at, fee, None).await?;
+    /// Runs `calldata` as Atlas would call the solver, the stand-in reporting `gas_liability_wei`
+    /// (so the op pays its gasPayWei, up to it, as on chain); the profit is the net after the bid and
+    /// the gas paid in ETH.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn simulate_op<P: Provider>(&self, p: &P, calldata: Bytes, block: BlockId, extra: &StateOverride, at: Option<SimAt>, fee: Option<SimFee>, gas_liability_wei: U256) -> Result<SimResult> {
+        let r = sim::simulate_call(p, self.atlas, self.solver, calldata, block, &self.overrides(extra, gas_liability_wei), at, fee, None).await?;
         let profit = IAtlasSolver::atlasSolverCallCall::abi_decode_returns(&r.return_data).context("solver returned no profit")?;
         Ok(SimResult { profit, gas_used: r.gas_used, l1_fee_wei: r.l1_fee_wei, block_number: r.block_number, probe_price: None })
     }
 }
 
 /// The solver venue at one bid: what a liquidation planned for this auction would net if carried
-/// by a solver operation bidding `bid_wei`.
+/// by a solver operation bidding `bid_wei` and paying `gas_pay_wei` of its gas in ETH, Atlas
+/// reporting a gas liability of `gas_liability_wei` (its maximum for the op).
 pub struct AtlasBid<'a> {
     pub solver: &'a AtlasSolver,
     pub bid_wei: U256,
+    pub gas_pay_wei: U256,
+    pub gas_liability_wei: U256,
 }
 
 impl LiquidationVenue<Morpho> for AtlasBid<'_> {
@@ -204,15 +278,15 @@ impl LiquidationVenue<Morpho> for AtlasBid<'_> {
 
     fn encode(&self, m: &MarketMeta, user: Address, pair: Pair, seize: U256, repay: U256, route: &ExitRoute, min_profit: U256, deadline_block: u64) -> Payload {
         let inner = self.solver.liquidator.encode(m, user, pair, seize, repay, route, U256::ZERO, deadline_block);
-        Payload { to: self.solver.solver, calldata: self.solver.calldata(pair.debt, &inner.calldata, self.bid_wei, min_profit), min_profit: SOLVER_MIN_PROFIT }
+        Payload { to: self.solver.solver, calldata: self.solver.calldata(pair.debt, &inner.calldata, self.bid_wei, min_profit, self.gas_pay_wei), min_profit: SOLVER_MIN_PROFIT }
     }
 
     async fn simulate<P: Provider>(&self, p: &P, calldata: Bytes, block: BlockId, overrides: &StateOverride, at: Option<SimAt>, fee: Option<SimFee>, _probe: Option<Address>) -> Result<SimResult> {
-        self.solver.simulate_op(p, calldata, block, overrides, at, fee).await
+        self.solver.simulate_op(p, calldata, block, overrides, at, fee, self.gas_liability_wei).await
     }
 
     async fn probe_gas<P: Provider>(&self, p: &P, calldata: Bytes, block: BlockId, overrides: &StateOverride, limits: &[u64]) -> Vec<(u64, bool)> {
-        sim::probe_gas_call(p, self.solver.atlas, self.solver.solver, calldata, block, &self.solver.overrides(overrides), limits).await
+        sim::probe_gas_call(p, self.solver.atlas, self.solver.solver, calldata, block, &self.solver.overrides(overrides, self.gas_liability_wei), limits).await
     }
 }
 
@@ -329,30 +403,66 @@ mod tests {
         assert!(!fits_solver_gas(5_950_000, 6_000_000, 0.9));
     }
 
+    /// The solverOpData tuple: (calls, bidSwap, profitToken, minProfit, gasPayWei).
+    type OpData = (Vec<SolverCall>, SwapStep, Address, U256, U256);
+
     #[test]
-    fn wraps_the_liquidation_in_a_solver_call_that_buys_and_pays_the_bid() {
+    fn wraps_the_liquidation_in_a_solver_call_that_buys_and_pays_the_bid_and_the_gas() {
         let s = solver();
         let usdc = Address::repeat_byte(0x10);
-        let venue = AtlasBid { solver: &s, bid_wei: U256::from(5u8) };
+        let venue = AtlasBid { solver: &s, bid_wei: U256::from(5u8), gas_pay_wei: U256::from(2u8), gas_liability_wei: U256::from(9u8) };
         assert_eq!((venue.target(), venue.swap_recipient()), (SIM_SOLVER, Address::repeat_byte(0x11)), "aggregator routes deliver to the inner liquidator");
         let p = venue.encode(&meta(usdc), Address::repeat_byte(7), crate::morpho::pair_of(&meta(usdc)), U256::from(90u64), U256::from(80u64), &ExitRoute::Packed(Bytes::from_static(&[1, 2])), U256::from(3u8), 9);
         assert_eq!(p.to, SIM_SOLVER);
         let call = IAtlasSolver::atlasSolverCallCall::abi_decode(&p.calldata).unwrap();
         assert_eq!((call.solverOpFrom, call.executionEnvironment, call.bidToken, call.bidAmount), (Address::repeat_byte(0x5e), SIM_EXECUTION_ENVIRONMENT, Address::ZERO, U256::from(5u8)));
-        let (calls, bid_swap, token, min) = <(Vec<SolverCall>, SwapStep, Address, U256)>::abi_decode_params(&call.solverOpData).unwrap();
+        let (calls, bid_swap, token, min, gas_pay) = <OpData>::abi_decode_params(&call.solverOpData).unwrap();
         assert_eq!((calls.len(), calls[0].target), (1, Address::repeat_byte(0x11)), "through the solver's liquidator");
         assert_eq!(calls[0].data[0], 0x00, "the liquidator's packed entry");
-        assert_eq!((bid_swap.target, bid_swap.tokenIn, token, min), (Address::repeat_byte(0x22), usdc, usdc, U256::from(3u8)));
+        assert_eq!((bid_swap.target, bid_swap.tokenIn, token, min, gas_pay), (Address::repeat_byte(0x22), usdc, usdc, U256::from(3u8), U256::from(2u8)));
         let buy = IBidRouter::exactOutputSingleCall::abi_decode(&bid_swap.data).unwrap();
-        assert_eq!((buy.params.tokenOut, buy.params.amountOut, buy.params.recipient), (Address::repeat_byte(0x0e), U256::from(5u8), SIM_SOLVER));
-        // minProfit sits at SOLVER_MIN_PROFIT.
+        assert_eq!((buy.params.tokenOut, buy.params.amountOut, buy.params.recipient), (Address::repeat_byte(0x0e), U256::from(7u8), SIM_SOLVER), "buys the bid plus the gas pay");
+        // minProfit sits at SOLVER_MIN_PROFIT (the gas pay after it is untouched).
         let patched = patch_min_profit(&p.calldata, p.min_profit, U256::from(4242u64)).unwrap();
-        let again = IAtlasSolver::atlasSolverCallCall::abi_decode(&patched).unwrap();
-        assert_eq!(<(Vec<SolverCall>, SwapStep, Address, U256)>::abi_decode_params(&again.solverOpData).unwrap().3, U256::from(4242u64));
-        // A WETH loan (or no bid) needs no bid swap.
-        let weth_loan = s.calldata(Address::repeat_byte(0x0e), &Bytes::new(), U256::from(5u8), U256::ZERO);
+        let again = <OpData>::abi_decode_params(&IAtlasSolver::atlasSolverCallCall::abi_decode(&patched).unwrap().solverOpData).unwrap();
+        assert_eq!((again.3, again.4), (U256::from(4242u64), U256::from(2u8)));
+        // A WETH loan needs no bid swap (the solver unwraps it); a zero bid still buys the gas pay.
+        let weth_loan = s.calldata(Address::repeat_byte(0x0e), &Bytes::new(), U256::from(5u8), U256::ZERO, U256::from(2u8));
         let op = IAtlasSolver::atlasSolverCallCall::abi_decode(&weth_loan).unwrap().solverOpData;
-        assert_eq!(<(Vec<SolverCall>, SwapStep, Address, U256)>::abi_decode_params(&op).unwrap().1.target, Address::ZERO);
+        assert_eq!(<OpData>::abi_decode_params(&op).unwrap().1.target, Address::ZERO);
+        let gas_only = <OpData>::abi_decode_params(&s.op_data(usdc, &Bytes::new(), U256::ZERO, U256::ZERO, U256::from(2u8))).unwrap().1;
+        assert_eq!(IBidRouter::exactOutputSingleCall::abi_decode(&gas_only.data).unwrap().params.amountOut, U256::from(2u8));
+        assert_eq!(<OpData>::abi_decode_params(&s.op_data(usdc, &Bytes::new(), U256::ZERO, U256::ZERO, U256::ZERO)).unwrap().1.target, Address::ZERO, "nothing to buy");
+    }
+
+    #[test]
+    fn the_stub_reports_the_liability_it_is_given() {
+        let s = solver();
+        let ov = s.overrides(&StateOverride::default(), U256::from(12345u64));
+        let stub = ov.get(&Address::repeat_byte(0xa7)).expect("stub at the atlas address");
+        assert_eq!(stub.state.as_ref().unwrap().get(&alloy::primitives::B256::ZERO), Some(&alloy::primitives::B256::from(U256::from(12345u64))), "slot 0 = gasLiability");
+    }
+
+    /// The bond-check maths against the real metacall (`AtlasBondGas.fork.t.sol`): at 15.005 gwei
+    /// and 10 % surcharge, a 2.2M op with userOp 0.5M + dappGasLimit 2M faced a 0.0856 ETH threshold
+    /// (2,985,228 non-solver gas). The bot's liability (500k overhead) must not be below it.
+    #[test]
+    fn op_gas_maths_cover_the_measured_liability() {
+        let price = OpGasPrice::new(15_005_000_000, 0.1);
+        assert_eq!(price.surcharge_bps, 1000);
+        let ns = non_solver_gas(500_000, 2_000_000);
+        assert_eq!(ns, 3_000_000);
+        let liability = price.liability_wei(2_200_000, ns);
+        let measured = U256::from(85_584_793_090_820_312u64);
+        assert!(liability >= measured, "liability {liability} >= measured threshold {measured}");
+        assert!(liability - measured < measured / U256::from(100u64), "within 1 % above it");
+        // Gas pay: (op gas + the metacall's fixed gas) x price x 1.1.
+        assert_eq!(price.gas_pay_wei(170_000), U256::from(600_000u64) * U256::from(15_005_000_000u64) * U256::from(11u64) / U256::from(10u64));
+        // Affordable op gas: the inverse of the liability, never above what the bond covers.
+        let bonded = U256::from(100_000_000_000_000_000u64); // 0.1 ETH
+        let g = price.affordable_op_gas(bonded, ns);
+        assert!(price.liability_wei(g, ns) <= bonded && price.liability_wei(g + 1_000, ns) > bonded, "{g}");
+        assert_eq!(price.affordable_op_gas(U256::from(1u8), ns), 0, "a bond below the non-solver part affords nothing");
     }
 
     #[test]

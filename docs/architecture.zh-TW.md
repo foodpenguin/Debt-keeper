@@ -203,6 +203,7 @@ gas 基準測試在 `contracts/test/MorphoLiquidator.gas.fork.t.sol`（`forge te
 | `flashblocks` | Flashblocks 串流解碼：只剩 examples 在用（Denim 會移除 Flashblocks） |
 | `atlas` | Chainlink SVR / Fastlane Atlas 拍賣串流與估值 |
 | `atlas_submit` | solver operation：EIP-712 簽名、送出（實跑、需明確開啟） |
+| `atlas_bond` | solver 的 atlETH bond：狀態、上下限、自動取出的步驟、我們 op 在 Atlas 的結果 |
 | `loss` | 輸單分析：追蹤市場裡每一筆鏈上清算，和我們當時看到的比較 |
 | `dash/`、`live` | SQLite 歷史資料 + 靜態儀表板；localhost 上的即時 HF 頁面 |
 
@@ -256,10 +257,10 @@ priority fee 依鏈上看到的競爭來決定。追蹤市場裡的每一筆清�
 
 - **單筆**（`[exec] max_tx_cost_eth`，預設 0.002）：區塊路徑交易的最壞成本 `gas_limit × (2 × base fee + priority) + L1 fee` 必須放得進去。出價會被截到放得進；截完低於基本 priority，或不高於預測的對手出價，就不送（送了也是輸）。只在 `send_approved` 檢查一次，在 policy 之後。
 - **每個 UTC 日的失敗 gas**（`[exec] daily_gas_budget_usd`）：在飛的交易先預留最壞成本，revert 時扣實際成本。
-- **每個 UTC 日的 Atlas bond**（`[atlas.solver] atlas_bond_budget_usd`）：當天第一次讀到的 bond 減掉現在的 bond（每 50 個 head 讀一次，op 被接受後也讀），加上下一個 op 的最壞扣款。bond 低於 `min_bond_eth` 時不送 op。
-- **每日虧損**（`[exec] daily_loss_limit_usd`）：已實現損益 = 結算的區塊路徑交易付給 `PROFIT_RECEIVER` 的金額（receipt 裡追蹤市場借款代幣的 ERC20 轉帳）減去 gas，再減去 bond 的減少量。Atlas 的收入不計入（op 在別人的 metacall 裡執行），所以損益只是下限，停機只會提早、不會延遲。超過上限就寫入 kill switch 檔案，要由人刪掉檔案才會恢復送單。
+- **Atlas bond 的上下限**（`[atlas.solver] bond_min_eth` / `bond_max_eth`，沒有預設值，`submit` 時必填）：低於下限就不送 op；每個 op 的最大責任也必須由 bond 蓋住（見下方「bond」一節）。每 `BOND_CHECK_HEADS` 個 head 讀一次，op 被接受後也讀。
+- **每日虧損**（`[exec] daily_loss_limit_usd`）：已實現損益 = 結算的區塊路徑交易付給 `PROFIT_RECEIVER` 的金額（receipt 裡追蹤市場借款代幣的 ERC20 轉帳）減去 gas，再減去 bond 的淨扣除（失敗 op 的 gas、得標 op 付得比實際 gas 費少的部分；bot 自己的 unbond 不算虧損）。Atlas 的收入不計入（op 的利潤從別人的 metacall 裡付給 `PROFIT_RECEIVER`），所以損益只是下限，停機只會提早、不會延遲。超過上限就寫入 kill switch 檔案，要由人刪掉檔案才會恢復送單。
 
-被這些上限擋下的送單會寫進 journal（`kind: "refused"`、`reason`、`worst_eth`、`cap_eth`）。實跑時，當天的失敗 gas、bond 基準和損益存在帳本檔（第一行 `v1`，第二行 JSON；`[exec] ledger_file`，預設和共用的 nonce 檔放在一起），啟動時讀回；讀不懂的檔案會讓實跑拒絕啟動。
+被這些上限擋下的送單會寫進 journal（`kind: "refused"`、`reason`、`worst_eth`、`cap_eth`）。實跑時，當天的失敗 gas、Atlas 當日帳（見下方）、最後一次 bond 讀數、已從 bond 取出但還沒轉出的 ETH，以及損益，存在帳本檔（第一行 `v1`，第二行 JSON；`[exec] ledger_file`，預設和共用的 nonce 檔放在一起），啟動時讀回；讀不懂的檔案會讓實跑拒絕啟動（v0.4.0 以前的帳本照樣讀得懂，Atlas 當日帳從零開始）。
 
 ### 預言機 log 與價格模型（`bot/src/oracle_logs.rs`、`bot/src/oracle.rs`）
 
@@ -277,29 +278,44 @@ Atlas 拍賣用拍賣的 median 估值：`PriceModel::preview` 換掉一個 aggr
 
 在啟用 SVR 的 feed 上，預言機更新後的清算權會透過 Fastlane Atlas 拍賣。這個模組監聽拍賣（`[atlas] observe`），用同一個 planner 在上面的價格模型上對每一場估值（先對整個市場 `quote_bundle`，再逐倉位規劃），寫進 journal（`atlas_auction`，含 `queued_ms` / `bundle_ms` / `value_ms`）；只有實跑模式加上 `[atlas.solver] submit` 才會送出（見下方）。side channel 滿了而被丟掉的拍賣記為 `atlas_dropped`。`value-auction` 可以重播過去的拍賣。出價的基礎是 solver 在 Atlas 收完 gas 費之後能留下的部分：每個市場的 `atlas_net_usd` = 這包的 `gross_usd` 減去它的 `gas_units` × 拍賣的 `maxFeePerGas` × (1 + 附加費)，加總成 `bundle_net_usd`；寫進 journal 的出價是拍賣 policy 對這個淨值的出價（預設 × (1 - `atlas.margin`)）。附加費在啟動時從 escrow 讀取（`getAtlasSurchargeRate`，基數 1e4）；讀不到時用 `[atlas] gas_surcharge`（預設 0.1）。
 
-**Solver venue（`bot/src/atlas_venue.rs`，只模擬）。**設定 `[atlas.solver] simulate = true` 時，每場被估值的拍賣裡，每個市場在 journal 裡會多一個 `solver` 欄位（`runner.rs` 的 `solver_op`）：把最大倉位的直接路由計畫包進 `atlasSolverCall`，出價是（`profit_usd` 減去這個 op 以上述 Atlas 費率計的 gas）× (1 - `atlas.margin`)，並像 Atlas 那樣呼叫來模擬。Atlas 地址上注入 `AtlasStub.sol`（沒有 gas 負債），solver 和它的 MorphoLiquidator 沒部署時也會注入；結果包含這次呼叫的 L1 fee。journal 會記錄出價、op 是否成功，以及扣掉出價後的淨利。`solver_op` 只包直接路由的計畫（既有計畫的聚合器 calldata 是為直接清算合約的地址產生的）；`exec.venue = "flash"` 時整個跳過。`AtlasSolver::calldata` 產生呼叫（借款代幣不是 WETH 時，在 `bid_router` 上用 `exactOutputSingle` 買出價要用的 WETH；minProfit 在 `SOLVER_MIN_PROFIT`）；`AtlasBid { solver, bid_wei }` 實作 `LiquidationVenue<Morpho>`，其 `swap_recipient()` 是 solver 的 MorphoLiquidator，所以 planner 也能直接透過它規劃，包含聚合器路線（路線會送到那個清算合約）。`e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation` 在 anvil fork 上驗證它。
+**Solver venue（`bot/src/atlas_venue.rs`，只模擬）。**設定 `[atlas.solver] simulate = true` 時，每場被估值的拍賣裡，每個市場在 journal 裡會多一個 `solver` 欄位（`runner.rs` 的 `solver_op`）：把最大倉位的直接路由計畫包進 `atlasSolverCall`，出價是（`profit_usd` 減去這個 op 以上述 Atlas 費率計的 gas）× (1 - `atlas.margin`)，並像 Atlas 那樣呼叫來模擬。Atlas 地址上注入 `AtlasStub.sol`（在 storage slot 0 回報 bot 為這個 op 算出的 gas 責任），solver 和它的 MorphoLiquidator 沒部署時也會注入；結果包含這次呼叫的 L1 fee。op 用賣出所得以 ETH 付自己的 gas（`gasPayWei`，見「bond」一節），所以 journal 裡扣掉出價後的淨利（`net_after_bid`、`net_after_bid_usd`）也已經扣掉 gas（`gas_pay_eth`）。`solver_op` 只包直接路由的計畫（既有計畫的聚合器 calldata 是為直接清算合約的地址產生的）；`exec.venue = "flash"` 時整個跳過。`AtlasSolver::calldata` 產生呼叫（借款代幣不是 WETH 時，在 `bid_router` 上用一次 `exactOutputSingle` 買出價加 gas 要用的 WETH；minProfit 在 `SOLVER_MIN_PROFIT`）；`AtlasBid { solver, bid_wei, gas_pay_wei, gas_liability_wei }` 實作 `LiquidationVenue<Morpho>`，其 `swap_recipient()` 是 solver 的 MorphoLiquidator，所以 planner 也能直接透過它規劃，包含聚合器路線（路線會送到那個清算合約）。`e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation` 在 anvil fork 上驗證它。
 
 **送出 solver operation（`bot/src/atlas_submit.rs`）。**在實跑模式下設定 `[atlas.solver] submit = true` 時，扣掉出價後模擬仍有利潤的 solver op 會被組出、簽名並送到拍賣（`runner.rs` 的 `submit_solver_op`）：
 
-- op 本身：`from` = 熱錢包（必須是 solver 的 `executor`）、`to` = Atlas、`gas` = 模擬 gas × `gas_limit_buffer`，不超過 DappControl 的 `getSolverGasLimit()`、`maxFeePerGas` 和 `deadline` = 拍賣的值、`solver` = 已部署的 AtlasLiquidationSolver、`control` = DappControl、`userOpHash` = 拍賣的值、`bidToken` = ETH（`address(0)`）、`bidAmount` = 出價、`data` = solver 的 `solverOpData`（`AtlasSolver::op_data`），其中 minProfit = 扣掉出價後的模擬淨利 × `min_profit_keep`；
+- op 本身：`from` = 熱錢包（必須是 solver 的 `executor`）、`to` = Atlas、`gas` = 模擬 gas × `gas_limit_buffer`，不超過 DappControl 的 `getSolverGasLimit()`、`maxFeePerGas` 和 `deadline` = 拍賣的值、`solver` = 已部署的 AtlasLiquidationSolver、`control` = DappControl、`userOpHash` = 拍賣的值、`bidToken` = ETH（`address(0)`）、`bidAmount` = 出價、`data` = solver 的 `solverOpData`（`AtlasSolver::op_data`），送單時重建：`gasPayWei` 用模擬 gas 重算（不乘 `gas_limit_buffer`，見「bond」一節），和出價一起買；比模擬時多出來的 gas 從利潤扣掉，minProfit = 這個淨利 × `min_profit_keep`；
 - 簽名：對 `SolverOperation(address from,address to,uint256 value,uint256 gas,uint256 maxFeePerGas,uint256 deadline,address solver,address control,bytes32 userOpHash,address bidToken,uint256 bidAmount,bytes data)` 做 EIP-712 簽名，domain 在啟動時從已部署的 AtlasVerification 讀取（`Atlas.VERIFICATION()`、`eip712Domain()`：name `AtlasVerification`、它的 version、chain id、verifying contract）；格式是原始的 `r || s || v`，v = 27 / 28，和 Fastlane 的 atlas-sdk-go 簽法相同。digest 會和 Base 上 `AtlasVerification.getSolverPayload(op)` 的結果核對（單元測試用一個記錄下來的值，`e2e_solver_op_digest_matches_atlas_verification` 用隨機的 op）；
 - 送出：以 JSON-RPC `solver_submitSolverOperation` 把 `[{ auction_id, auction_solution }]` 送到 `[atlas.solver] endpoint`（預設是 Chainlink SVR 的出價端點），op 用 SDK 的 `SolverOperationRaw` 格式（hex 數值）。在本地的 mock 端點上測試；
-- 規則：每個 EOA 每個區塊一個 op（Atlas 只保留一個；同一個區塊的第二場拍賣需要另一個 EOA），所以一場拍賣的 op 依扣掉出價後的利潤由高到低嘗試，直到端點接受其中一個；被拒絕的 op 會把這個區塊的名額讓給下一個，其餘的在 journal 記下實際送出的是哪一個；緊急停止檔案會停止送出；op 只有在 bond 不低於 `min_bond_eth`，而且當天 bond 的減少量加上這個 op 的最壞扣款（全部 gas 以拍賣的 max fee 加上 escrow 附加費計）放得進 `[atlas.solver] atlas_bond_budget_usd` 時才送出（見「花費上限」）。journal 的 `solver` 欄位記錄送出了什麼（`submitted`）。
+- 規則：每個 EOA 每個區塊一個 op（Atlas 只保留一個；同一個區塊的第二場拍賣需要另一個 EOA），所以一場拍賣的 op 依扣掉出價後的利潤由高到低嘗試，直到端點接受其中一個；被拒絕的 op 會把這個區塊的名額讓給下一個，其餘的在 journal 記下實際送出的是哪一個；緊急停止檔案會停止送出；op 只有在 bond 不低於 `bond_min_eth`，而且蓋得住這個 op 的最大責任時才送出（否則記 `skipped: "bond_insufficient"`，附上責任和 bonded）。journal 的 `solver` 欄位記錄送出了什麼（`submitted`：gas、gas pay、責任、bonded）。
 
-啟動時（`build_submitter`），以下條件沒有全部成立，bot 就拒絕送出：solver 和它的清算合約已部署（`[atlas.solver] address`、`liquidator`）、solver 的 `executor()` 是熱錢包、熱錢包至少 bond 了 `min_bond_eth` 的 atlETH（`Atlas.balanceOfBonded`）、讀得到 Atlas 的 domain 和 DappControl 的 gas 上限。
+啟動時（`build_submitter`），以下條件沒有全部成立，bot 就拒絕送出：solver 和它的清算合約已部署（`[atlas.solver] address`、`liquidator`）、solver 的 `executor()` 是熱錢包而 `PROFIT_RECEIVER()` 不是、熱錢包至少 bond 了 `bond_min_eth` 的 atlETH（`Atlas.balanceOfBonded`）、讀得到 Atlas 的 domain 和 DappControl 的 gas 參數（solver 和 dApp 的 gas 上限、bundler 附加費）。
+
+### bond：用賣出所得付 gas（`bot/src/atlas_bond.rs`，v0.4.0）
+
+Atlas 怎麼向 solver 收費（已在部署的 Atlas 上查證；`AtlasBondGas.fork.t.sol` 重播一筆真實的 Base SVR metacall，把得標者的位置換成我們的 op）：
+
+- **執行 op 之前**，Atlas 要求 `bonded >= 最大責任`（不足就以 InsufficientEscrow 跳過這個 op）。責任是用 gas **上限**算的：（op 的 `gas` + userOp 的 gas + DappControl 的 dappGasLimit + metacall 額外開銷）×（1 + Atlas 和 bundler 附加費）× gas price。用 ETH 付 gas 不會降低它：bond 仍然要蓋過最大的 op。bot 以拍賣的 max fee 計算它（`OpGasPrice::liability_wei`、`non_solver_gas`）；userOp 的 gas 來自拍賣串流（`gas`）或 `[atlas] user_op_gas`，dappGasLimit 和 bundler 附加費來自 DappControl。額外開銷常數（`LIABILITY_OVERHEAD_GAS`）高於 fork 實測值，所以檢查寧可多擋。
+- **得標的 op** 結算時呼叫 `reconcile{value: repay + gasPay}(liability - gasPay)`。metacall 結束時 Atlas 收實際的 gas 費（用量 × 附加費 × gas price）；op 付的 ETH 超過的部分加回 bond，不足的部分從 bond 扣。所以付的 ETH 接近實際 gas 費時，bond 幾乎不動（fork 上約在 gas 費的 1% 內）。
+- **失敗的 op** 的 gas 仍然從 bond 扣。
+
+bot 做的事：
+
+- **gas pay。**估值時：`gasPayWei` =（估計的 op gas + `METACALL_FIXED_GAS`）× max fee ×（1 + Atlas 和 bundler 附加費），和每個出價基準（批次和單一部位的 op 都一樣）已經扣掉的 gas 完全相同，用同一個每單位 gas 價格算；bid swap 一次買出價加 gas pay；合約付 `min(gasPayWei, Atlas 的責任)`（參數錯誤也不會多付）。送單時用模擬 gas + `METACALL_FIXED_GAS` 重算：也就是 Atlas 對這個 op 實際用掉的 gas 預期會收的費用，而不是它的 gas 上限（模擬 × `gas_limit_buffer`）。gas pay 必須由賣出所得買到，替有 buffer 的上限付錢只會白白吃掉薄利 op 的利潤；多付的加回 bond，少量不足從 bond 扣。`gasPayWei = 0` 就是舊行為（全部從 bond 扣）。
+- **依 bond 決定批次大小。**估值時規劃的 op 不超過 bond 負擔得起的大小（`bond_capped_solver_gas`：bonded atlETH 蓋得住責任的最大 op gas，再除以 `gas_limit_buffer`），所以市場的批次會縮小到 bond 付得起，而不是整筆放棄。只在實跑加上 `submit` 時（那時才會讀 bond）。
+- **上下限。**低於 `bond_min_eth`：不送 op、告警，也不從 bond 取出任何東西。高於 `bond_max_eth`（多付的 gas 會累積）：告警；或在 `bond_auto_withdraw = true` 時由熱錢包 unbond 超出的量，等 Atlas 放行（`unbondingCompleteBlock()`：bond 最後一次變動後 ESCROW_DURATION 個區塊，等待期間被扣款會重新計時，再多留幾個區塊的餘裕），withdraw，再把 ETH 轉到 solver 的 `PROFIT_RECEIVER`。一次一步（`next_step`），每一步都是經過 executor、用一般 priority fee 的交易，只在沒有其他交易在途、實跑且 kill switch 沒開時執行。如果有不是 bot unbond 的 free atlETH（操作者 `deposit` 了還沒 bond），自動取出會暫停並告警，因為 `withdraw` 會先扣這筆餘額，bot 會把它一起掃走。在途的 bond 交易（含 hash）和已取出待轉出的金額都存在帳本：executor 不再追蹤的交易（重啟，或被判定掉單但實際上鏈）會用 receipt 對帳，所以提領出來的 ETH 不會悄悄留在熱錢包，轉帳也不會重複。bond（存入）仍然是操作者的步驟。
+- **結果和帳本。**每次讀 bond 時，bot 也讀 Atlas 對我們簽名者的 `SolverTxResult` log（`atlas_op_result`）：得標的 op（以及各自付的 gas，對回送出的紀錄）和失敗的 op。帳本的 Atlas 當日帳只用鏈上狀態歸因每次讀數的變化：從 bonded 移到 unbonding 的 atlETH（不論是 bot 或操作者 unbond 的）不算虧損；剩下的減少算扣除（期間只有失敗、沒有得標的算失敗 op 的 gas）；增加只有在期間有得標時才算加回（多付的 gas），否則算存入，不會抵銷當天的虧損。journal：每次讀數一筆 `atlas_bond`（bonded、unbonding、上下限、下一步），每筆結算的 bond 交易一筆 `atlas_bond_tx`（用 receipt 對帳的標 `via: "receipt"`）。
+- **儀表板。**bond 卡片顯示 bonded 在上下限之間的位置和我們 op 的結果；紙上交易表多一列：每場拍賣只算實際會送的那一個 op（有送出的就用它，否則用模擬淨利最高的市場），以它自己的出價判斷輸贏，利潤用它模擬的扣出價和 gas 後淨利（`net_after_bid_usd`）。
 
 ### SVR 拍賣出價：操作者步驟
 
-bot 從不為 Atlas 移動資金；這些都由操作者在自己的終端機執行：
+bot 從不把資金放進 Atlas；這些都由操作者在自己的終端機執行（bot 只會在開啟 `bond_auto_withdraw` 時，把超出上限的 bond 取出）：
 
 1. 部署 `AtlasLiquidationSolver(atlas, weth, owner, executor = hot wallet, profitReceiver = cold wallet)`，以及一個 executor 和利潤接收者都是 solver 的 `MorphoLiquidator`；在 solver 上把清算合約和出價 router 加入白名單（`setAllowedTarget`），在清算合約上把出場 router 加入白名單；在清算合約上對借款代幣呼叫 `approveMorpho`。
-2. 從熱錢包（簽 op 的 EOA）bond atlETH，例如 Chainlink 建議 Base 用的 0.1 ETH：
-   `cast send <ATLAS> 'depositAndBond(uint256)' 100000000000000000 --value 0.1ether --account bot-hot`。
-   用 `cast call <ATLAS> 'balanceOfBonded(address)(uint256)' <HOT>` 確認。Atlas 會從這筆 bond 扣每個 op 的 gas（以拍賣的 max fee 加上它的附加費計），op 失敗時也會扣。
-3. 設定 `[atlas.solver] simulate = true`、`submit = true`、`address`、`liquidator` 和 `min_bond_eth`；以 `exec.mode = "live"` 啟動 `watch --live`。
-4. 提領：`unbond(amount)`，等 `ESCROW_DURATION()` 個區塊（查詢時 Base 上是 64），再 `redeem(amount)`。
+2. 從熱錢包（簽 op 的 EOA）bond atlETH：數量要蓋得住你想送的最大 op 的最大責任（見「bond」一節；bond 越小，批次越小），例如 `cast send <ATLAS> 'depositAndBond(uint256)' <WEI> --value <WEI> --account bot-hot`。
+   用 `cast call <ATLAS> 'balanceOfBonded(address)(uint256)' <HOT>` 確認。得標的 op 自己付 gas；失敗 op 的 gas 從 bond 扣。
+3. 設定 `[atlas.solver] simulate = true`、`submit = true`、`address`、`liquidator`、`bond_min_eth` 和 `bond_max_eth`（可選 `bond_auto_withdraw`）；以 `exec.mode = "live"` 啟動 `watch --live`。
+4. 手動提領：`unbond(amount)`，等 `unbondingCompleteBlock(<HOT>)` 過了（bond 最後一次變動後 `ESCROW_DURATION()` 個區塊，查詢時 Base 上是 64），再 `withdraw(amount)`（或先 `redeem` 再 `withdraw`）。
 
-結果可以用 Fastlane 的查詢 API 追蹤（`solver_getSolverOperationResult`，見 Chainlink 的 searcher 文件）；bot 目前還不會呼叫它（對帳之後才會做；在那之前，bot 唯一看得到的 Atlas 成本是 bond 的減少量）。
+我們 op 的結果從 Atlas 的 `SolverTxResult` log 讀取（見「bond」一節）；不使用 Fastlane 的查詢 API（`solver_getSolverOperationResult`，見 Chainlink 的 searcher 文件）。
 
 ### 儀表板和即時頁面
 

@@ -33,6 +33,8 @@ pub struct Auction {
     /// Last block the bundle may land in.
     pub deadline: u64,
     pub max_fee_per_gas: u128,
+    /// The userOp's gas limit when the feed carries it (part of every solver's maximum liability).
+    pub user_op_gas: Option<u64>,
     pub user_op_hash: B256,
     pub seen: Instant,
     /// Wall-clock arrival (unix ms), to place it against on-chain times.
@@ -59,6 +61,8 @@ struct PartialUserOp {
     control: Address,
     deadline: String,
     max_fee_per_gas: String,
+    #[serde(default)]
+    gas: Option<String>,
     user_op_hash: B256,
     hints: Hints,
 }
@@ -87,6 +91,7 @@ pub fn parse(text: &str, chain_id: u64, control: Address, seen: Instant) -> Opti
         median: U256::from_str_radix(op.hints.median_price.trim_start_matches("0x"), 16).ok()?,
         deadline: hex_u128(&op.deadline)? as u64,
         max_fee_per_gas: hex_u128(&op.max_fee_per_gas)?,
+        user_op_gas: op.gas.as_deref().and_then(hex_u128).map(|g| g as u64),
         user_op_hash: op.user_op_hash,
         seen,
         seen_unix_ms: crate::gates::unix_ms(),
@@ -161,6 +166,7 @@ mod tests {
         assert_eq!(a.aggregator, address!("fa9ebD1FC381C5Babb495BB53664ae9B6665E4E4"));
         assert_eq!(a.median, U256::from(127_840_411u64));
         assert_eq!((a.deadline, a.max_fee_per_gas), (0x324c1a0, 0x29b92700));
+        assert_eq!(a.user_op_gas, Some(500_000), "the userOp gas limit, when the feed has it");
         // Arbitrum (0xa4b1) or another control: ignored. Subscription ack: ignored.
         assert!(parse(&msg("0xa4b1", "0xa5e1a36938769cbd5a26f5e19d8fcb379f597c83"), 8453, BASE_CONTROL, t).is_none());
         assert!(parse(&msg("0x2105", "0xe15bba987c002ecc3586e81244517877d294d291"), 8453, BASE_CONTROL, t).is_none());

@@ -41,6 +41,10 @@ contract MockAtlas {
         borrowLiability = b;
     }
 
+    function setGasLiability(uint256 g) external {
+        gasLiability = g;
+    }
+
     function shortfall() external view returns (uint256, uint256) {
         return (gasLiability, borrowLiability);
     }
@@ -77,10 +81,81 @@ contract AtlasLiquidationSolverSecurityTest is Test {
 
     /// The liquidation leaves `gain` USDC; `swapIn` of it is swapped 1:1 into WETH for the bid.
     function _data(uint256 gain, uint256 swapIn, uint256 minProfit) internal view returns (bytes memory) {
+        return _dataGas(gain, swapIn, minProfit, 0);
+    }
+
+    /// As `_data`, paying `gasPay` of the op's gas in ETH (the swap must also buy it).
+    function _dataGas(uint256 gain, uint256 swapIn, uint256 minProfit, uint256 gasPay) internal view returns (bytes memory) {
         SolverCall[] memory calls = new SolverCall[](1);
         calls[0] = SolverCall({target: address(liquidation), data: abi.encodeCall(MockLiquidation.pay, (usdc, address(solver), gain))});
         SwapStep memory bidSwap = SwapStep({target: address(router), tokenIn: address(usdc), amountIn: swapIn, data: abi.encodeCall(MockRouter.swap, (usdc, MockERC20(address(weth)), swapIn))});
-        return abi.encode(calls, bidSwap, address(usdc), minProfit);
+        return abi.encode(calls, bidSwap, address(usdc), minProfit, gasPay);
+    }
+
+    function _nothingAtRest() internal view {
+        assertEq(usdc.balanceOf(address(solver)) + weth.balanceOf(address(solver)) + address(solver).balance, 0, "nothing at rest");
+    }
+
+    /// The op pays part of its gas in ETH bought with the proceeds and approves the rest of Atlas's
+    /// liability against the bond.
+    function test_paysItsGasInEthOutOfTheProceeds() public {
+        atlas.setGasLiability(50e6);
+        // 1000 gained; 100 bid + 30 gas bought with 130 USDC.
+        uint256 net = atlas.solve(solver, signer, ee, address(0), 100e6, _dataGas(1_000e6, 130e6, 870e6, 30e6));
+        assertEq(net, 870e6, "the profit is net of the bid and the gas");
+        assertEq(ee.balance, 100e6, "bid paid");
+        assertEq(atlas.reconciledValue(), 30e6, "gas paid in ETH");
+        assertEq(address(atlas).balance, 30e6);
+        assertEq(atlas.reconciledGas(), 20e6, "the rest of the liability approved against the bond");
+        assertEq(usdc.balanceOf(receiver), 870e6);
+        _nothingAtRest();
+    }
+
+    /// A gasPayWei above Atlas's liability (a wrong parameter) pays only the liability; the extra
+    /// WETH bought goes to the receiver, not to Atlas, and nothing stays here.
+    function test_gasPayAboveTheLiabilityPaysOnlyTheLiability() public {
+        atlas.setGasLiability(20e6);
+        uint256 net = atlas.solve(solver, signer, ee, address(0), 100e6, _dataGas(1_000e6, 150e6, 0, 50e6));
+        assertEq(atlas.reconciledValue(), 20e6, "capped at the liability");
+        assertEq(atlas.reconciledGas(), 0, "nothing left to approve against the bond");
+        assertEq(net, 850e6);
+        assertEq(weth.balanceOf(receiver), 30e6, "the WETH bought beyond the liability is swept");
+        _nothingAtRest();
+    }
+
+    /// minProfit is the real net: after the bid AND the gas paid in ETH.
+    function test_minProfitIsCheckedAfterTheGas() public {
+        atlas.setGasLiability(50e6);
+        vm.expectRevert(abi.encodeWithSelector(AtlasLiquidationSolver.InsufficientProfit.selector, 850e6, 851e6));
+        atlas.solve(solver, signer, ee, address(0), 100e6, _dataGas(1_000e6, 150e6, 851e6, 50e6));
+    }
+
+    /// The swap must buy the bid plus the gas: 120 WETH cannot fund a 100 bid and 50 of gas.
+    function test_aBidPlusGasTheSwapCannotFundReverts() public {
+        atlas.setGasLiability(50e6);
+        vm.expectRevert();
+        atlas.solve(solver, signer, ee, address(0), 100e6, _dataGas(1_000e6, 120e6, 0, 50e6));
+    }
+
+    /// gasPayWei = 0: the previous behavior, the whole liability approved against the bond.
+    function test_zeroGasPayLeavesTheWholeGasToTheBond() public {
+        atlas.setGasLiability(50e6);
+        atlas.solve(solver, signer, ee, address(0), 100e6, _dataGas(1_000e6, 100e6, 900e6, 0));
+        assertEq(atlas.reconciledValue(), 0, "no ETH for gas");
+        assertEq(atlas.reconciledGas(), 50e6, "the whole liability against the bond");
+        _nothingAtRest();
+    }
+
+    /// Borrowed ETH, the bid and the gas all come out of the same unwrap, each to its own place.
+    function test_borrowBidAndGasAreSettledTogether() public {
+        atlas.setGasLiability(50e6);
+        atlas.setBorrow(3e6);
+        vm.deal(address(this), 3e6);
+        atlas.solve{value: 3e6}(solver, signer, ee, address(0), 100e6, _dataGas(1_000e6, 140e6, 0, 40e6));
+        assertEq(ee.balance, 100e6, "bid paid");
+        assertEq(atlas.reconciledValue(), 43e6, "the loan back plus 40 of gas");
+        assertEq(atlas.reconciledGas(), 10e6);
+        _nothingAtRest();
     }
 
     function test_runsTheLiquidationPaysTheEthBidSettlesAndKeepsTheRest() public {

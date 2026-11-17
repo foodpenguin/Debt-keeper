@@ -163,10 +163,11 @@ eager_hedge_max_in_flight = 2  # valuation sims hedged to a 2nd endpoint at once
 max_concurrent = 1             # valuations at once (they share the RPC pool)
 paper_margins = [0.01, 0.05, 0.1]   # dashboard paper trading: bid = bundle net x (1 - m) vs the decoded winning bid
 paper_deadline_ms = 2000       # a valuation later than this after the auction could not have bid in time
+# user_op_gas = 500000         # the auctioned userOp's gas limit when the feed message omits it (bond check)
 
 # The AtlasLiquidationSolver venue. simulate: the top position of each valued auction is also wrapped
 # into a solver operation (bid from the auction policy, default its net x (1 - margin)) and simulated
-# against an Atlas stand-in; the net after the bid is journaled. submit (live only, `watch --live`):
+# against an Atlas stand-in; the net after the bid and its gas is journaled. submit (live only, `watch --live`):
 # the op is also signed and sent to the SVR bid endpoint (needs the deployed solver and a bond).
 [atlas.solver]
 simulate = false
@@ -178,8 +179,14 @@ simulate = false
 # bid_fee = 500                # fallback fee tier of the loan token / WETH pool the bid is bought in
 # bid_factory = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"   # Uni V3 factory: probed for the deepest bid pool per loan token
 # bid_fee_tiers = [500, 3000, 100, 10000]   # candidate bid-pool fee tiers probed at startup (deepest wins)
-# min_bond_eth = 0.01          # below this atlETH bond no op is submitted (checked at start and every 50 heads)
-# atlas_bond_budget_usd = 2.0  # most the bond may shrink in a UTC day before ops stop until the next day
+# The op pays its own gas in ETH out of its proceeds; Atlas credits the bond with any excess over the
+# real charge and takes any shortfall from it. Before running an op Atlas needs the bonded atlETH to
+# cover its maximum liability (op gas + userOp gas + dappGasLimit + ~0.5M, at the max fee + surcharge):
+# larger bundles need a larger bond. Required with submit = true (no defaults; pick your own numbers):
+# bond_min_eth = 0.0           # below this bonded atlETH no op is submitted and an alert is logged
+# bond_max_eth = 0.0           # above this the excess is due to leave the bond (alert, or auto-withdraw)
+# bond_auto_withdraw = false   # above bond_max_eth: unbond the excess, wait ESCROW_DURATION, withdraw it
+#                              # and send the ETH to PROFIT_RECEIVER (live, kill switch off)
 
 # `bot dashboard`: durable SQLite history + data/dashboard.html.
 [dashboard]

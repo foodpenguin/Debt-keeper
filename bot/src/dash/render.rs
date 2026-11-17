@@ -95,6 +95,7 @@ pub fn page(db: &Connection, cfg: &Config) -> Result<String> {
         "auctions": auctions(db, &clock, since, eth_usd)?,
         "auction_days": auction_days(db, &clock, since)?,
         "paper": paper(db, &clock, since, cfg)?,
+        "bond": bond(db)?,
         "exits": exits(db, &clock, since)?,
         "rpc": rpc(db, &clock)?,
     });
@@ -341,13 +342,73 @@ fn paper(db: &Connection, clock: &Clock, since: f64, cfg: &Config) -> Result<Val
     let pct = |p: f64| (!ratios.is_empty()).then(|| ratios[((ratios.len() as f64 * p) as usize).min(ratios.len() - 1)]);
     let fast = rows.iter().filter(|r| r.3.is_some_and(|ms| ms <= deadline)).count();
     let band_names = ["<$50", "$50-1k", "$1k-5k", ">$5k"];
+    let real = paper_real(&rows, deadline);
     Ok(json!({
-        "auctions": rows.len(), "legacy_auctions": legacy, "in_time": fast, "deadline_ms": deadline, "m1": m1, "margins": margins,
+        "auctions": rows.len(), "legacy_auctions": legacy, "in_time": fast, "deadline_ms": deadline, "m1": m1, "margins": margins, "real": real,
         "markets": markets.iter().map(|(k, v)| json!({ "market": k, "n": v.0, "wins": v.1, "pnl": v.2, "ours": v.3, "win_usd": v.4 })).collect::<Vec<_>>(),
         "days": days.iter().map(|(d, v)| json!([d, v.0, v.1, v.2])).collect::<Vec<_>>(),
         "bands": bands.iter().zip(band_names).map(|(v, n)| json!({ "band": n, "n": v.0, "wins": v.1, "pnl": v.2 })).collect::<Vec<_>>(),
         "sim": { "total": sim_total, "ok": sim_ok, "gas_ratio_p50": pct(0.5), "gas_ratio_p90": pct(0.9) },
         "first_head": rows.first().map(|r| r.0),
+    }))
+}
+
+/// The paper result of the op we would actually send, with its simulated net as the profit: since
+/// v0.4.0 the op pays its own gas, so `net_after_bid_usd` is the real net after the bid AND the gas
+/// (the margin table is net-estimate minus a hypothetical bid). An auction gets ONE op (one per
+/// block per EOA): the one submitted if the row says so, else the market whose simulated op nets
+/// the most. Won = that op's own bid beats the winning one. Only auctions with such an op (a v0.4.0+
+/// valuation) count (`n`), so older journals are left out rather than mixed in.
+fn paper_real(rows: &[PaperRow], deadline_ms: i64) -> Value {
+    let (mut n, mut wins, mut pnl, mut wins_t, mut pnl_t) = (0i64, 0i64, 0.0f64, 0i64, 0.0f64);
+    for (_, _, eth_usd, ms, js, win_eth, _, _) in rows {
+        let j: Value = serde_json::from_str(js).unwrap_or_default();
+        // (net, bid USD, submitted) of each market's simulated op that would pay.
+        let ops: Vec<(f64, f64, bool)> = j["markets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| &m["solver"])
+            .filter(|s| s["ok"].as_bool() == Some(true))
+            .filter_map(|s| Some((s["net_after_bid_usd"].as_f64()?, s["bid_usd"].as_f64()?, s["submitted"]["ok"].as_bool() == Some(true))))
+            .collect();
+        let op = ops.iter().find(|o| o.2).or_else(|| ops.iter().max_by(|a, b| a.0.total_cmp(&b.0)));
+        let Some(&(net, bid_usd, _)) = op.filter(|_| *eth_usd > 0.0) else { continue };
+        n += 1;
+        if bid_usd / eth_usd <= *win_eth {
+            continue;
+        }
+        wins += 1;
+        pnl += net;
+        if ms.is_some_and(|ms| ms <= deadline_ms) {
+            wins_t += 1;
+            pnl_t += net;
+        }
+    }
+    json!({ "n": n, "wins": wins, "pnl": pnl, "wins_t": wins_t, "pnl_t": pnl_t })
+}
+
+/// The solver's atlETH bond: the latest reading against the band (`atlas_bond` journal rows), its
+/// recent history, and our ops' results (`atlas_op_result`): won, failed, gas paid in ETH.
+fn bond(db: &Connection) -> Result<Value> {
+    let mut q = db.prepare("SELECT block, json FROM journal_other WHERE kind = 'atlas_bond' ORDER BY block DESC LIMIT 500")?;
+    let readings: Vec<(i64, Value)> = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, serde_json::from_str::<Value>(&r.get::<_, String>(1)?).unwrap_or_default())))?.collect::<rusqlite::Result<_>>()?;
+    let Some((_, latest)) = readings.first() else { return Ok(Value::Null) };
+    let series: Vec<Value> = readings.iter().rev().map(|(b, j)| json!([b, j["bonded_eth"]])).collect();
+    let mut q = db.prepare("SELECT json FROM journal_other WHERE kind = 'atlas_op_result'")?;
+    let (mut won, mut failed, mut gas_paid) = (0i64, 0i64, 0.0f64);
+    for j in q.query_map([], |r| r.get::<_, String>(0))? {
+        let j: Value = serde_json::from_str(&j?).unwrap_or_default();
+        if j["success"].as_bool() == Some(true) {
+            won += 1;
+            gas_paid += j["gas_pay_eth"].as_f64().unwrap_or(0.0);
+        } else {
+            failed += 1;
+        }
+    }
+    Ok(json!({
+        "bonded": latest["bonded_eth"], "unbonding": latest["unbonding_eth"], "min": latest["min_eth"], "max": latest["max_eth"], "step": latest["step"], "block": latest["block"],
+        "series": series, "won": won, "failed": failed, "gas_paid_eth": gas_paid,
     }))
 }
 
@@ -491,6 +552,48 @@ mod tests {
     #[test]
     fn template_has_the_data_slot() {
         assert!(TEMPLATE.contains("/*__DATA__*/null"), "render replaces this placeholder");
+    }
+
+    #[test]
+    fn the_bond_card_reads_the_latest_reading_and_our_ops_results() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute("CREATE TABLE journal_other (kind TEXT, block INTEGER, json TEXT)", []).unwrap();
+        assert_eq!(bond(&db).unwrap(), Value::Null, "no readings: no card data");
+        let row = |kind: &str, block: i64, j: Value| db.execute("INSERT INTO journal_other VALUES (?1, ?2, ?3)", params![kind, block, j.to_string()]).unwrap();
+        row("atlas_bond", 10, json!({ "block": 10, "bonded_eth": 0.09, "unbonding_eth": 0.0, "min_eth": 0.06, "max_eth": 0.1, "step": "Idle" }));
+        row("atlas_bond", 20, json!({ "block": 20, "bonded_eth": 0.11, "unbonding_eth": 0.0, "min_eth": 0.06, "max_eth": 0.1, "step": "AboveMax" }));
+        row("atlas_op_result", 15, json!({ "success": true, "gas_pay_eth": 0.01 }));
+        row("atlas_op_result", 16, json!({ "success": false }));
+        let b = bond(&db).unwrap();
+        assert_eq!((b["bonded"].as_f64(), b["max"].as_f64(), b["step"].as_str()), (Some(0.11), Some(0.1), Some("AboveMax")), "the latest reading");
+        assert_eq!((b["won"].as_i64(), b["failed"].as_i64(), b["gas_paid_eth"].as_f64()), (Some(1), Some(1), Some(0.01)));
+        assert_eq!(b["series"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn real_paper_pnl_is_the_one_op_we_would_send() {
+        // A market's simulated op: (net after bid and gas, its own bid in USD).
+        let op = |net: f64, bid_usd: f64| json!({ "solver": { "ok": true, "net_after_bid_usd": net, "bid_usd": bid_usd } });
+        let auction = |markets: Vec<Value>| json!({ "markets": markets }).to_string();
+        // ETH at $3000, winning bid 0.01 ETH = $30.
+        let rows: Vec<PaperRow> = vec![
+            (1, 100.0, 3000.0, Some(500), auction(vec![op(12.0, 60.0)]), 0.01, None, 50.0), // won in time
+            (2, 100.0, 3000.0, Some(5000), auction(vec![op(8.0, 60.0)]), 0.01, None, 50.0), // won, late
+            (3, 100.0, 3000.0, Some(500), auction(vec![op(30.0, 15.0)]), 0.01, None, 50.0), // outbid
+            // Three markets: only ONE op goes (the best, net 9 at a $45 bid), not the three summed
+            // (review A#3/B#9).
+            (4, 100.0, 3000.0, Some(500), auction(vec![op(5.0, 20.0), op(9.0, 45.0), op(4.0, 10.0)]), 0.01, None, 50.0),
+            // The best market's op bids too little: the auction is lost even though the summed bid
+            // (or another market's) would have won.
+            (5, 100.0, 3000.0, Some(500), auction(vec![op(9.0, 20.0), op(3.0, 50.0)]), 0.01, None, 50.0),
+            // A submitted op is the one that counts, whatever the others net.
+            (6, 100.0, 3000.0, Some(500), auction(vec![op(20.0, 20.0), json!({ "solver": { "ok": true, "net_after_bid_usd": 2.0, "bid_usd": 40.0, "submitted": { "ok": true } } })]), 0.01, None, 50.0),
+            // Pre-v0.4.0 row (no net_after_bid_usd): left out.
+            (7, 100.0, 3000.0, Some(500), json!({ "markets": [{ "solver": { "ok": true, "net_after_bid": 5.0 } }] }).to_string(), 0.01, None, 50.0),
+        ];
+        let r = paper_real(&rows, 2000);
+        assert_eq!((r["n"].as_i64(), r["wins"].as_i64(), r["wins_t"].as_i64()), (Some(6), Some(4), Some(3)));
+        assert_eq!((r["pnl"].as_f64(), r["pnl_t"].as_f64()), (Some(12.0 + 8.0 + 9.0 + 2.0), Some(12.0 + 9.0 + 2.0)));
     }
 
     #[test]
