@@ -115,13 +115,13 @@ contract AtlasLiquidationSolverForkTest is Test {
     function _op(uint256 bid, uint256 minProfit) internal view returns (bytes memory) {
         SolverCall[] memory calls = new SolverCall[](1);
         calls[0] = _liquidation(1 ether);
-        return abi.encode(calls, _bidSwap(bid), USDC, minProfit);
+        return abi.encode(calls, _bidSwap(bid), USDC, minProfit, uint256(0));
     }
 
     function test_solverLiquidatesPaysTheEthBidAndKeepsTheRest() public {
         uint256 s = vm.snapshotState();
         vm.prank(address(atlas));
-        uint256 noBid = solver.atlasSolverCall(signer, ee, address(0), 0, abi.encode(_calls(), _noSwap(), USDC, 0), "");
+        uint256 noBid = solver.atlasSolverCall(signer, ee, address(0), 0, abi.encode(_calls(), _noSwap(), USDC, uint256(0), uint256(0)), "");
         vm.revertToState(s);
 
         uint256 bid = 0.01 ether;
