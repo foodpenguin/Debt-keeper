@@ -492,7 +492,15 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             let built = self.aggregator.build(&kyber.as_ref().expect("kyber won").1, holder, holder, self.cfg.slippage_bps).await;
             q.kyber_build_ms = bt.elapsed().as_millis() as u64;
             match built {
-                Ok(b) => Some((ExitRoute::Call { target: b.target, calldata: b.calldata }, agg_name)),
+                Ok(b) => {
+                    // A build fallback (e.g. a pool-only re-quote after an RFQ failure) is journaled
+                    // as on the single-position path; the route differs from the quote priced above,
+                    // so the batch op's simulation is what prices it.
+                    if let Some(note) = b.note {
+                        q.router = format!("{} ({note})", q.router);
+                    }
+                    Some((ExitRoute::Call { target: b.target, calldata: b.calldata }, agg_name))
+                }
                 Err(err) => {
                     q.error = Some(format!("{agg_name} build failed: {err}"));
                     None
@@ -806,6 +814,43 @@ mod generic_tests {
             assert!(q.plan.as_ref().is_some_and(|p| matches!(p.exit, ExitRoute::Call { .. })), "{:?}", q.error);
             assert_eq!(*dex.0.lock().unwrap(), vec![(want, want)]);
         }
+    }
+
+    /// An aggregator whose build took a fallback route (SwapCall.note).
+    struct NoteDex;
+
+    impl Dex for NoteDex {
+        type Quote = U256;
+        fn name(&self) -> &'static str {
+            "notedex"
+        }
+        async fn quote_within(&self, token_in: Address, token_out: Address, amount_in: U256, gas_budget: u64) -> Result<U256> {
+            MockDex.quote_within(token_in, token_out, amount_in, gas_budget).await
+        }
+        fn amount_out(&self, quote: &U256) -> U256 {
+            MockDex.amount_out(quote)
+        }
+        fn swap_gas(&self, quote: &U256) -> Option<u64> {
+            MockDex.swap_gas(quote)
+        }
+        async fn build(&self, quote: &U256, sender: Address, recipient: Address, slippage_bps: u32) -> Result<crate::dex::SwapCall> {
+            let call = MockDex.build(quote, sender, recipient, slippage_bps).await?;
+            Ok(crate::dex::SwapCall { note: Some("fallback"), ..call })
+        }
+    }
+
+    #[tokio::test]
+    async fn bundle_exit_journals_a_build_fallback() {
+        // The single-position path tags plan.router with the build's note; the bundle exit must too,
+        // or a fallback route (priced only by the batch sim) is invisible in the journal.
+        let provider = ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap());
+        let (toy, venue, cfg) = (Toy::default(), MockVenue, cfg());
+        let m = Mk { key: key(1), name: "alpha".into() };
+        let v = view(&toy, 0, user(1), &m, &1.0, &(100, 90));
+        let planner = Planner { protocol: &toy, aggregator: &NoteDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
+        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 }, true, 5, None, None).await;
+        assert_eq!(q.router, "notedex (fallback)", "{:?}", q.error);
+        assert_eq!(q.plan.as_ref().map(|p| p.router), Some("notedex"), "the executable plan keeps the venue name");
     }
 
     #[tokio::test]

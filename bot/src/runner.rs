@@ -125,8 +125,9 @@ impl Runner<()> {
         } else {
             info!(rpc = ?atlas_specs.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), "atlas valuation endpoints");
             // Hedge the valuation sim immediately: the first endpoint often lags a block, and the
-            // extra request is worth racing on this latency-critical path (S6).
-            let p = rpc::RpcPool::new(atlas_specs)?.with_eager_hedge(["eth_simulateV1".to_string()]);
+            // extra request is worth racing on this latency-critical path (S6) — for a few sims at a
+            // time, so a burst does not double the pool's load.
+            let p = rpc::RpcPool::new(atlas_specs)?.with_eager_hedge(["eth_simulateV1".to_string()], cfg.atlas.eager_hedge_max_in_flight);
             Some((ProviderBuilder::new().connect_client(alloy::rpc::client::RpcClient::new(p.clone(), false)), p))
         };
         let morpho = Morpho::from_config(&cfg);
@@ -1161,18 +1162,25 @@ async fn value_auction<P: Provider>(
     // The journaled bid: the policy's bid on the bundle net (default: x (1 - atlas.margin)); the
     // dashboard's paper table tries the atlas.paper_margins ladder around it. None = no bid.
     let bid_usd = parts.auction.bid_usd(None, bundle_net, eth_usd);
-    // From this auction's arrival to the end of the valuation proper (before any solver-op
-    // simulation, see valuation()).
-    let since_valued = v["valued_unix_ms"].as_u64().map_or(0, |t| gates::unix_ms().saturating_sub(t));
-    let value_ms = (a.seen.elapsed().as_millis() as u64).saturating_sub(since_valued);
+    // From THIS auction's arrival to the op being sendable (the valuation and the overlapped batch-op
+    // simulation are done; see valuation()). A shared valuation is timed per sibling: each one's own
+    // arrival, not the first auction's. Paper trading times with it.
+    let value_ms = arrival_to_valued_ms(a.seen.elapsed().as_millis() as u64, v["valued_unix_ms"].as_u64(), gates::unix_ms());
     info!(auction = %a.id, aggregator = %a.aggregator, deadline = a.deadline, liquidatable = %v["liquidatable"], bonus_usd = %v["bonus_usd"], bundle_net_usd = bundle_net, net_usd = %v["net_usd"], bid_usd = bid_usd.unwrap_or(0.0), bundle_ms = %v["bundle_ms"], value_ms, shared = %v["shared"], "ATLAS auction valued (observe only)");
     let mut row = json!({ "kind": "atlas_auction", "auction_id": a.id, "user_op_hash": a.user_op_hash, "aggregator": a.aggregator, "median": a.median.to_string(),
                           "deadline": a.deadline, "head": head.number, "max_fee_gwei": a.max_fee_per_gas as f64 / 1e9, "bid_usd": bid_usd, "bid_eth": bid_usd.map(|b| b / eth_usd.max(1.0)),
                           "eth_usd": eth_usd, "bid_basis": "batch_est", "bid_margin": atlas.margin, "queued_ms": queued_ms, "value_ms": value_ms });
-    for k in ["markets", "positions", "liquidatable", "bonus_usd", "bundle_net_usd", "net_usd", "bundle_ms", "ready_ms", "shared"] {
+    for k in ["markets", "positions", "liquidatable", "bonus_usd", "bundle_net_usd", "net_usd", "bundle_ms", "shared"] {
         row[k] = v[k].clone();
     }
     let _ = journal.send(row.to_string());
+}
+
+/// Milliseconds from an auction's arrival to when the (possibly shared) valuation finished: the
+/// auction's age now minus how long ago the valuation finished (`valued_unix_ms`, wall clock). A
+/// sibling that arrived after the first auction gets its own shorter latency.
+fn arrival_to_valued_ms(age_ms: u64, valued_unix_ms: Option<u64>, now_unix_ms: u64) -> u64 {
+    age_ms.saturating_sub(valued_unix_ms.map_or(0, |t| now_unix_ms.saturating_sub(t)))
 }
 
 /// The valuation proper (see value_auction): per-market rows, positions and totals, timed from
@@ -1464,11 +1472,9 @@ async fn valuation<P: Provider>(
         (bundle, bundle_ms, overrides, plans, op)
     }))
     .await;
-    // Valuation + the overlapped batch sim are complete here (wall-clock, since a shared valuation is
-    // timed against each sibling auction's own arrival). ready_ms is from the auction's arrival to
-    // the op being sendable; paper trading times with it.
+    // Valuation + the overlapped batch sim are complete here: the op is sendable. Wall clock, so a
+    // shared valuation is timed against each sibling auction's own arrival (value_auction).
     let valued_unix_ms = gates::unix_ms();
-    let ready_ms = a.seen.elapsed().as_millis() as u64;
     // Split each market's op into its journal row and its submission candidate (moved, not cloned).
     let mut solvers: Vec<Option<serde_json::Value>> = Vec::with_capacity(valued.len());
     let mut cands: Vec<Option<OpCandidate>> = Vec::with_capacity(valued.len());
@@ -1528,7 +1534,7 @@ async fn valuation<P: Provider>(
             positions.push(json!({ "market": m.meta.name, "user": v.user, "hf": v.hf, "bonus_usd": v.bonus, "router": router, "net_usd": net, "error": err, "quote_ms": quote_ms, "sim_ms": sim_ms }));
         }
     }
-    json!({ "markets": rows, "positions": positions, "liquidatable": n_liq, "bonus_usd": bonus_sum, "bundle_net_usd": bundle_net, "net_usd": net_sum, "bundle_ms": bundle_ms_max, "ready_ms": ready_ms, "valued_unix_ms": valued_unix_ms, "first_auction": a.id })
+    json!({ "markets": rows, "positions": positions, "liquidatable": n_liq, "bonus_usd": bonus_sum, "bundle_net_usd": bundle_net, "net_usd": net_sum, "bundle_ms": bundle_ms_max, "valued_unix_ms": valued_unix_ms, "first_auction": a.id })
 }
 
 /// The risk gate's bid, checked at its own priority. The plan was simulated at the base priority;
@@ -2519,6 +2525,21 @@ mod tests {
         // Just past the tip by more than the gap is rejected; within the gap is kept.
         assert!(!head_plausible(2_000 + gap + 1, 1_000, 2_000, gap));
         assert!(head_plausible(2_000 + gap, 1_000, 2_000, gap));
+    }
+
+    #[test]
+    fn a_shared_valuation_is_timed_from_each_siblings_own_arrival() {
+        // The first auction arrived at t=0; the shared valuation finished at t=1800 (unix ms 10_800);
+        // it is now t=2000 (unix 11_000).
+        let (valued, now) = (Some(10_800), 11_000);
+        assert_eq!(arrival_to_valued_ms(2_000, valued, now), 1_800, "first auction: arrival -> valued");
+        // A sibling that arrived at t=1500 waited on the same valuation for 300 ms, not 1800: a
+        // paper deadline judged on the first auction's latency would wrongly mark it as missed.
+        assert_eq!(arrival_to_valued_ms(500, valued, now), 300);
+        // A sibling arriving after the valuation finished was ready at once.
+        assert_eq!(arrival_to_valued_ms(100, valued, now), 0);
+        // No timestamp (old row): the auction's age.
+        assert_eq!(arrival_to_valued_ms(700, None, now), 700);
     }
 
     #[test]

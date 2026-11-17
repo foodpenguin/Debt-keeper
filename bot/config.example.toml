@@ -159,6 +159,7 @@ max_bundle_positions = 20      # most positions one batch solver op liquidates t
 flash_headroom_bps = 5         # extra loan token the batch flash-borrows over the sum of the repayments
 min_bonus_usd = 0              # skip auctions below this total bonus (USD); 0 = off (real floor is private)
 bundle_gas_headroom = 0.9      # a batch op whose simulated gas exceeds this x solver_gas_limit is not sent
+eager_hedge_max_in_flight = 2  # valuation sims hedged to a 2nd endpoint at once (duplicates), at most this many; 0 = off
 max_concurrent = 1             # valuations at once (they share the RPC pool)
 paper_margins = [0.01, 0.05, 0.1]   # dashboard paper trading: bid = bundle net x (1 - m) vs the decoded winning bid
 paper_deadline_ms = 2000       # a valuation later than this after the auction could not have bid in time

@@ -310,9 +310,9 @@ bot 從不為 Atlas 移動資金；這些都由操作者在自己的終端機執
 第一次在 GCP 上跑多天 shadow 後：
 
 - **撐過壞掉的 RPC。**單一 endpoint 可能回報完全錯誤的區塊號；比剛讀到的 tip 還多出 `head_sanity_gap` 以上的 head 會被丟掉（`runner::head_plausible`），避免把錯誤的號碼當成查詢區塊（那會讓每個 multicall 都以「from block > latest」失敗）。`load_markets` 會重試 desynced endpoint 回傳的空值／垃圾市場資料（pool 不會對這種 200 回應 failover），「fell behind」的 full reload 也改成非致命——都是為了讓一個壞 endpoint 只記 log 重試，而不是整個退出。
-- **Revert 原因。**revert 的 solver／liquidator 模擬由 `bot/src/revert.rs` 解碼（自訂錯誤，遞迴進 `CallFailed`/`SwapFailed`/`BidSwapFailed` 的巢狀 reason，以及 `Error(string)`/`Panic`）；完整的 revert hex（≤ 4 KB）保留、不截斷。
-- **op 可靠性。**Kyber build 在 RFQ/PMM 路由失敗時只用池子重新 quote；聚合器出場的 gas 加了安全係數（`BundleGas::agg_swap_safety`），批次 op 的**實際**模擬 gas 超過 `bundle_gas_headroom × solver_gas_limit` 就不送；bid swap 依每個借款代幣挑最深的借款代幣/WETH 池（啟動時探測）。
-- **延遲。**批次 op 的模擬和每個部位的 plan（診斷＋單一部位退路）並行跑，所以慢的 plan 不會拖到真正要送的 op；Kyber 呼叫有時間預算；Atlas 估值的 pool 對 `eth_simulateV1` 立即 hedge（`onchain_core::rpc::RpcPool::with_eager_hedge`）。journal 記錄 `kyber_quote_ms`、`kyber_build_ms`、`batch_sim_ms` 和 `ready_ms`（拍賣抵達 → op 可送），紙上交易用 `ready_ms` 判斷期限。
+- **Revert 原因。**revert 的 solver／liquidator 模擬由 `bot/src/revert.rs` 解碼（自訂錯誤，遞迴進 `CallFailed`/`SwapFailed`/`BidSwapFailed` 的巢狀 reason，以及 `Error(string)`/`Panic`）。revert data 從錯誤鏈裡的 `SimReverted` 讀出、不論大小都完整解碼；只有接在後面記進 journal 的錯誤文字有上限（4096 字元）。
+- **op 可靠性。**Kyber build 失敗時，只有 route 用到 RFQ/PMM 來源（`kyber_rfq_exclude`）才只用池子重新 quote——依 route 本身的來源判斷、不看錯誤文字，所以純池子 route 的無關失敗不會多花一輪，逾時也不重試；聚合器出場的 gas 加了安全係數（`BundleGas::agg_swap_safety`），批次 op 的**實際**模擬 gas 超過 `bundle_gas_headroom × solver_gas_limit` 就不送；bid swap 依每個借款代幣挑最深的借款代幣/WETH 池（啟動時探測）。
+- **延遲。**批次 op 的模擬和每個部位的 plan（診斷＋單一部位退路）並行跑，所以慢的 plan 不會拖到真正要送的 op；Kyber 呼叫有時間預算；Atlas 估值的 pool 對 `eth_simulateV1` 立即 hedge（`onchain_core::rpc::RpcPool::with_eager_hedge`），但同時最多 `eager_hedge_max_in_flight` 個，暴跌 burst 時不會讓 pool 負載加倍。journal 記錄 `kyber_quote_ms`、`kyber_build_ms` 和 `batch_sim_ms`；紙上交易用 `value_ms`（每場拍賣自己的抵達 → op 可送，含 batch sim）判斷期限。
 - **未來工作（尚未實作）：預先 quote。**每場拍賣的 Kyber quote + build + sim 在關鍵路徑上。對追蹤中的市場在每個 head 預先 quote 可能的出場（在拍賣抵達前），並重用夠新的報價，可以砍掉拍賣當下的延遲，代價是投機性的 Kyber 負載；需要夠緊的新鮮度界線，以配合被拍賣的更新中已變動的價格。
 
 ## 加入一個協議

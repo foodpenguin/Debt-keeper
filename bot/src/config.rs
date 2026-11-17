@@ -188,6 +188,12 @@ pub struct AtlasConfig {
     /// batch used 5.95M against a 4.9M estimate, almost the 6M cap). Leaves headroom for state drift.
     #[serde(default = "default_bundle_gas_headroom")]
     pub bundle_gas_headroom: f64,
+    /// Valuation simulations (`eth_simulateV1`) hedged to a second endpoint at once rather than
+    /// after ~2x the first one's latency, at most this many in flight (each is a duplicate request);
+    /// the rest hedge after the usual delay, so a crash burst does not double the pool's load. The
+    /// batch op's simulation starts first in each market, so it is the one that gets a slot. 0 = off.
+    #[serde(default = "default_eager_hedge_max")]
+    pub eager_hedge_max_in_flight: usize,
     /// Auction valuations running at once. They share an RPC pool: a crash brings dozens of
     /// auctions within seconds, and unbounded valuations would starve it.
     #[serde(default = "default_atlas_concurrent")]
@@ -209,7 +215,7 @@ pub struct AtlasConfig {
 
 impl Default for AtlasConfig {
     fn default() -> Self {
-        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, bundle_gas_headroom: default_bundle_gas_headroom(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
+        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, bundle_gas_headroom: default_bundle_gas_headroom(), eager_hedge_max_in_flight: default_eager_hedge_max(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
     }
 }
 
@@ -778,6 +784,9 @@ fn default_kyber_timeout_ms() -> u64 {
 }
 fn default_bundle_gas_headroom() -> f64 {
     0.9
+}
+fn default_eager_hedge_max() -> usize {
+    2
 }
 fn default_head_sanity_gap() -> u64 {
     // A chain never advances this many blocks between heads; only a lying endpoint does. Still small

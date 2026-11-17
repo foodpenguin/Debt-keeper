@@ -40,11 +40,46 @@ pub struct BuiltSwap {
     pub fell_back: bool,
 }
 
-/// A build error worth retrying without RFQ/PMM sources: a signed maker quote that expired or was
-/// declined ("pmm RFQ failed"), or the build endpoint refusing the route (HTTP 403 Forbidden).
+/// A Kyber call abandoned past its time budget (`kyber_timeout_ms`).
+#[derive(Debug)]
+struct KyberTimeout(u128);
+
+impl std::fmt::Display for KyberTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "kyber timeout ({} ms)", self.0)
+    }
+}
+
+impl std::error::Error for KyberTimeout {}
+
+/// The liquidity sources (`exchange` ids, e.g. "uniswap-v3", "pmm-19") a route summary uses; None
+/// when the summary carries no readable route.
+fn route_sources(summary: &Value) -> Option<Vec<&str>> {
+    let hops: Vec<&str> = summary["route"].as_array()?.iter().filter_map(Value::as_array).flatten().filter_map(|s| s["exchange"].as_str()).collect();
+    (!hops.is_empty()).then_some(hops)
+}
+
+/// The error text of a failed RFQ/PMM fill: a signed maker quote that expired or was declined ("pmm
+/// RFQ failed"), or the build endpoint refusing the route (HTTP 403 Forbidden). Only consulted when
+/// the route itself is unreadable.
 fn is_rfq_build_error(e: &anyhow::Error) -> bool {
     let s = format!("{e:#}").to_lowercase();
     s.contains("pmm") || s.contains("rfq") || s.contains("forbidden") || s.contains("403")
+}
+
+/// Whether a failed build is worth one pool-only re-quote: only when the route used one of the
+/// excluded (RFQ/PMM) sources — excluding them from a route that has none yields the same route, so
+/// an unrelated failure (a WAF 403, a bad request) costs no extra round trip on the auction's critical
+/// path. A timeout already spent the budget: no retry. An unreadable route falls back to the error
+/// text.
+fn worth_pool_only_retry(summary: &Value, exclude: &str, e: &anyhow::Error) -> bool {
+    if exclude.is_empty() || e.downcast_ref::<KyberTimeout>().is_some() {
+        return false;
+    }
+    match route_sources(summary) {
+        Some(srcs) => srcs.iter().any(|s| exclude.split(',').any(|x| x.trim().eq_ignore_ascii_case(s))),
+        None => is_rfq_build_error(e),
+    }
 }
 
 /// Sends the request and parses JSON, keeping status + body head in the error for diagnosis.
@@ -101,7 +136,7 @@ impl Kyber {
     async fn fetch(&self, req: reqwest::RequestBuilder) -> Result<Value> {
         match tokio::time::timeout(self.timeout, read_json(req)).await {
             Ok(r) => r,
-            Err(_) => bail!("kyber timeout ({} ms)", self.timeout.as_millis()),
+            Err(_) => Err(KyberTimeout(self.timeout.as_millis()).into()),
         }
     }
 
@@ -157,13 +192,15 @@ impl Kyber {
     }
 
     /// Calldata for the quoted route; `sender` is the contract that holds the tokens and calls the
-    /// router. If the route's RFQ/PMM fill fails to build (expired or declined maker quote, or a
-    /// 403), re-quote the same trade over pools only (`rfq_exclude`) and build that, so one flaky
-    /// maker does not lose the auction. The fallback route is flagged (`fell_back`) for the journal.
+    /// router. If a route that uses an RFQ/PMM source fails to build (expired or declined maker
+    /// quote, a 403), re-quote the same trade over pools only (`rfq_exclude`) and build that, so one
+    /// flaky maker does not lose the auction (see `worth_pool_only_retry`). The fallback route is
+    /// flagged (`fell_back`) for the journal; its output and gas are not the original quote's, so the
+    /// simulation that gates the send is what prices it.
     pub async fn build(&self, quote: &Quote, sender: Address, recipient: Address, slippage_bps: u32) -> Result<BuiltSwap> {
         match self.build_summary(&quote.summary, sender, recipient, slippage_bps).await {
             Ok((router, calldata)) => Ok(BuiltSwap { router, calldata, fell_back: false }),
-            Err(e) if is_rfq_build_error(&e) && !self.rfq_exclude.is_empty() => {
+            Err(e) if worth_pool_only_retry(&quote.summary, &self.rfq_exclude, &e) => {
                 tracing::warn!(error = %e, exclude = %self.rfq_exclude, "kyber build failed on an RFQ/PMM route; re-quoting over pools only");
                 let q = self.quote(quote.token_in, quote.token_out, quote.amount_in, quote.gas_price_wei, &self.rfq_exclude).await?;
                 let (router, calldata) = self.build_summary(&q.summary, sender, recipient, slippage_bps).await?;
@@ -236,6 +273,27 @@ mod tests {
         // A generic failure is not retried over a different route.
         assert!(!is_rfq_build_error(&anyhow::anyhow!("kyber build: insufficient liquidity")));
         assert!(!is_rfq_build_error(&anyhow::anyhow!("connection reset")));
+    }
+
+    #[test]
+    fn the_pool_only_retry_follows_the_routes_sources_not_the_error_text() {
+        let excl = "pmm-19,bebop";
+        let route = |ex: &[&str]| json!({ "route": [ex.iter().map(|e| json!({ "exchange": e })).collect::<Vec<_>>()] });
+        let with_pmm = route(&["uniswap-v3", "pmm-19"]);
+        let pools = route(&["uniswap-v3", "aerodrome"]);
+        let forbidden = anyhow::anyhow!("kyber http 403 Forbidden: ...");
+        // The route used a maker: any build failure is worth a pool-only route.
+        assert!(worth_pool_only_retry(&with_pmm, excl, &anyhow::anyhow!("kyber build: route expired")));
+        assert!(worth_pool_only_retry(&route(&["BEBOP"]), excl, &forbidden), "case-insensitive ids");
+        // A pools-only route would re-quote to the same route: a 403 (e.g. a WAF) is not retried.
+        assert!(!worth_pool_only_retry(&pools, excl, &forbidden));
+        // A timeout already spent the budget.
+        assert!(!worth_pool_only_retry(&with_pmm, excl, &anyhow::Error::new(KyberTimeout(700))));
+        // No exclusion configured: never.
+        assert!(!worth_pool_only_retry(&with_pmm, "", &forbidden));
+        // An unreadable route falls back to the error text.
+        assert!(worth_pool_only_retry(&Value::Null, excl, &anyhow::anyhow!("kyber build: pmm RFQ failed")));
+        assert!(!worth_pool_only_retry(&Value::Null, excl, &anyhow::anyhow!("kyber build: insufficient liquidity")));
     }
 
     #[test]

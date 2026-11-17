@@ -113,19 +113,37 @@ pub fn decode_revert(data: &[u8]) -> String {
     format!("0x{}", alloy::hex::encode(data))
 }
 
-/// The trailing revert hex of a sim error (`SimReverted` formats its message as "... 0x<data>").
-fn revert_hex(err: &str) -> Option<Bytes> {
-    err.rsplit(char::is_whitespace).find(|t| t.starts_with("0x") && t.len() > 2).and_then(|t| t.parse().ok())
+/// Longest error text kept in the journal after the decoded reason (a pathological blob cannot bloat
+/// it). Decoding reads the revert data before this cut, so it never truncates what gets decoded.
+const EXPLAIN_TEXT_CAP: usize = 4096;
+
+/// One whitespace-separated token as revert hex: surrounding quotes/punctuation (`"0x…"`, `0x…,`,
+/// `(0x…)`) are trimmed. `allow_empty` accepts a bare "0x" (an empty revert).
+fn hex_token(t: &str, allow_empty: bool) -> Option<Bytes> {
+    let t = t.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    (t.starts_with("0x") && (allow_empty || t.len() > 2)).then(|| t.parse().ok()).flatten()
+}
+
+/// The revert data a sim error carries. A `SimReverted` anywhere in the chain formats its message as
+/// "<reason> 0x<data>": its last token is the data (possibly an empty "0x"). Any other error (e.g. a
+/// node error quoting the data) falls back to the last parseable 0x token in the text.
+fn revert_data(e: &anyhow::Error) -> Option<Bytes> {
+    if let Some(s) = e.chain().find_map(|c| c.downcast_ref::<crate::venue::SimReverted>())
+        && let Some(d) = s.message.rsplit(char::is_whitespace).next().and_then(|t| hex_token(t, true))
+    {
+        return Some(d);
+    }
+    format!("{e:#}").rsplit(char::is_whitespace).find_map(|t| hex_token(t, false))
 }
 
 /// A sim error as a journal string: the decoded revert reason when the error carries revert data,
-/// followed by the full error (capped so a pathological blob cannot bloat the journal). Never
-/// truncates the revert hex itself to a few hundred chars the way the old 200-char cut did.
+/// followed by the error text (capped at EXPLAIN_TEXT_CAP chars). The revert data is decoded in full,
+/// whatever its size; only the trailing text is cut.
 pub fn explain(e: &anyhow::Error) -> String {
-    let full: String = format!("{e:#}").chars().take(4096).collect();
-    match revert_hex(&full) {
-        Some(data) => format!("{} [{full}]", decode_revert(&data)),
-        None => full,
+    let text: String = format!("{e:#}").chars().take(EXPLAIN_TEXT_CAP).collect();
+    match revert_data(e) {
+        Some(data) => format!("{} [{text}]", decode_revert(&data)),
+        None => text,
     }
 }
 
@@ -167,5 +185,32 @@ mod tests {
         let out = explain(&e);
         assert!(out.starts_with("BidSwapFailed("), "{out}");
         assert!(out.contains("sim reverted"), "keeps the full error too: {out}");
+    }
+
+    #[test]
+    fn a_large_revert_is_decoded_in_full_not_cut_by_the_text_cap() {
+        // ~3 KB of revert data = ~6 K hex chars, past the 4096-char text cap: decoding must read the
+        // data itself, not the capped text (which cuts the hex mid-way).
+        let reason = "x".repeat(3000);
+        let data = Error { message: reason.clone() }.abi_encode();
+        let sim = crate::venue::SimReverted { message: format!("execution reverted 0x{}", alloy::hex::encode(&data)), block_number: None, probe: None };
+        let e = anyhow::Error::new(sim).context("batch op sim");
+        let out = explain(&e);
+        assert!(out.starts_with(&format!("Error({reason:?})")), "decoded in full: {}", &out[..80.min(out.len())]);
+        assert!(out.len() < reason.len() + 4096 + 64, "the trailing text stays capped");
+    }
+
+    #[test]
+    fn revert_data_is_found_through_quotes_punctuation_and_empty_reverts() {
+        // A node error that quotes the data (not a SimReverted): the token is `"0x…"`.
+        let nf = alloy::hex::encode(NotFunded {}.abi_encode());
+        let e = anyhow::anyhow!("server returned an error response: error code 3: execution reverted, data: \"0x{nf}\"");
+        assert!(explain(&e).starts_with("NotFunded"), "{}", explain(&e));
+        // Trailing punctuation on the data token (a chained message ending in "0x….").
+        let e = anyhow::anyhow!("execution reverted: 0x{nf}.");
+        assert!(explain(&e).starts_with("NotFunded"), "{}", explain(&e));
+        // An empty revert from a SimReverted reads as such, not as the raw text.
+        let sim = crate::venue::SimReverted { message: "execution reverted 0x".into(), block_number: None, probe: None };
+        assert!(explain(&anyhow::Error::new(sim)).starts_with("empty revert"));
     }
 }

@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS liquidations (tx TEXT, borrower TEXT, block INTEGER, 
 CREATE INDEX IF NOT EXISTS liquidations_block ON liquidations (block);
 CREATE TABLE IF NOT EXISTS atlas_auctions (auction_id TEXT PRIMARY KEY, user_op_hash TEXT, head INTEGER, deadline INTEGER,
     aggregator TEXT, liquidatable INTEGER, bonus_usd REAL, bundle_net_usd REAL, net_usd REAL, bid_usd REAL, bid_basis TEXT,
-    eth_usd REAL, bundle_ms INTEGER, value_ms INTEGER, ready_ms INTEGER, queued_ms INTEGER, skipped TEXT, json TEXT);
+    eth_usd REAL, bundle_ms INTEGER, value_ms INTEGER, queued_ms INTEGER, skipped TEXT, json TEXT);
 CREATE INDEX IF NOT EXISTS atlas_auctions_uoh ON atlas_auctions (user_op_hash);
 CREATE INDEX IF NOT EXISTS atlas_auctions_head ON atlas_auctions (head);
 -- On-chain facts about journaled liquidation txs (dashboard.rpc lookups).
@@ -113,11 +113,6 @@ async fn run_inner(cfg: &Config, drain: bool) -> Result<()> {
     let has_bytes: bool = db.prepare("SELECT 1 FROM pragma_table_info('rpc_usage') WHERE name = 'bytes_out'")?.exists([])?;
     if !has_bytes {
         db.execute("ALTER TABLE rpc_usage ADD COLUMN bytes_out INTEGER", [])?;
-    }
-    // ready_ms (true op-ready latency) added after value_ms: old DBs get the column.
-    let has_ready: bool = db.prepare("SELECT 1 FROM pragma_table_info('atlas_auctions') WHERE name = 'ready_ms'")?.exists([])?;
-    if !has_ready {
-        db.execute("ALTER TABLE atlas_auctions ADD COLUMN ready_ms INTEGER", [])?;
     }
 
     let (lines, first_new_ts) = ingest_log(&mut db, &d.log_path)?;
@@ -432,10 +427,10 @@ fn ingest_journal(db: &mut Connection, path: &str) -> Result<usize> {
             }
             "atlas_auction" => {
                 tx.execute(
-                    "INSERT OR IGNORE INTO atlas_auctions (auction_id, user_op_hash, head, deadline, aggregator, liquidatable, bonus_usd, bundle_net_usd, net_usd, bid_usd, bid_basis, eth_usd, bundle_ms, value_ms, ready_ms, queued_ms, skipped, json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                    "INSERT OR IGNORE INTO atlas_auctions (auction_id, user_op_hash, head, deadline, aggregator, liquidatable, bonus_usd, bundle_net_usd, net_usd, bid_usd, bid_basis, eth_usd, bundle_ms, value_ms, queued_ms, skipped, json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                     params![
                         s("auction_id"), s("user_op_hash").map(|h| h.to_lowercase()), i("head"), i("deadline"), s("aggregator"), i("liquidatable"), f("bonus_usd"), f("bundle_net_usd"), f("net_usd"), f("bid_usd"),
-                        s("bid_basis").or_else(|| Some("per_position_sum".into())), f("eth_usd"), i("bundle_ms"), i("value_ms"), i("ready_ms"), i("queued_ms"), s("skipped"), line
+                        s("bid_basis").or_else(|| Some("per_position_sum".into())), f("eth_usd"), i("bundle_ms"), i("value_ms"), i("queued_ms"), s("skipped"), line
                     ],
                 )?;
             }

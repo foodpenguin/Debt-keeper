@@ -14,20 +14,27 @@ Fixes from the v0.3.1 GCP shadow run (2026-11-08..13). Needs onchain-core v0.1.4
   full reload whose multicalls then all failed "from block > latest"; `load_markets` retries
   empty/garbage market data (a desynced endpoint the pool does not fail over); the full reload is
   non-fatal.
-- Diagnostics: the solver error is no longer truncated to 200 chars — the full revert hex (≤ 4 KB) is
-  kept and decoded, recursing into the `CallFailed`/`SwapFailed`/`BidSwapFailed` nested reasons and
-  `Error(string)`/`Panic`.
-- Atlas op reliability: a Kyber build failing on an RFQ/PMM route re-quotes over pools only
-  (`kyber_rfq_exclude`); the aggregator exit's gas carries extra safety and a batch op whose
-  *simulated* gas exceeds `bundle_gas_headroom × solver_gas_limit` is not sent (an under-estimated
-  Kyber exit ran 5.95M against a 4.9M estimate, near the 6M cap); the bid swap picks the deepest
-  loan-token/WETH pool per loan token (`bid_fee_tiers`/`bid_factory`) instead of one fixed fee.
+- Diagnostics: the solver error is no longer truncated to 200 chars — the revert data is read from
+  the simulation error itself and decoded in full, recursing into the
+  `CallFailed`/`SwapFailed`/`BidSwapFailed` nested reasons and `Error(string)`/`Panic`; only the
+  error text journaled after it is capped (4096 chars). Quoted or punctuated revert hex in a node
+  error is found too.
+- Atlas op reliability: a Kyber build that fails on a route using an RFQ/PMM source
+  (`kyber_rfq_exclude`) re-quotes over pools only — decided by the route's sources, not the error
+  text, so a failure on a pools-only route (e.g. a WAF 403) costs no extra round trip, and a timeout
+  is not retried; a fallback is tagged in the journal on the batch exit as on the single-position
+  one. The aggregator exit's gas carries extra safety and a batch op whose *simulated* gas exceeds
+  `bundle_gas_headroom × solver_gas_limit` is not sent (an under-estimated Kyber exit ran 5.95M
+  against a 4.9M estimate, near the 6M cap); the bid swap picks the deepest loan-token/WETH pool per
+  loan token (`bid_fee_tiers`/`bid_factory`) instead of one fixed fee.
 - Latency: the batch op simulates concurrently with the per-position plans (which are diagnostics
   plus the single-position fallback), so slow plans no longer delay the op that gets sent; Kyber
   calls have a time budget (`kyber_timeout_ms`, 700 ms); the Atlas valuation pool hedges
-  `eth_simulateV1` immediately (onchain-core `with_eager_hedge`). The journal gains `kyber_quote_ms`,
-  `kyber_build_ms`, `batch_sim_ms` and `ready_ms` (arrival → op sendable), and paper trading times
-  against `ready_ms`.
+  `eth_simulateV1` immediately (onchain-core `with_eager_hedge`), at most
+  `eager_hedge_max_in_flight` (2) at a time so a crash burst does not double the pool's load. The
+  journal gains `kyber_quote_ms`, `kyber_build_ms` and `batch_sim_ms`. `value_ms` now runs to the op
+  being sendable (the batch sim included, timed from each sibling auction's own arrival), so it is
+  later than v0.3.1's figure for the same auction; paper trading keeps timing with it.
 
 ## v0.3.1 (2026-11-09)
 
