@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.2 (unreleased)
+## v0.3.2 (2026-11-17)
 
 Fixes from the v0.3.1 GCP shadow run (2026-11-08..13). Needs onchain-core v0.1.4.
 
