@@ -235,9 +235,17 @@ pub struct SolverConfig {
     /// Uniswap V3-style router (exactOutputSingle) that buys the ETH bid with the loan token.
     #[serde(default = "default_bid_router")]
     pub bid_router: Address,
-    /// Fee tier of the bid swap pool (loan token / WETH).
+    /// Fee tier of the bid swap pool (loan token / WETH): the fallback when no `bid_fee_tiers` pool
+    /// exists for a loan token.
     #[serde(default = "default_bid_fee")]
     pub bid_fee: u32,
+    /// Uniswap V3 factory used to find the deepest loan-token/WETH pool for the bid swap at startup,
+    /// so it does not fail on a thin or missing pool at a single fixed fee (2026-11-13 BidSwapFailed).
+    #[serde(default = "default_bid_factory")]
+    pub bid_factory: Address,
+    /// Candidate bid-swap fee tiers probed for the deepest loan-token/WETH pool at startup.
+    #[serde(default = "default_bid_fee_tiers")]
+    pub bid_fee_tiers: Vec<u32>,
     #[serde(default = "default_solver_artifact")]
     pub artifact: String,
     #[serde(default = "default_atlas_stub_artifact")]
@@ -268,6 +276,8 @@ impl Default for SolverConfig {
             weth: default_weth(),
             bid_router: default_bid_router(),
             bid_fee: default_bid_fee(),
+            bid_factory: default_bid_factory(),
+            bid_fee_tiers: default_bid_fee_tiers(),
             artifact: default_solver_artifact(),
             stub_artifact: default_atlas_stub_artifact(),
             submit: false,
@@ -298,6 +308,13 @@ fn default_bid_router() -> Address {
 }
 fn default_bid_fee() -> u32 {
     500
+}
+fn default_bid_factory() -> Address {
+    // Uniswap V3 factory on Base.
+    "0x33128a8fC17869897dcE68Ed026d694621f6FDfD".parse().unwrap()
+}
+fn default_bid_fee_tiers() -> Vec<u32> {
+    vec![500, 3000, 100, 10000]
 }
 fn default_solver_artifact() -> String {
     "../contracts/out/AtlasLiquidationSolver.sol/AtlasLiquidationSolver.json".into()

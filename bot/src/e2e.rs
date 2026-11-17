@@ -456,3 +456,23 @@ async fn e2e_stuck_tx_is_replaced_by_a_cancel() {
     assert_eq!(reader.get_transaction_count(exec_key.address()).await.unwrap(), n0 + 1, "its nonce was used by the cancel");
     println!("e2e stuck tx: {} replaced at nonce {n0}", inf.hash);
 }
+
+/// The bid-swap fee-tier probe on a Base fork: USDC's deepest WETH pool is the 500 (0.05%) tier, and
+/// a token with no pool at any tier is absent (the bid swap falls back to the configured bid_fee).
+/// Validates the 2026-11-13 BidSwapFailed fix. Read-only, so it connects to the fork directly.
+#[tokio::test]
+#[ignore = "needs an archive fork; run with --ignored (BASE_FORK_URL)"]
+async fn e2e_bid_fee_probe_picks_the_deepest_pool() {
+    const WETH: Address = address!("4200000000000000000000000000000000000006");
+    const UNI_V3_FACTORY: Address = address!("33128a8fC17869897dcE68Ed026d694621f6FDfD");
+    let url = std::env::var("BASE_FORK_URL").unwrap_or_else(|_| "https://base.gateway.tenderly.co".into());
+    let p = ProviderBuilder::new().connect_http(url.parse().unwrap());
+    let nonexistent = Address::repeat_byte(0x7f);
+    let tiers = [500u32, 3000, 100, 10000];
+    let fees = crate::atlas_venue::probe_bid_fees(&p, UNI_V3_FACTORY, WETH, &[USDC, WETH, nonexistent], &tiers).await;
+    // USDC maps to the deepest existing WETH-pool tier (which tier is deepest can shift block to
+    // block; the point is it is a real candidate, not the hardcoded default fee).
+    assert!(fees.get(&USDC).is_some_and(|f| tiers.contains(f)), "USDC maps to a real tier, got {:?}", fees.get(&USDC));
+    assert!(!fees.contains_key(&WETH), "a WETH loan needs no bid swap");
+    assert!(!fees.contains_key(&nonexistent), "no pool -> falls back to bid_fee");
+}

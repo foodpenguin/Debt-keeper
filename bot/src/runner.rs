@@ -341,8 +341,12 @@ async fn build_atlas_solver<P: Provider>(engine: &MorphoEngine<P>) -> Result<Opt
     }
     let art: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&c.stub_artifact).with_context(|| format!("reading {} (run `forge build` in contracts/)", c.stub_artifact))?)?;
     let stub: alloy::primitives::Bytes = art["deployedBytecode"]["object"].as_str().context("atlas stub: no deployedBytecode")?.parse()?;
-    info!(%solver, %signer, "atlas: solver operations are simulated (never signed or sent)");
-    Ok(Some(atlas_venue::AtlasSolver::new(atlas, c.address, signer, c.weth, c.bid_router, c.bid_fee, liq, solver_code, stub)))
+    // The deepest loan/WETH pool per loan token, so the bid swap does not fail on a thin/missing
+    // pool at one fixed fee (2026-11-13: BidSwapFailed).
+    let loan_tokens: Vec<Address> = engine.metas.iter().map(|m| m.params.loanToken).collect();
+    let bid_fees = atlas_venue::probe_bid_fees(p, c.bid_factory, c.weth, &loan_tokens, &c.bid_fee_tiers).await;
+    info!(%solver, %signer, bid_fee_overrides = bid_fees.len(), "atlas: solver operations are simulated (never signed or sent)");
+    Ok(Some(atlas_venue::AtlasSolver::new(atlas, c.address, signer, c.weth, c.bid_router, c.bid_fee, liq, solver_code, stub).with_bid_fees(bid_fees)))
 }
 
 /// FlashLiquidator over Morpho: the repayment is flash-borrowed (exec.flash_funding) and Morpho's
