@@ -68,6 +68,10 @@ pub struct BundleQuote {
     pub kyber_net_usd: Option<f64>,
     pub error: Option<String>,
     pub quote_ms: u64,
+    /// The Kyber /routes and /route/build times (0 when Kyber was not used), to see where a slow
+    /// valuation went (2026-11-13: Kyber quotes up to 12 s).
+    pub kyber_quote_ms: u64,
+    pub kyber_build_ms: u64,
     /// The executable form of this bundle (positions, flash-loan size, the one full-size exit),
     /// built when a 100 %-size exit is available. Not journaled.
     #[serde(skip)]
@@ -443,12 +447,15 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             if !use_kyber {
                 return Err(format!("off ({agg_name} quotes the current market only)"));
             }
+            let kt = Instant::now();
             let k = self.aggregator.quote_within(collateral, loan, total_seize, swap_gas_budget).await.map_err(|e| e.to_string())?;
+            let quote_ms = kt.elapsed().as_millis() as u64;
             let g = gross(self.aggregator.amount_out(&k), total_seize);
-            Ok(((agg_name, 10_000u64, g, self.aggregator.swap_gas(&k).unwrap_or(swap_gas_budget)), k))
+            Ok(((agg_name, 10_000u64, g, self.aggregator.swap_gas(&k).unwrap_or(swap_gas_budget)), k, quote_ms))
         };
         let (direct, kyber) = tokio::join!(direct, kyber);
         q.quote_ms = t0.elapsed().as_millis() as u64;
+        q.kyber_quote_ms = kyber.as_ref().ok().map(|x| x.2).unwrap_or(0);
         // Route selection weighs the exits at the auction's gas price when given (gas dominates at
         // 15 gwei: a lower-gas exit can beat a higher-output one), else the planner's own.
         let gas_price = gas_price_wei.map(|w| w as f64).unwrap_or_else(|| self.route_gas_price(base_fee_wei));
@@ -481,7 +488,10 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             Some((ExitRoute::Packed(self.v3.expect("direct needs v3").encode(pair, grid, a)), "direct"))
         } else {
             let holder = exit_holder.unwrap_or_else(|| self.venue.swap_recipient());
-            match self.aggregator.build(&kyber.as_ref().expect("kyber won").1, holder, holder, self.cfg.slippage_bps).await {
+            let bt = Instant::now();
+            let built = self.aggregator.build(&kyber.as_ref().expect("kyber won").1, holder, holder, self.cfg.slippage_bps).await;
+            q.kyber_build_ms = bt.elapsed().as_millis() as u64;
+            match built {
                 Ok(b) => Some((ExitRoute::Call { target: b.target, calldata: b.calldata }, agg_name)),
                 Err(err) => {
                     q.error = Some(format!("{agg_name} build failed: {err}"));

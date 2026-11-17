@@ -1,6 +1,8 @@
 //! Exit routing. v1: KyberSwap aggregator API (covers Uni V3/V4, Aerodrome/Aero, Pancake,
 //! Curve, prop AMMs...). Two calls: /routes for a quote, /route/build for calldata.
 
+use std::time::Duration;
+
 use alloy::primitives::{Address, Bytes, U256};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -11,6 +13,8 @@ pub struct Kyber {
     client_id: String,
     /// Source ids excluded when a build fails on an RFQ/PMM route (re-quote over pools only).
     rfq_exclude: String,
+    /// Time budget for one /routes or /route/build call; past it the call is abandoned.
+    timeout: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -88,8 +92,17 @@ fn parse_u256(v: &Value) -> Option<U256> {
 }
 
 impl Kyber {
-    pub fn new(http: reqwest::Client, base: &str, client_id: &str, rfq_exclude: &str) -> Self {
-        Self { http, base: base.trim_end_matches('/').to_string(), client_id: client_id.to_string(), rfq_exclude: rfq_exclude.to_string() }
+    pub fn new(http: reqwest::Client, base: &str, client_id: &str, rfq_exclude: &str, timeout_ms: u64) -> Self {
+        Self { http, base: base.trim_end_matches('/').to_string(), client_id: client_id.to_string(), rfq_exclude: rfq_exclude.to_string(), timeout: Duration::from_millis(timeout_ms) }
+    }
+
+    /// `read_json` under the Kyber time budget: a slow call (up to 12 s seen 2026-11-13) is abandoned
+    /// so the valuation can fall back to the direct route or skip instead of waiting.
+    async fn fetch(&self, req: reqwest::RequestBuilder) -> Result<Value> {
+        match tokio::time::timeout(self.timeout, read_json(req)).await {
+            Ok(r) => r,
+            Err(_) => bail!("kyber timeout ({} ms)", self.timeout.as_millis()),
+        }
     }
 
     /// One route. `gas_price_wei` (None = Kyber's default, the live price) is what Kyber charges each
@@ -111,7 +124,7 @@ impl Kyber {
             query.push(("excludedSources", exclude.to_string()));
         }
         let req = self.http.get(format!("{}/routes", self.base)).query(&query).header("x-client-id", &self.client_id);
-        let resp = read_json(req).await?;
+        let resp = self.fetch(req).await?;
         if resp["code"].as_i64() != Some(0) {
             bail!("kyber routes: {}", resp["message"]);
         }
@@ -168,7 +181,7 @@ impl Kyber {
             "slippageTolerance": slippage_bps,
         });
         let req = self.http.post(format!("{}/route/build", self.base)).header("x-client-id", &self.client_id).json(&body);
-        let resp = read_json(req).await?;
+        let resp = self.fetch(req).await?;
         if resp["code"].as_i64() != Some(0) {
             bail!("kyber build: {}", resp["message"]);
         }

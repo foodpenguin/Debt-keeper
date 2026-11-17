@@ -253,7 +253,8 @@ fn auctions(db: &Connection, clock: &Clock, since: f64, eth_usd_now: f64) -> Res
 /// auction. P&L of a win = bundle net - our bid (what our own exit would have left).
 /// An auction valuation with the winning bid: (head, bundle_net_usd, eth_usd, value_ms, json,
 /// win_bid_eth, winner).
-/// (head, bid basis net USD, eth_usd, value_ms, auction json, winning bid ETH, winner, bonus USD).
+/// (head, bid basis net USD, eth_usd, ready_ms [the true op-ready latency, else value_ms on old
+/// journals], auction json, winning bid ETH, winner, bonus USD).
 type PaperRow = (i64, f64, f64, Option<i64>, String, f64, Option<String>, f64);
 
 fn paper(db: &Connection, clock: &Clock, since: f64, cfg: &Config) -> Result<Value> {
@@ -262,7 +263,7 @@ fn paper(db: &Connection, clock: &Clock, since: f64, cfg: &Config) -> Result<Val
     // old, non-executable `bundle_net` / `per_position_sum` basis; those are counted apart (legacy)
     // so the paper table is not mixed with auctions no op could actually have won.
     let mut q = db.prepare(
-        "SELECT a.head, a.bundle_net_usd, a.eth_usd, a.value_ms, a.json, t.win_bid_eth, t.winner, a.bonus_usd
+        "SELECT a.head, a.bundle_net_usd, a.eth_usd, COALESCE(a.ready_ms, a.value_ms), a.json, t.win_bid_eth, t.winner, a.bonus_usd
          FROM atlas_auctions a JOIN liq_txs t ON t.user_op_hash = a.user_op_hash
          WHERE a.liquidatable > 0 AND a.bid_basis = 'batch_est' AND t.win_bid_eth IS NOT NULL AND a.head >= ?1 ORDER BY a.head",
     )?;

@@ -662,6 +662,11 @@ pub struct ExecConfig {
     /// re-quoted over pools only. Public Kyber source ids, not strategy.
     #[serde(default = "default_kyber_rfq_exclude")]
     pub kyber_rfq_exclude: String,
+    /// Time budget (ms) for a single Kyber /routes or /route/build call: past it the call is
+    /// abandoned (a timeout error), so the valuation falls back to the direct route or skips instead
+    /// of waiting (seen 2026-11-13: a Kyber quote took up to 12 s).
+    #[serde(default = "default_kyber_timeout_ms")]
+    pub kyber_timeout_ms: u64,
     pub slippage_bps: u32,
     pub priority_fee_wei: u128,
     /// How long a liquidation tx stays valid. 4 s = 2 blocks today, 20 blocks after Denim.
@@ -767,6 +772,9 @@ fn default_poll_ms() -> u64 {
 }
 fn default_kyber_rfq_exclude() -> String {
     "pmm-19,bebop".into()
+}
+fn default_kyber_timeout_ms() -> u64 {
+    700
 }
 fn default_bundle_gas_headroom() -> f64 {
     0.9

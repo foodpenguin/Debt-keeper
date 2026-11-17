@@ -253,7 +253,7 @@ impl venue::LiquidationVenue<Morpho> for Venue {
 /// standing Morpho allowance on every loan token, from the discovered storage slot).
 async fn build_planner_parts<P: Provider>(engine: &MorphoEngine<P>) -> Result<(Kyber, Venue)> {
     let cfg = &engine.cfg;
-    let kyber = Kyber::new(engine.http.clone(), &cfg.exec.kyber_api, &cfg.exec.kyber_client_id, &cfg.exec.kyber_rfq_exclude);
+    let kyber = Kyber::new(engine.http.clone(), &cfg.exec.kyber_api, &cfg.exec.kyber_client_id, &cfg.exec.kyber_rfq_exclude, cfg.exec.kyber_timeout_ms);
     if cfg.exec.venue == "flash" {
         return Ok((kyber, Venue::Flash(build_flash_venue(engine).await?)));
     }
@@ -1167,7 +1167,7 @@ async fn value_auction<P: Provider>(
     let mut row = json!({ "kind": "atlas_auction", "auction_id": a.id, "user_op_hash": a.user_op_hash, "aggregator": a.aggregator, "median": a.median.to_string(),
                           "deadline": a.deadline, "head": head.number, "max_fee_gwei": a.max_fee_per_gas as f64 / 1e9, "bid_usd": bid_usd, "bid_eth": bid_usd.map(|b| b / eth_usd.max(1.0)),
                           "eth_usd": eth_usd, "bid_basis": "batch_est", "bid_margin": atlas.margin, "queued_ms": queued_ms, "value_ms": value_ms });
-    for k in ["markets", "positions", "liquidatable", "bonus_usd", "bundle_net_usd", "net_usd", "bundle_ms", "shared"] {
+    for k in ["markets", "positions", "liquidatable", "bonus_usd", "bundle_net_usd", "net_usd", "bundle_ms", "ready_ms", "shared"] {
         row[k] = v[k].clone();
     }
     let _ = journal.send(row.to_string());
@@ -1288,14 +1288,16 @@ async fn batch_op<P: Provider>(
     let calldata = solver.calldata(loan, &inner, bid_wei, U256::ZERO);
     let venue = atlas_venue::AtlasBid { solver, bid_wei };
     let at = Some(venue::SimAt { number: block + 1, time: sim_time });
+    let t_sim = std::time::Instant::now();
     let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
+    let batch_sim_ms = t_sim.elapsed().as_millis() as u64;
     match r {
         Ok(s) => {
             // The real sim gas is the hard safety (an aggregator exit can run well above its
             // estimate): too close to the DappControl's solverGasLimit and the op risks running out
             // of gas on-chain, so it is not sent even though the sim passed.
             if !atlas_venue::fits_solver_gas(s.gas_used, solver_gas_limit, gas_headroom) {
-                return (row(json!({ "ok": false, "skipped": "gas_near_limit", "gas_used": s.gas_used, "limit": solver_gas_limit })), None);
+                return (row(json!({ "ok": false, "skipped": "gas_near_limit", "gas_used": s.gas_used, "limit": solver_gas_limit, "batch_sim_ms": batch_sim_ms })), None);
             }
             let net_after_bid = math::units(s.profit, m.meta.loan_decimals);
             let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, loan, eth_usd).unwrap_or(0.0);
@@ -1309,9 +1311,9 @@ async fn batch_op<P: Provider>(
                 gas_used: s.gas_used,
                 profit_usd: net_after_bid * loan_usd,
             });
-            (row(json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used })), cand)
+            (row(json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used, "batch_sim_ms": batch_sim_ms })), cand)
         }
-        Err(e) => (row(json!({ "bid_usd": bid_usd, "ok": false, "error": crate::revert::explain(&e) })), None),
+        Err(e) => (row(json!({ "bid_usd": bid_usd, "ok": false, "error": crate::revert::explain(&e), "batch_sim_ms": batch_sim_ms })), None),
     }
 }
 
@@ -1423,6 +1425,9 @@ async fn valuation<P: Provider>(
     // maxFeePerGas) plus the escrow's surcharge, per gas unit, in USD.
     let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
     let ops = futures::future::join_all(markets.iter().zip(&valued).enumerate().map(|(mi, (m, (bundle, _, ov, plans)))| solver_op(provider, parts, mi, m, bundle.as_ref(), plans.first().map(|(_, p)| p), ov, head.number, sim_time, a.deadline, atlas.min_bonus_usd, atlas.solver_gas_limit, atlas.bundle_gas_headroom, atlas_gas_usd, eth_usd))).await;
+    // From the auction's arrival to the batch op being sendable (valuation + the batch sim): the true
+    // send latency, longer than value_ms (which stops before the sims). Paper trading times with this.
+    let ready_ms = a.seen.elapsed().as_millis() as u64;
     let (mut solvers, cands): (Vec<Option<serde_json::Value>>, Vec<Option<OpCandidate>>) = ops.into_iter().map(|o| o.map_or((None, None), |(row, c)| (Some(row), c))).unzip();
     // Atlas takes one op per block from an EOA: the auction's candidates are tried most profitable
     // first (live + `submit`), regardless of which market's simulation finished first, until one
@@ -1472,7 +1477,7 @@ async fn valuation<P: Provider>(
             positions.push(json!({ "market": m.meta.name, "user": v.user, "hf": v.hf, "bonus_usd": v.bonus, "router": router, "net_usd": net, "error": err, "quote_ms": quote_ms, "sim_ms": sim_ms }));
         }
     }
-    json!({ "markets": rows, "positions": positions, "liquidatable": n_liq, "bonus_usd": bonus_sum, "bundle_net_usd": bundle_net, "net_usd": net_sum, "bundle_ms": bundle_ms_max, "valued_unix_ms": valued_unix_ms, "first_auction": a.id })
+    json!({ "markets": rows, "positions": positions, "liquidatable": n_liq, "bonus_usd": bonus_sum, "bundle_net_usd": bundle_net, "net_usd": net_sum, "bundle_ms": bundle_ms_max, "ready_ms": ready_ms, "valued_unix_ms": valued_unix_ms, "first_auction": a.id })
 }
 
 /// The risk gate's bid, checked at its own priority. The plan was simulated at the base priority;
