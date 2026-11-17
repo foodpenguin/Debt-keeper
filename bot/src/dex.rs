@@ -29,6 +29,9 @@ pub enum ExitRoute {
 pub struct SwapCall {
     pub target: Address,
     pub calldata: Bytes,
+    /// A short note on how the route was built (e.g. a fallback was taken), for the journal; None
+    /// when the primary route was used. Neutral text, set by the aggregator impl.
+    pub note: Option<&'static str>,
 }
 
 /// An external swap aggregator.

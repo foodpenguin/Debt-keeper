@@ -197,6 +197,19 @@ pub fn bundle_swap_budget(solver_gas_limit: u64, n: usize) -> u64 {
     solver_gas_limit.saturating_sub(BUNDLE_OVERHEAD_GAS + BUNDLE_GAS_PER_POSITION * n as u64)
 }
 
+/// Extra safety on an *aggregator* exit's gas in the bundle estimate (on top of KYBER_GAS_SAFETY):
+/// the aggregator's own estimate is less reliable than the self-built direct router's (seen
+/// 2026-11-13, a Kyber-exit batch ran ~1.2x its estimate), so its bid is priced and its budget
+/// checked more conservatively. The direct route (exact quoter) takes no extra factor.
+pub const BUNDLE_AGG_SWAP_SAFETY: f64 = 1.3;
+
+/// Whether a batch op's simulated gas leaves enough headroom under `solver_gas_limit` to send: the
+/// real sim gas (not the estimate) is gated so an under-estimated aggregator exit that would run
+/// close to the cap is not sent (it risks running out of gas on-chain or being rejected by Atlas).
+pub fn fits_solver_gas(gas_used: u64, solver_gas_limit: u64, headroom: f64) -> bool {
+    (gas_used as f64) <= solver_gas_limit as f64 * headroom
+}
+
 /// Exit modes in the batch liquidator's `exit` bytes (match MorphoLiquidator MODE_ROUTE/MODE_STEPS).
 const EXIT_MODE_ROUTE: u8 = 0x01;
 const EXIT_MODE_STEPS: u8 = 0x02;
@@ -224,7 +237,7 @@ fn batch_exit_bytes(exit: &ExitRoute, collateral: Address, total_seize: U256) ->
 
 
 /// What `Planner::quote_bundle` charges a solver op besides its swap.
-pub const ATLAS_BUNDLE_GAS: crate::planner::BundleGas = crate::planner::BundleGas { per_position: BUNDLE_GAS_PER_POSITION, overhead: BUNDLE_OVERHEAD_GAS };
+pub const ATLAS_BUNDLE_GAS: crate::planner::BundleGas = crate::planner::BundleGas { per_position: BUNDLE_GAS_PER_POSITION, overhead: BUNDLE_OVERHEAD_GAS, agg_swap_safety: BUNDLE_AGG_SWAP_SAFETY };
 
 #[cfg(test)]
 mod tests {
@@ -257,6 +270,15 @@ mod tests {
         // A 10-position bundle leaves 6M - 500k - 400k = 5.1M for the swap.
         assert_eq!(bundle_swap_budget(6_000_000, 10), 5_100_000);
         assert_eq!(bundle_capacity(1_000_000, 20), 0);
+    }
+
+    #[test]
+    fn gas_send_guard_rejects_ops_near_the_solver_limit() {
+        // 6M limit, 0.9 headroom: send up to 5.4M of real sim gas, not beyond.
+        assert!(fits_solver_gas(4_000_000, 6_000_000, 0.9));
+        assert!(fits_solver_gas(5_400_000, 6_000_000, 0.9));
+        // The 2026-11-13 case: a Kyber-exit batch that really used 5.95M is not sent.
+        assert!(!fits_solver_gas(5_950_000, 6_000_000, 0.9));
     }
 
     #[test]

@@ -9,6 +9,8 @@ pub struct Kyber {
     http: reqwest::Client,
     base: String,
     client_id: String,
+    /// Source ids excluded when a build fails on an RFQ/PMM route (re-quote over pools only).
+    rfq_exclude: String,
 }
 
 #[derive(Clone, Debug)]
@@ -19,12 +21,26 @@ pub struct Quote {
     pub gas: Option<u64>,
     /// Opaque route summary, passed back to /route/build.
     summary: Value,
+    /// The request, kept so a build failure on an RFQ/PMM route can re-quote over pools only.
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    gas_price_wei: Option<u128>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BuiltSwap {
     pub router: Address,
     pub calldata: Bytes,
+    /// The route was rebuilt without RFQ/PMM sources after the first build failed.
+    pub fell_back: bool,
+}
+
+/// A build error worth retrying without RFQ/PMM sources: a signed maker quote that expired or was
+/// declined ("pmm RFQ failed"), or the build endpoint refusing the route (HTTP 403 Forbidden).
+fn is_rfq_build_error(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    s.contains("pmm") || s.contains("rfq") || s.contains("forbidden") || s.contains("403")
 }
 
 /// Sends the request and parses JSON, keeping status + body head in the error for diagnosis.
@@ -72,13 +88,14 @@ fn parse_u256(v: &Value) -> Option<U256> {
 }
 
 impl Kyber {
-    pub fn new(http: reqwest::Client, base: &str, client_id: &str) -> Self {
-        Self { http, base: base.trim_end_matches('/').to_string(), client_id: client_id.to_string() }
+    pub fn new(http: reqwest::Client, base: &str, client_id: &str, rfq_exclude: &str) -> Self {
+        Self { http, base: base.trim_end_matches('/').to_string(), client_id: client_id.to_string(), rfq_exclude: rfq_exclude.to_string() }
     }
 
     /// One route. `gas_price_wei` (None = Kyber's default, the live price) is what Kyber charges each
-    /// unit of route gas when it compares splits: a high value buys fewer, cheaper paths.
-    pub async fn quote(&self, token_in: Address, token_out: Address, amount_in: U256, gas_price_wei: Option<u128>) -> Result<Quote> {
+    /// unit of route gas when it compares splits: a high value buys fewer, cheaper paths. `exclude`
+    /// (comma-separated source ids, empty = none) drops liquidity sources, e.g. RFQ/PMM on a retry.
+    pub async fn quote(&self, token_in: Address, token_out: Address, amount_in: U256, gas_price_wei: Option<u128>, exclude: &str) -> Result<Quote> {
         // gasInclude=true asks for gas-aware route selection and populates routeSummary.gas/gasUsd
         // (harmless at the default price; needed for the gasPrice penalty to bite).
         let mut query = vec![
@@ -89,6 +106,9 @@ impl Kyber {
         ];
         if let Some(g) = gas_price_wei {
             query.push(("gasPrice", g.to_string()));
+        }
+        if !exclude.is_empty() {
+            query.push(("excludedSources", exclude.to_string()));
         }
         let req = self.http.get(format!("{}/routes", self.base)).query(&query).header("x-client-id", &self.client_id);
         let resp = read_json(req).await?;
@@ -101,7 +121,7 @@ impl Kyber {
         if gas.is_none() {
             tracing::warn!("kyber route has no gas estimate; the gas budget falls back to simulation");
         }
-        Ok(Quote { amount_out, gas, summary })
+        Ok(Quote { amount_out, gas, summary, token_in, token_out, amount_in, gas_price_wei })
     }
 
     /// Best route whose swap fits `gas_budget` (real gas, after KYBER_GAS_SAFETY). Kyber's default
@@ -111,7 +131,7 @@ impl Kyber {
     /// (KYBER_GAS_LADDER) collapses it, e.g. 1 path / 0.47M gas for 0.24% less out; all rungs are
     /// quoted in parallel and the best one that fits wins.
     pub async fn quote_within(&self, token_in: Address, token_out: Address, amount_in: U256, gas_budget: u64) -> Result<Quote> {
-        let rungs = futures::future::join_all(KYBER_GAS_LADDER.iter().map(|g| self.quote(token_in, token_out, amount_in, *g))).await;
+        let rungs = futures::future::join_all(KYBER_GAS_LADDER.iter().map(|g| self.quote(token_in, token_out, amount_in, *g, ""))).await;
         let mut last_err = None;
         let ok: Vec<Quote> = rungs
             .into_iter()
@@ -123,10 +143,26 @@ impl Kyber {
         pick_within_budget(ok, gas_budget).with_context(|| format!("kyber: no route within {gas_budget} gas"))
     }
 
-    /// Calldata for the quoted route; `sender` is the contract that holds the tokens and calls the router.
+    /// Calldata for the quoted route; `sender` is the contract that holds the tokens and calls the
+    /// router. If the route's RFQ/PMM fill fails to build (expired or declined maker quote, or a
+    /// 403), re-quote the same trade over pools only (`rfq_exclude`) and build that, so one flaky
+    /// maker does not lose the auction. The fallback route is flagged (`fell_back`) for the journal.
     pub async fn build(&self, quote: &Quote, sender: Address, recipient: Address, slippage_bps: u32) -> Result<BuiltSwap> {
+        match self.build_summary(&quote.summary, sender, recipient, slippage_bps).await {
+            Ok((router, calldata)) => Ok(BuiltSwap { router, calldata, fell_back: false }),
+            Err(e) if is_rfq_build_error(&e) && !self.rfq_exclude.is_empty() => {
+                tracing::warn!(error = %e, exclude = %self.rfq_exclude, "kyber build failed on an RFQ/PMM route; re-quoting over pools only");
+                let q = self.quote(quote.token_in, quote.token_out, quote.amount_in, quote.gas_price_wei, &self.rfq_exclude).await?;
+                let (router, calldata) = self.build_summary(&q.summary, sender, recipient, slippage_bps).await?;
+                Ok(BuiltSwap { router, calldata, fell_back: true })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn build_summary(&self, summary: &Value, sender: Address, recipient: Address, slippage_bps: u32) -> Result<(Address, Bytes)> {
         let body = json!({
-            "routeSummary": quote.summary,
+            "routeSummary": summary,
             "sender": format!("{sender:#x}"),
             "recipient": format!("{recipient:#x}"),
             "slippageTolerance": slippage_bps,
@@ -137,10 +173,10 @@ impl Kyber {
             bail!("kyber build: {}", resp["message"]);
         }
         let d = &resp["data"];
-        Ok(BuiltSwap {
-            router: d["routerAddress"].as_str().context("kyber: no router")?.parse()?,
-            calldata: d["data"].as_str().context("kyber: no data")?.parse()?,
-        })
+        Ok((
+            d["routerAddress"].as_str().context("kyber: no router")?.parse()?,
+            d["data"].as_str().context("kyber: no data")?.parse()?,
+        ))
     }
 }
 
@@ -167,7 +203,7 @@ impl crate::dex::Dex for Kyber {
 
     async fn build(&self, quote: &Quote, sender: Address, recipient: Address, slippage_bps: u32) -> Result<crate::dex::SwapCall> {
         let b = Kyber::build(self, quote, sender, recipient, slippage_bps).await?;
-        Ok(crate::dex::SwapCall { target: b.router, calldata: b.calldata })
+        Ok(crate::dex::SwapCall { target: b.router, calldata: b.calldata, note: b.fell_back.then_some("no-rfq") })
     }
 }
 
@@ -176,7 +212,17 @@ mod tests {
     use super::*;
 
     fn q(out: u64, gas: u64) -> Quote {
-        Quote { amount_out: U256::from(out), gas: Some(gas), summary: Value::Null }
+        Quote { amount_out: U256::from(out), gas: Some(gas), summary: Value::Null, token_in: Address::ZERO, token_out: Address::ZERO, amount_in: U256::ZERO, gas_price_wei: None }
+    }
+
+    #[test]
+    fn rfq_build_errors_trigger_the_pool_only_fallback() {
+        assert!(is_rfq_build_error(&anyhow::anyhow!("kyber build: pmm RFQ failed")));
+        assert!(is_rfq_build_error(&anyhow::anyhow!("kyber http 403 Forbidden: ...")));
+        assert!(is_rfq_build_error(&anyhow::anyhow!("RFQ quote expired")));
+        // A generic failure is not retried over a different route.
+        assert!(!is_rfq_build_error(&anyhow::anyhow!("kyber build: insufficient liquidity")));
+        assert!(!is_rfq_build_error(&anyhow::anyhow!("connection reset")));
     }
 
     #[test]
@@ -190,7 +236,7 @@ mod tests {
         // Nothing fits.
         assert!(pick_within_budget(ladder(), 500_000).is_none());
         // No estimate: passes (the simulation or the bundle's full budget accounts for it).
-        let unknown = Quote { amount_out: U256::from(1u8), gas: None, summary: Value::Null };
+        let unknown = Quote { amount_out: U256::from(1u8), gas: None, summary: Value::Null, token_in: Address::ZERO, token_out: Address::ZERO, amount_in: U256::ZERO, gas_price_wei: None };
         assert!(pick_within_budget(vec![unknown], 1).is_some());
     }
 }

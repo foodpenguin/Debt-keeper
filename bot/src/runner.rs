@@ -253,7 +253,7 @@ impl venue::LiquidationVenue<Morpho> for Venue {
 /// standing Morpho allowance on every loan token, from the discovered storage slot).
 async fn build_planner_parts<P: Provider>(engine: &MorphoEngine<P>) -> Result<(Kyber, Venue)> {
     let cfg = &engine.cfg;
-    let kyber = Kyber::new(engine.http.clone(), &cfg.exec.kyber_api, &cfg.exec.kyber_client_id);
+    let kyber = Kyber::new(engine.http.clone(), &cfg.exec.kyber_api, &cfg.exec.kyber_client_id, &cfg.exec.kyber_rfq_exclude);
     if cfg.exec.venue == "flash" {
         return Ok((kyber, Venue::Flash(build_flash_venue(engine).await?)));
     }
@@ -1203,6 +1203,8 @@ async fn solver_op<P: Provider>(
     sim_time: u64,
     deadline: u64,
     min_bonus_usd: f64,
+    solver_gas_limit: u64,
+    gas_headroom: f64,
     atlas_gas_usd: f64,
     eth_usd: f64,
 ) -> Option<(serde_json::Value, Option<OpCandidate>)> {
@@ -1216,7 +1218,7 @@ async fn solver_op<P: Provider>(
     if let Some(b) = bundle
         && let Some(plan) = &b.plan
     {
-        return Some(batch_op(provider, parts, mi, m, b, plan, solver, overrides, block, sim_time, deadline, atlas_gas_usd, eth_usd).await);
+        return Some(batch_op(provider, parts, mi, m, b, plan, solver, overrides, block, sim_time, deadline, solver_gas_limit, gas_headroom, atlas_gas_usd, eth_usd).await);
     }
 
     let Some(Ok(plan)) = top else { return None };
@@ -1258,6 +1260,8 @@ async fn batch_op<P: Provider>(
     block: u64,
     sim_time: u64,
     deadline: u64,
+    solver_gas_limit: u64,
+    gas_headroom: f64,
     atlas_gas_usd: f64,
     eth_usd: f64,
 ) -> (serde_json::Value, Option<OpCandidate>) {
@@ -1283,6 +1287,12 @@ async fn batch_op<P: Provider>(
     let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
     match r {
         Ok(s) => {
+            // The real sim gas is the hard safety (an aggregator exit can run well above its
+            // estimate): too close to the DappControl's solverGasLimit and the op risks running out
+            // of gas on-chain, so it is not sent even though the sim passed.
+            if !atlas_venue::fits_solver_gas(s.gas_used, solver_gas_limit, gas_headroom) {
+                return (row(json!({ "ok": false, "skipped": "gas_near_limit", "gas_used": s.gas_used, "limit": solver_gas_limit })), None);
+            }
             let net_after_bid = math::units(s.profit, m.meta.loan_decimals);
             let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, loan, eth_usd).unwrap_or(0.0);
             // Candidate when the op nets positive after the bid; the minProfit (profit x keep) that
@@ -1408,7 +1418,7 @@ async fn valuation<P: Provider>(
     // What Atlas charges a solver op for its gas: the metacall's gas price (the auction's
     // maxFeePerGas) plus the escrow's surcharge, per gas unit, in USD.
     let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
-    let ops = futures::future::join_all(markets.iter().zip(&valued).enumerate().map(|(mi, (m, (bundle, _, ov, plans)))| solver_op(provider, parts, mi, m, bundle.as_ref(), plans.first().map(|(_, p)| p), ov, head.number, sim_time, a.deadline, atlas.min_bonus_usd, atlas_gas_usd, eth_usd))).await;
+    let ops = futures::future::join_all(markets.iter().zip(&valued).enumerate().map(|(mi, (m, (bundle, _, ov, plans)))| solver_op(provider, parts, mi, m, bundle.as_ref(), plans.first().map(|(_, p)| p), ov, head.number, sim_time, a.deadline, atlas.min_bonus_usd, atlas.solver_gas_limit, atlas.bundle_gas_headroom, atlas_gas_usd, eth_usd))).await;
     let (mut solvers, cands): (Vec<Option<serde_json::Value>>, Vec<Option<OpCandidate>>) = ops.into_iter().map(|o| o.map_or((None, None), |(row, c)| (Some(row), c))).unzip();
     // Atlas takes one op per block from an EOA: the auction's candidates are tried most profitable
     // first (live + `submit`), regardless of which market's simulation finished first, until one

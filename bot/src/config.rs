@@ -183,6 +183,11 @@ pub struct AtlasConfig {
     /// Skip auctions whose total bonus is below this (USD). 0 = off (the real floor is private).
     #[serde(default)]
     pub min_bonus_usd: f64,
+    /// Fraction of `solver_gas_limit` a batch op's SIMULATED gas may use before it is not sent: the
+    /// aggregator exit's gas estimate is unreliable near the limit (seen 2026-11-13: a Kyber-exit
+    /// batch used 5.95M against a 4.9M estimate, almost the 6M cap). Leaves headroom for state drift.
+    #[serde(default = "default_bundle_gas_headroom")]
+    pub bundle_gas_headroom: f64,
     /// Auction valuations running at once. They share an RPC pool: a crash brings dozens of
     /// auctions within seconds, and unbounded valuations would starve it.
     #[serde(default = "default_atlas_concurrent")]
@@ -204,7 +209,7 @@ pub struct AtlasConfig {
 
 impl Default for AtlasConfig {
     fn default() -> Self {
-        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
+        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, bundle_gas_headroom: default_bundle_gas_headroom(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
     }
 }
 
@@ -635,6 +640,11 @@ pub struct ExecConfig {
     pub liquidator_artifact: String,
     pub kyber_api: String,
     pub kyber_client_id: String,
+    /// Kyber source ids (comma-separated) excluded when a build fails on an RFQ/PMM route (the
+    /// signed quote expired or the maker declined, e.g. "pmm RFQ failed" / HTTP 403): the route is
+    /// re-quoted over pools only. Public Kyber source ids, not strategy.
+    #[serde(default = "default_kyber_rfq_exclude")]
+    pub kyber_rfq_exclude: String,
     pub slippage_bps: u32,
     pub priority_fee_wei: u128,
     /// How long a liquidation tx stays valid. 4 s = 2 blocks today, 20 blocks after Denim.
@@ -737,6 +747,12 @@ pub struct MarketEntry {
 
 fn default_poll_ms() -> u64 {
     1000
+}
+fn default_kyber_rfq_exclude() -> String {
+    "pmm-19,bebop".into()
+}
+fn default_bundle_gas_headroom() -> f64 {
+    0.9
 }
 fn default_head_sanity_gap() -> u64 {
     // A chain never advances this many blocks between heads; only a lying endpoint does. Still small

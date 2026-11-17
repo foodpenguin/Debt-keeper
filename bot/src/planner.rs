@@ -37,6 +37,9 @@ const GAS_PER_EXTRA_PATH: u64 = 60_000;
 pub struct BundleGas {
     pub per_position: u64,
     pub overhead: u64,
+    /// Extra safety applied to an aggregator exit's swap gas (not the exact direct route's): the
+    /// aggregator's estimate is less reliable, so its bid and budget use a conservative figure.
+    pub agg_swap_safety: f64,
 }
 
 /// Gas of one liquidation outside its swap (protocol liquidate, callback, checks, transfers): what a
@@ -449,7 +452,12 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         // Route selection weighs the exits at the auction's gas price when given (gas dominates at
         // 15 gwei: a lower-gas exit can beat a higher-output one), else the planner's own.
         let gas_price = gas_price_wei.map(|w| w as f64).unwrap_or_else(|| self.route_gas_price(base_fee_wei));
-        let gas_units = |e: &BundleExit| e.3 + bundle_gas.per_position * views.len() as u64 + bundle_gas.overhead;
+        // The direct route's swap gas is an exact quote; an aggregator's is its own (looser)
+        // estimate, so it carries extra safety — a conservative bid, and over-budget routes rejected.
+        let gas_units = |e: &BundleExit| {
+            let swap = if e.0 == "direct" { e.3 } else { (e.3 as f64 * bundle_gas.agg_swap_safety) as u64 };
+            swap + bundle_gas.per_position * views.len() as u64 + bundle_gas.overhead
+        };
         let net = |e: &BundleExit| e.2 - gas_units(e) as f64 * gas_price / 1e18 * eth_usd;
         let de = direct.as_ref().ok().map(|x| &x.0);
         let ke = kyber.as_ref().ok().map(|x| &x.0);
@@ -598,6 +606,10 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             plan.error = Some(format!("router {} not allowlisted", built.target));
             return Ok(plan);
         }
+        // Record a build fallback (e.g. the aggregator re-quoted over pools after an RFQ failure).
+        if let Some(note) = built.note {
+            plan.router = format!("{} ({note})", plan.router);
+        }
         let route = ExitRoute::Call { target: built.target, calldata: built.calldata };
         let payload = self.venue.encode(c.meta, c.view.user, pair, seize, repaid, &route, U256::ZERO, c.deadline_block);
         let calldata = payload.calldata.clone();
@@ -727,7 +739,7 @@ mod generic_tests {
         assert_eq!(v.max_seize, U256::from(90u64));
 
         let planner = Planner { protocol: &toy, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000 }, false, 5, None, None).await;
+        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000, agg_swap_safety: 1.3 }, false, 5, None, None).await;
         assert_eq!(q.positions, 1);
         let err = q.error.unwrap();
         assert!(err.contains("no direct pools") && err.contains("mockdex: off (mockdex quotes"), "{err}");
@@ -779,7 +791,7 @@ mod generic_tests {
         for (exit_holder, want) in [(Some(holder), holder), (None, LiquidationVenue::<Toy>::target(&venue))] {
             let dex = HolderDex::default();
             let planner = Planner { protocol: &toy, aggregator: &dex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-            let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000 }, true, 5, None, exit_holder).await;
+            let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 }, true, 5, None, exit_holder).await;
             assert_eq!(q.router, "holderdex", "{:?}", q.error);
             assert!(q.plan.as_ref().is_some_and(|p| matches!(p.exit, ExitRoute::Call { .. })), "{:?}", q.error);
             assert_eq!(*dex.0.lock().unwrap(), vec![(want, want)]);
