@@ -209,13 +209,17 @@ pub struct AtlasConfig {
     /// the Atlas escrow at start (`getAtlasSurchargeRate`, scale 1e4); this is the fallback.
     #[serde(default = "default_atlas_surcharge")]
     pub gas_surcharge: f64,
+    /// The auctioned userOp's gas limit when the feed message does not carry it (`gas`): part of
+    /// every solver op's maximum liability, which the bond must cover.
+    #[serde(default = "default_user_op_gas")]
+    pub user_op_gas: u64,
     #[serde(default)]
     pub solver: SolverConfig,
 }
 
 impl Default for AtlasConfig {
     fn default() -> Self {
-        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, bundle_gas_headroom: default_bundle_gas_headroom(), eager_hedge_max_in_flight: default_eager_hedge_max(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), solver: SolverConfig::default() }
+        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, bundle_gas_headroom: default_bundle_gas_headroom(), eager_hedge_max_in_flight: default_eager_hedge_max(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), user_op_gas: default_user_op_gas(), solver: SolverConfig::default() }
     }
 }
 
@@ -259,17 +263,25 @@ pub struct SolverConfig {
     /// Sign the solver operation of each valued auction whose op succeeds with a profit after the
     /// bid, and submit it to `endpoint` (atlas_submit.rs). Only in live mode (exec.mode = "live"
     /// and `watch --live`), with the solver and its liquidator deployed (`address`, `liquidator`),
-    /// the signer = the hot wallet, and at least `min_bond_eth` atlETH bonded by it.
+    /// the signer = the hot wallet, and at least `bond_min_eth` atlETH bonded by it.
     #[serde(default)]
     pub submit: bool,
     #[serde(default = "default_bid_endpoint")]
     pub endpoint: String,
-    #[serde(default = "default_min_bond")]
-    pub min_bond_eth: f64,
-    /// Most the bond may shrink in a UTC day (gas charged for our solver ops, in USD at the ETH
-    /// price of the check): past it no op is submitted until the next day.
-    #[serde(default = "default_bond_budget")]
-    pub atlas_bond_budget_usd: f64,
+    /// atlETH bonded by the signer below which no solver op is submitted (and an alert is logged):
+    /// under it even the smallest op's liability is not covered. No default: required with `submit`.
+    #[serde(default)]
+    pub bond_min_eth: Option<f64>,
+    /// atlETH bonded above which the excess (built up by ops paying more gas than charged) is due to
+    /// leave the bond for PROFIT_RECEIVER: alerted, or withdrawn with `bond_auto_withdraw`. Also the
+    /// most a stolen hot wallet could take out of the bond. No default: required with `submit`.
+    #[serde(default)]
+    pub bond_max_eth: Option<f64>,
+    /// Above `bond_max_eth`, the hot wallet unbonds the excess, waits out Atlas's ESCROW_DURATION,
+    /// withdraws it and sends the ETH to PROFIT_RECEIVER (live mode, kill switch off, one at a time,
+    /// at the normal gas price). Off: only an alert.
+    #[serde(default)]
+    pub bond_auto_withdraw: bool,
 }
 
 impl Default for SolverConfig {
@@ -288,8 +300,9 @@ impl Default for SolverConfig {
             stub_artifact: default_atlas_stub_artifact(),
             submit: false,
             endpoint: default_bid_endpoint(),
-            min_bond_eth: default_min_bond(),
-            atlas_bond_budget_usd: default_bond_budget(),
+            bond_min_eth: None,
+            bond_max_eth: None,
+            bond_auto_withdraw: false,
         }
     }
 }
@@ -297,11 +310,8 @@ impl Default for SolverConfig {
 fn default_bid_endpoint() -> String {
     crate::atlas_submit::SVR_BID_ENDPOINT.into()
 }
-fn default_min_bond() -> f64 {
-    0.01
-}
-fn default_bond_budget() -> f64 {
-    2.0
+fn default_user_op_gas() -> u64 {
+    500_000
 }
 fn default_atlas_surcharge() -> f64 {
     0.1
@@ -495,12 +505,40 @@ mod tests {
     }
 
     #[test]
+    fn removed_bond_keys_get_a_migration_message() {
+        for (key, new) in [("min_bond_eth = 0.01", "bond_min_eth"), ("atlas_bond_budget_usd = 2.0", "bond_max_eth")] {
+            let legacy: toml::Table = format!("[atlas.solver]\nsimulate = true\n{key}\n").parse().unwrap();
+            let err = Config::reject_legacy_layout_of(&legacy).unwrap_err().to_string();
+            assert!(err.contains("removed in v0.4.0") && err.contains(new), "{err}");
+        }
+        let current: toml::Table = "[atlas.solver]\nbond_min_eth = 1.0\nbond_max_eth = 2.0\n".parse().unwrap();
+        assert!(Config::reject_legacy_layout_of(&current).is_ok());
+    }
+
+    #[test]
+    fn submitting_needs_a_valid_bond_band() {
+        let mut cfg = Config::load("config.example.toml").unwrap();
+        cfg.atlas.solver.submit = true;
+        assert!(cfg.validate().unwrap_err().to_string().contains("bond_min_eth and bond_max_eth"));
+        cfg.atlas.solver.bond_min_eth = Some(2.0);
+        cfg.atlas.solver.bond_max_eth = Some(1.0);
+        assert!(cfg.validate().unwrap_err().to_string().contains("0 < bond_min_eth < bond_max_eth"));
+        cfg.atlas.solver.bond_max_eth = Some(3.0);
+        assert!(cfg.validate().is_ok());
+        cfg.atlas.solver.submit = false;
+        cfg.atlas.solver.bond_min_eth = None;
+        assert!(cfg.validate().is_ok(), "not submitting: no band needed");
+    }
+
+    #[test]
     fn new_settings_have_their_defaults() {
         let cfg = Config::load("config.example.toml").unwrap();
         assert_eq!(cfg.atlas.address, "0x583dcFef0D240DC80753F0F0B26513feE27D9B77".parse::<Address>().unwrap());
         assert_eq!(cfg.atlas.svr_cutoff_secs, 10);
         assert!(cfg.atlas.rpc.is_empty() && cfg.atlas.logs_ws.is_empty());
-        assert_eq!(cfg.atlas.solver.atlas_bond_budget_usd, 2.0);
+        // The bond band has no defaults (an operator's numbers); auto-withdraw is off.
+        assert_eq!((cfg.atlas.solver.bond_min_eth, cfg.atlas.solver.bond_max_eth, cfg.atlas.solver.bond_auto_withdraw), (None, None, false));
+        assert_eq!(cfg.atlas.user_op_gas, 500_000);
         assert_eq!((cfg.exec.max_tx_cost_eth, cfg.exec.daily_loss_limit_usd), (0.002, 5.0));
         assert!(cfg.exec.ledger_file.is_empty() && cfg.exec.replan_secs.is_none());
     }
@@ -906,6 +944,16 @@ impl Config {
                 anyhow::ensure!(!fb.contains_key(old), "[flashblocks] {old} moved to {new} (see config.example.toml)");
             }
         }
+        // v0.4.0: solver ops pay their gas out of the proceeds, so the bond no longer shrinks by
+        // design; a daily bond budget and a single floor gave way to a min/max band.
+        if let Some(s) = t.get("atlas").and_then(|v| v.get("solver")).and_then(|v| v.as_table()) {
+            for (old, new) in [
+                ("min_bond_eth", "bond_min_eth (the floor below which no op is submitted)"),
+                ("atlas_bond_budget_usd", "bond_min_eth / bond_max_eth (ops now pay their own gas; the daily loss stop, [exec] daily_loss_limit_usd, still counts what failed ops cost the bond)"),
+            ] {
+                anyhow::ensure!(!s.contains_key(old), "[atlas.solver] {old} was removed in v0.4.0: use {new} (see CHANGELOG, config.example.toml)");
+            }
+        }
         Ok(())
     }
 
@@ -925,6 +973,13 @@ impl Config {
         if e.venue == "flash" {
             anyhow::ensure!(self.router.mode != "direct", "exec.venue = \"flash\" takes aggregator exits only: router.mode must be \"best\" or \"aggregator\"");
             anyhow::ensure!(!self.flashblocks.enabled || self.flashblocks.router != "direct", "exec.venue = \"flash\" takes aggregator exits only: flashblocks.router must be \"best\" or \"aggregator\"");
+        }
+        let s = &self.atlas.solver;
+        if s.submit {
+            let (Some(min), Some(max)) = (s.bond_min_eth, s.bond_max_eth) else {
+                anyhow::bail!("[atlas.solver] submit = true needs bond_min_eth and bond_max_eth (the bond band; no defaults)");
+            };
+            anyhow::ensure!(min > 0.0 && max > min, "[atlas.solver] bond_min_eth = {min} and bond_max_eth = {max}: need 0 < bond_min_eth < bond_max_eth");
         }
         Ok(())
     }

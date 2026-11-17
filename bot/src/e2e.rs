@@ -336,7 +336,7 @@ async fn e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation() {
     let route = ExitRoute::Packed(hop(UNI_WETH_USDC_500, 1, 10u128.pow(17)).into());
     let mut nets = vec![];
     for bid_wei in [U256::ZERO, U256::from(10u64).pow(U256::from(15)), U256::from(10u64).pow(U256::from(18))] {
-        let venue = AtlasBid { solver: &solver, bid_wei };
+        let venue = AtlasBid { solver: &solver, bid_wei, gas_pay_wei: U256::ZERO, gas_liability_wei: U256::ZERO };
         let payload = venue.encode(&meta, WETH_BORROWER, crate::morpho::pair_of(&meta), seize, U256::ZERO, &route, U256::ZERO, n + 5);
         let r = venue.simulate(&p, payload.calldata, BlockId::number(n), &StateOverride::default(), None, None, None).await;
         println!("e2e atlas solver: bid {bid_wei} wei -> {:?}", r.as_ref().map(|s| (s.profit, s.gas_used)).map_err(|e| e.to_string()));
@@ -405,8 +405,8 @@ async fn e2e_atlas_batch_solver_op() {
     let mut nets = vec![];
     for bid_wei in [U256::ZERO, U256::from(10u64).pow(U256::from(15)), U256::from(10u64).pow(U256::from(18))] {
         let inner = solver.batch_inner(&meta, &plan, n + 5);
-        let calldata = solver.calldata(USDC, &inner, bid_wei, U256::ZERO);
-        let venue = AtlasBid { solver: &solver, bid_wei };
+        let calldata = solver.calldata(USDC, &inner, bid_wei, U256::ZERO, U256::ZERO);
+        let venue = AtlasBid { solver: &solver, bid_wei, gas_pay_wei: U256::ZERO, gas_liability_wei: U256::ZERO };
         let r = venue.simulate(&p, calldata, BlockId::number(n), &StateOverride::default(), None, None, None).await;
         println!("e2e atlas batch ({} positions): bid {bid_wei} wei -> {:?}", items.len(), r.as_ref().map(|s| (s.profit, s.gas_used)).map_err(|e| e.to_string()));
         nets.push(r.ok().map(|s| s.profit));
@@ -414,6 +414,84 @@ async fn e2e_atlas_batch_solver_op() {
     let (free, bid) = (nets[0].expect("no-bid batch op succeeds"), nets[1].expect("0.001 ETH bid batch op succeeds"));
     assert!(free > U256::ZERO && bid < free, "the bid is paid out of the bundle's profit: {free} -> {bid}");
     assert!(nets[2].is_none(), "a 1 ETH bid on this small bundle cannot be paid");
+}
+
+/// v0.4.0: an Atlas solver op pays its own gas in ETH out of the liquidation (simulation only, the
+/// bot's own code path): the bid swap buys the bid plus the gas pay, the Atlas stand-in reports the
+/// liability the bot computed (storage override), and the simulated profit is the net after both.
+/// The gas pay costs about what the same ETH as a bid costs; a gas pay the proceeds cannot buy fails
+/// the op. (The real Atlas escrow's settlement of that ETH against the bond is the forge test
+/// `AtlasBondGas.fork.t.sol`.)
+#[tokio::test]
+#[ignore = "needs anvil + network; run with --ignored"]
+async fn e2e_atlas_op_pays_its_own_gas() {
+    use alloy::{eips::BlockId, rpc::types::state::StateOverride, sol_types::SolCall};
+
+    use crate::{
+        atlas_venue::{AtlasBid, AtlasSolver, OpGasPrice, SIM_SOLVER, non_solver_gas},
+        dex::ExitRoute,
+        venue::LiquidationVenue,
+    };
+    alloy::sol! { interface IShortfall { function shortfall() external view returns (uint256 gasLiability, uint256 borrowLiability); } }
+    const ATLAS: Address = address!("583dcFef0D240DC80753F0F0B26513feE27D9B77");
+    const WETH: Address = address!("4200000000000000000000000000000000000006");
+    const UNI_ROUTER: Address = address!("2626664c2603336E57B271c5C0b26F421741e481");
+
+    let fork = std::env::var("BASE_FORK_URL").unwrap_or_else(|_| "https://base.gateway.tenderly.co".into());
+    let anvil = Anvil::new().fork(fork).chain_id(8453).spawn();
+    let p = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let signer = anvil.addresses()[1];
+    let meta = onchain::load_market_meta(&p, MORPHO, WETH_MARKET, "WETH/USDC").await.unwrap();
+    let p0 = IOraclePrice::new(meta.params.oracle, &p).price().call().await.unwrap();
+    p.anvil_set_code(meta.params.oracle, sim::constant_price_oracle(p0 * U256::from(9) / U256::from(10))).await.unwrap();
+    let n = p.get_block_number().await.unwrap();
+
+    let solver_code = sim::LiquidatorCode::build(&p, "../contracts/out/AtlasLiquidationSolver.sol/AtlasLiquidationSolver.json", &[ATLAS, WETH, signer, signer, signer], signer).await.unwrap();
+    let liq_code = sim::LiquidatorCode::build(&p, "../contracts/out/MorphoLiquidator.sol/MorphoLiquidator.json", &[MORPHO, SIM_SOLVER, SIM_SOLVER, SIM_SOLVER], SIM_SOLVER).await.unwrap();
+    let mut liq = Simulator::new(None, SIM_SOLVER, Some(liq_code), vec![]);
+    liq.add_approval(USDC, sim::discover_allowance_key(&p, USDC, liq.liquidator, MORPHO).await.unwrap());
+    let art: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("../contracts/out/AtlasStub.sol/AtlasStub.json").unwrap()).unwrap();
+    let stub: Bytes = art["deployedBytecode"]["object"].as_str().unwrap().parse().unwrap();
+    let solver = AtlasSolver::new(ATLAS, None, signer, WETH, UNI_ROUTER, 500, liq, Some(solver_code), stub);
+
+    let seize = U256::from(10u64).pow(U256::from(17)); // 0.1 WETH
+    let route = ExitRoute::Packed(hop(UNI_WETH_USDC_500, 1, 10u128.pow(17)).into());
+    let run = |bid_wei: U256, gas_pay_wei: U256, gas_liability_wei: U256| {
+        let (solver, meta, route, p) = (&solver, &meta, &route, &p);
+        async move {
+            let venue = AtlasBid { solver, bid_wei, gas_pay_wei, gas_liability_wei };
+            let payload = venue.encode(meta, WETH_BORROWER, crate::morpho::pair_of(meta), seize, U256::ZERO, route, U256::ZERO, n + 5);
+            venue.simulate(p, payload.calldata, BlockId::number(n), &StateOverride::default(), None, None, None).await
+        }
+    };
+    let milli = U256::from(10u64).pow(U256::from(15));
+    let base = run(U256::ZERO, U256::ZERO, U256::ZERO).await.expect("no bid, no gas pay");
+    let with_bid = run(milli, U256::ZERO, U256::ZERO).await.expect("0.001 ETH bid");
+    // The bot's own gas maths: pay the op's gas, report the liability Atlas would (op gas + userOp
+    // 0.5M + dappGasLimit 2M + overhead). At 1.5 gwei, so this small (0.1 WETH) liquidation can
+    // afford it; at an SVR auction's 15 gwei it cannot (below).
+    let price = OpGasPrice::new(1_500_000_000, 0.1);
+    let gas_pay = price.gas_pay_wei(with_bid.gas_used);
+    let liability = price.liability_wei(with_bid.gas_used, non_solver_gas(500_000, 2_000_000));
+    let with_gas = run(milli, gas_pay, liability).await.expect("bid + gas pay");
+    println!("e2e atlas gas: profit {} (no bid) -> {} (0.001 ETH bid) -> {} (+ {} wei gas pay, liability {})", base.profit, with_bid.profit, with_gas.profit, gas_pay, liability);
+    assert!(with_gas.profit < with_bid.profit, "the gas is paid out of the profit");
+    // A wei of ETH costs the same USDC whether it is bid or gas: compare per wei (5 %, pool curvature).
+    let per_wei = |usdc: U256, wei: U256| usdc.to::<u128>() as f64 / wei.to::<u128>() as f64;
+    let (bid_cost, gas_cost) = (per_wei(base.profit - with_bid.profit, milli), per_wei(with_bid.profit - with_gas.profit, gas_pay));
+    assert!((gas_cost / bid_cost - 1.0).abs() < 0.05, "gas pay priced like the bid: {gas_cost} vs {bid_cost} USDC per wei");
+    // The stand-in reports exactly the liability it was given (what the contract caps its payment at).
+    let ov = solver.overrides(&StateOverride::default(), liability);
+    let r = sim::simulate_call(&p, signer, ATLAS, IShortfall::shortfallCall {}.abi_encode().into(), BlockId::number(n), &ov, None, None, None).await.unwrap();
+    let s = IShortfall::shortfallCall::abi_decode_returns(&r.return_data).unwrap();
+    assert_eq!((s.gasLiability, s.borrowLiability), (liability, U256::ZERO));
+    // A gas pay the proceeds cannot buy fails the op: at the SVR price the metacall gas of this
+    // small liquidation costs more than it makes, so it is not done at a loss.
+    let svr = OpGasPrice::new(15_005_000_000, 0.1);
+    let svr_pay = svr.gas_pay_wei(with_bid.gas_used);
+    let r = run(milli, svr_pay, svr.liability_wei(with_bid.gas_used, non_solver_gas(500_000, 2_000_000))).await;
+    println!("e2e atlas gas: at 15.005 gwei the gas pay is {svr_pay} wei -> {:?}", r.as_ref().map(|s| s.profit).map_err(crate::revert::explain));
+    assert!(r.is_err(), "the proceeds cannot buy the bid and the SVR-priced gas");
 }
 
 /// A tx given up on while it still sits in the mempool is replaced (same nonce, 0-value

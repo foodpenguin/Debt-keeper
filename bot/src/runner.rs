@@ -27,7 +27,7 @@ use alloy::sol;
 use crate::{
     actor::{self, ExecHandle},
     bid::WinningBids,
-    atlas, atlas_submit, atlas_venue, config, dex, executor, flash_venue, funding, gates, heads, live, loss, morpho, oracle, oracle_logs, planner, protocol, risk, rpc, sim, v3router, venue,
+    atlas, atlas_bond, atlas_submit, atlas_venue, config, dex, executor, flash_venue, funding, gates, heads, live, loss, morpho, oracle, oracle_logs, planner, protocol, risk, rpc, sim, v3router, venue,
     config::Config,
     engine::JournalRow,
     heads::Head,
@@ -560,26 +560,52 @@ sol! {
     }
 }
 
-/// `[atlas.solver] submit` in live mode: the solver operations' signer, after checking that the
-/// deployed solver is run by it and that it has atlETH bonded. None in shadow mode or without
-/// `submit`.
-async fn build_submitter<P: Provider>(engine: &MorphoEngine<P>, signer: Option<&alloy::signers::local::PrivateKeySigner>) -> Result<Option<atlas_submit::Submitter>> {
+/// `[atlas.solver] submit` in live mode: the solver operations' signer and the bond band, after
+/// checking that the deployed solver is run by it, pays a cold PROFIT_RECEIVER, and that the signer
+/// has at least `bond_min_eth` atlETH bonded. None in shadow mode or without `submit`.
+async fn build_submitter<P: Provider>(engine: &MorphoEngine<P>, signer: Option<&alloy::signers::local::PrivateKeySigner>) -> Result<Option<(atlas_submit::Submitter, BondBand)>> {
     use alloy::sol_types::SolCall;
     let c = &engine.cfg.atlas.solver;
     let Some(signer) = signer.filter(|_| c.submit) else { return Ok(None) };
     let (p, atlas, control) = (&engine.provider, engine.cfg.atlas.address, engine.cfg.atlas.control);
     let solver = c.address.context("atlas.solver.submit needs the deployed solver address")?;
     anyhow::ensure!(c.signer.is_none_or(|s| s == signer.address()), "atlas.solver.signer must be the hot wallet (it signs the solver ops)");
-    let req = alloy::rpc::types::TransactionRequest::default().to(solver).input(alloy::primitives::Bytes::from(ILiquidatorView::executorCall {}.abi_encode()).into());
-    let run_by = ILiquidatorView::executorCall::abi_decode_returns(&p.call(req).await.context("solver executor()")?)?;
+    let read = |data: Vec<u8>| p.call(alloy::rpc::types::TransactionRequest::default().to(solver).input(alloy::primitives::Bytes::from(data).into()));
+    let run_by = ILiquidatorView::executorCall::abi_decode_returns(&read(ILiquidatorView::executorCall {}.abi_encode()).await.context("solver executor()")?)?;
     anyhow::ensure!(run_by == signer.address(), "solver {solver} is run by {run_by}, not the hot wallet {}", signer.address());
+    let receiver = ILiquidatorView::PROFIT_RECEIVERCall::abi_decode_returns(&read(ILiquidatorView::PROFIT_RECEIVERCall {}.abi_encode()).await.context("solver PROFIT_RECEIVER()")?)?;
+    anyhow::ensure!(receiver != signer.address(), "the solver's PROFIT_RECEIVER must be a cold wallet, not the hot signer");
+    // Config::validate requires both with submit.
+    let (min, max) = (c.bond_min_eth.context("atlas.solver.bond_min_eth")?, c.bond_max_eth.context("atlas.solver.bond_max_eth")?);
+    let band = BondBand { min_wei: eth_wei(min), max_wei: eth_wei(max), auto_withdraw: c.bond_auto_withdraw, receiver };
     let bonded = atlas_submit::bonded(p, atlas, signer.address()).await?;
     let bonded_eth = math::units(bonded, 18);
-    anyhow::ensure!(bonded_eth >= c.min_bond_eth, "{bonded_eth} atlETH bonded by {} < atlas.solver.min_bond_eth {} (Atlas.depositAndBond, see docs)", signer.address(), c.min_bond_eth);
+    anyhow::ensure!(bonded >= band.min_wei, "{bonded_eth} atlETH bonded by {} < atlas.solver.bond_min_eth {min} (Atlas.depositAndBond, see docs)", signer.address());
     let domain = atlas_submit::read_domain(p, atlas).await?;
     let gas_limit = atlas_submit::solver_gas_limit(p, control).await?;
-    warn!(%solver, signer = %signer.address(), bonded_eth, gas_limit, version = ?domain.version, "ATLAS LIVE: profitable solver operations WILL be signed and submitted");
-    Ok(Some(atlas_submit::Submitter::new(signer.clone(), domain, atlas, control, c.endpoint.clone(), engine.http.clone(), gas_limit)))
+    warn!(%solver, signer = %signer.address(), bonded_eth, bond_min_eth = min, bond_max_eth = max, auto_withdraw = c.bond_auto_withdraw, gas_limit, version = ?domain.version, "ATLAS LIVE: profitable solver operations WILL be signed and submitted");
+    Ok(Some((atlas_submit::Submitter::new(signer.clone(), domain, atlas, control, c.endpoint.clone(), engine.http.clone(), gas_limit), band)))
+}
+
+/// `eth` ETH in wei.
+fn eth_wei(eth: f64) -> U256 {
+    U256::from((eth * 1e18).round() as u128)
+}
+
+/// The DappControl's gas terms, when there is a solver venue. Live submission needs them (the bond
+/// check); in shadow a failed read only leaves the liability without them (logged).
+async fn read_dapp_gas<P: Provider>(engine: &MorphoEngine<P>, live_submit: bool) -> Result<Option<atlas_bond::DappGas>> {
+    if !engine.cfg.atlas.solver.simulate && !live_submit {
+        return Ok(None);
+    }
+    match atlas_bond::read_dapp_gas(&engine.provider, engine.cfg.atlas.control).await {
+        Ok(d) => Ok(Some(d)),
+        Err(e) if !live_submit => {
+            warn!(error = %e, "DappControl gas terms unreadable; solver op liabilities leave out dappGasLimit");
+            Ok(None)
+        }
+        Err(e) => Err(e.context("live solver submission needs the DappControl's gas terms")),
+    }
 }
 
 /// Live pre-flight: refuses to send unless the deployed contract, the hot wallet and the
@@ -655,18 +681,57 @@ struct PlannerParts {
     ledger: std::sync::Mutex<Ledger>,
     /// An Atlas op was accepted: read the bond again soon.
     bond_dirty: std::sync::atomic::AtomicBool,
-    /// `[atlas.solver] atlas_bond_budget_usd`.
-    atlas_bond_budget_usd: f64,
-    /// `[atlas.solver] min_bond_eth`: below it no op is submitted.
-    atlas_min_bond_eth: f64,
+    /// The DappControl's gas terms in every solver op's maximum liability (None = no solver venue).
+    dapp_gas: Option<atlas_bond::DappGas>,
+    /// `[atlas] user_op_gas`: the userOp gas limit when the feed omits it.
+    user_op_gas: u64,
+    /// The bond band and where withdrawn ETH goes (live + `[atlas.solver] submit`).
+    bond_band: Option<BondBand>,
+    /// Solver ops submitted lately (deadline, bid, gas pay): an Atlas result for one of them says
+    /// what gas a won op paid.
+    submitted_ops: std::sync::Mutex<Vec<SubmittedOp>>,
     /// The bidding policies (see policy.rs).
     auction: Arc<dyn AuctionBidPolicy>,
     priority: Arc<dyn PriorityBidPolicy>,
 }
 
+/// `[atlas.solver] bond_min_eth` / `bond_max_eth` / `bond_auto_withdraw`, and the solver's
+/// PROFIT_RECEIVER (where ETH withdrawn from the bond goes).
+#[derive(Debug, Clone, Copy)]
+struct BondBand {
+    min_wei: U256,
+    max_wei: U256,
+    auto_withdraw: bool,
+    receiver: Address,
+}
+
+/// A submitted solver op, kept until its deadline is long past.
+#[derive(Debug, Clone, Copy)]
+struct SubmittedOp {
+    deadline: u64,
+    bid_wei: U256,
+    gas_pay_wei: U256,
+}
+
+/// How long a submitted op is kept to match Atlas's result for it (blocks past its deadline).
+const SUBMITTED_KEEP_BLOCKS: u64 = 5_000;
+/// Most blocks one scan for our ops' Atlas results covers (a longer gap is scanned from its end).
+const RESULT_SCAN_BLOCKS: u64 = 2_000;
+
 impl PlannerParts {
     fn planner<'a>(&'a self, mode: &'a str) -> Planner<'a, Morpho, Venue, Kyber> {
         Planner { protocol: &self.protocol, aggregator: &self.kyber, venue: &self.venue, cfg: &self.exec, v3: Some(&self.v3), mode }
+    }
+
+    /// What Atlas charges this auction's solver ops per unit of gas (its max fee, Atlas's and the
+    /// bundler's surcharges).
+    fn op_gas_price(&self, a: &atlas::Auction) -> atlas_venue::OpGasPrice {
+        atlas_venue::OpGasPrice::new(a.max_fee_per_gas, self.atlas_surcharge + self.dapp_gas.map_or(0.0, |d| d.bundler_surcharge))
+    }
+
+    /// The metacall gas outside the solver ops in this auction's maximum liabilities.
+    fn non_solver_gas(&self, a: &atlas::Auction) -> u64 {
+        atlas_venue::non_solver_gas(a.user_op_gas.unwrap_or(self.user_op_gas), self.dapp_gas.map_or(0, |d| d.dapp_gas_limit))
     }
 
     /// The competition model's priority per USD of gross for `market` now (None = too few winners
@@ -1083,13 +1148,14 @@ async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngi
     let price = base.price * U256::from(10_000 - drop_bps) / U256::from(10_000u64);
     let m = auction_market(engine, mi, &base, price);
     let (kyber, simulator) = build_planner_parts(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: None, ledger: std::sync::Mutex::new(Ledger::in_memory()), bond_dirty: Default::default(), atlas_bond_budget_usd: engine.cfg.atlas.solver.atlas_bond_budget_usd, atlas_min_bond_eth: engine.cfg.atlas.solver.min_bond_eth, auction, priority });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: None, ledger: std::sync::Mutex::new(Ledger::in_memory()), bond_dirty: Default::default(), dapp_gas: read_dapp_gas(engine, false).await?, user_op_gas: engine.cfg.atlas.user_op_gas, bond_band: None, submitted_ops: Default::default(), auction, priority });
     let a = atlas::Auction {
         id: format!("replay-{market}-{at_block}"),
         aggregator: Address::ZERO,
         median: U256::ZERO,
         deadline: h.number + 100,
         max_fee_per_gas: 0,
+        user_op_gas: None,
         user_op_hash: alloy::primitives::B256::ZERO,
         seen: Instant::now(),
         seen_unix_ms: gates::unix_ms(),
@@ -1192,22 +1258,50 @@ struct OpCandidate {
     market: usize,
     payload: executor::Payload,
     bid_wei: U256,
+    /// Profit after the bid and the gas paid in ETH (`gas_pay_wei`), in the loan token.
     profit: U256,
     gas_used: u64,
-    /// Profit after the bid, in USD: how the auction's markets are ranked for its one op.
+    /// The gas pay the simulation paid (from the estimate); submission recomputes it from
+    /// `gas_used` and takes any difference out of `profit`.
+    gas_pay_wei: U256,
+    /// Loan-token price (USD) and decimals, to convert that difference.
+    loan_usd: f64,
+    loan_decimals: u8,
+    /// Profit after the bid and the gas, in USD: how the auction's markets are ranked for its one op.
     profit_usd: f64,
 }
 
-/// The auction's top position as a solver operation (`[atlas.solver] simulate`): its direct-router
-/// plan, wrapped into `atlasSolverCall` with a bid of the plan's net x (1 - margin), simulated against
-/// the Atlas stand-in. Returns the journal row and, when the op succeeds with a profit after the
-/// bid, the candidate for submission (`valuation` submits the auction's best one). None: solver
-/// venue off, or no direct-router plan to wrap (an aggregator route is built for the direct
-/// liquidator's address).
+/// What an auction's solver ops cost in gas: Atlas's charge per unit (max fee + surcharges), the
+/// non-solver part of their maximum liability, and the charge per unit in USD (the bid basis).
+#[derive(Debug, Clone, Copy)]
+struct OpCost {
+    price: atlas_venue::OpGasPrice,
+    non_solver: u64,
+    gas_usd: f64,
+}
+
+impl OpCost {
+    /// The stand-in's gas liability for an op whose gas is about `op_gas`: Atlas's maximum for it
+    /// (always above the gas pay, so the simulated op pays its whole gas pay).
+    fn liability(&self, op_gas: u64) -> U256 {
+        self.price.liability_wei(op_gas, self.non_solver)
+    }
+}
+
+/// The solver gas a valuation may plan an op for: the DappControl's limit, or less when the bond
+/// (`bonded`, None = not read / not live) covers only a smaller op's maximum liability. The op is
+/// submitted with its simulated gas x `gas_limit_buffer`, so the planned gas leaves that room.
+fn bond_capped_solver_gas(solver_gas_limit: u64, bonded: Option<U256>, cost: &OpCost, gas_limit_buffer: f64) -> u64 {
+    match bonded {
+        Some(b) => ((cost.price.affordable_op_gas(b, cost.non_solver) as f64 / gas_limit_buffer.max(1.0)) as u64).min(solver_gas_limit),
+        None => solver_gas_limit,
+    }
+}
+
 /// What `batch_solver_op` decided for a market: a journal row (handled), nothing (no solver venue),
 /// or "value the single-position op instead" (no executable bundle plan; that needs the plans).
 enum BatchOutcome {
-    Row(serde_json::Value, Option<OpCandidate>),
+    Row(serde_json::Value, Option<Box<OpCandidate>>),
     NoRow,
     NeedSingle,
 }
@@ -1230,7 +1324,7 @@ async fn batch_solver_op<P: Provider>(
     min_bonus_usd: f64,
     solver_gas_limit: u64,
     gas_headroom: f64,
-    atlas_gas_usd: f64,
+    cost: OpCost,
     eth_usd: f64,
 ) -> BatchOutcome {
     let (Some(solver), Venue::Callback(_)) = (&parts.solver, &parts.venue) else { return BatchOutcome::NoRow };
@@ -1242,8 +1336,8 @@ async fn batch_solver_op<P: Provider>(
     if let Some(b) = bundle
         && let Some(plan) = &b.plan
     {
-        let (row, cand) = batch_op(provider, parts, mi, m, b, plan, solver, overrides, block, sim_time, deadline, solver_gas_limit, gas_headroom, atlas_gas_usd, eth_usd).await;
-        return BatchOutcome::Row(row, cand);
+        let (row, cand) = batch_op(provider, parts, mi, m, b, plan, solver, overrides, block, sim_time, deadline, solver_gas_limit, gas_headroom, cost, eth_usd).await;
+        return BatchOutcome::Row(row, cand.map(Box::new));
     }
     BatchOutcome::NeedSingle
 }
@@ -1260,36 +1354,52 @@ async fn single_solver_op<P: Provider>(
     overrides: &StateOverride,
     block: u64,
     sim_time: u64,
-    atlas_gas_usd: f64,
+    cost: OpCost,
     eth_usd: f64,
 ) -> Option<(serde_json::Value, Option<OpCandidate>)> {
     let (Some(solver), Venue::Callback(_)) = (&parts.solver, &parts.venue) else { return None };
     let Some(Ok(plan)) = top else { return None };
     let payload = plan.payload.as_ref().filter(|_| plan.router == "direct")?;
     // Net of the op's gas as Atlas charges it (see valuation()).
-    let net = plan.profit_usd.unwrap_or(0.0) - plan.gas_used.unwrap_or(0) as f64 * atlas_gas_usd;
+    let op_gas = plan.gas_used.unwrap_or(0);
+    let net = plan.profit_usd.unwrap_or(0.0) - op_gas as f64 * cost.gas_usd;
     let Some(bid_usd) = parts.auction.bid_usd(Some(&m.meta.name), net.max(0.0), eth_usd) else {
         return Some((json!({ "bid_basis": "single_est", "ok": false, "skipped": "policy" }), None));
     };
     let bid_wei = U256::from((bid_usd / eth_usd.max(1.0) * 1e18) as u128);
-    let venue = atlas_venue::AtlasBid { solver, bid_wei };
-    let calldata = solver.calldata(m.meta.params.loanToken, &payload.calldata, bid_wei, U256::ZERO);
+    // The op pays its own gas (estimated from the plan's) in ETH out of the proceeds.
+    let gas_pay_wei = cost.price.gas_pay_wei(op_gas);
+    let venue = atlas_venue::AtlasBid { solver, bid_wei, gas_pay_wei, gas_liability_wei: cost.liability(op_gas) };
+    let calldata = solver.calldata(m.meta.params.loanToken, &payload.calldata, bid_wei, U256::ZERO, gas_pay_wei);
     let at = Some(venue::SimAt { number: block + 1, time: sim_time });
     let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
+    let gas_pay_eth = math::units(gas_pay_wei, 18);
     Some(match r {
         Ok(s) => {
             let net_after_bid = math::units(s.profit, m.meta.loan_decimals);
             let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, m.meta.params.loanToken, eth_usd).unwrap_or(0.0);
-            let cand = (!s.profit.is_zero()).then(|| OpCandidate { market: mi, payload: payload.clone(), bid_wei, profit: s.profit, gas_used: s.gas_used, profit_usd: net_after_bid * loan_usd });
-            (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used }), cand)
+            let cand = (!s.profit.is_zero()).then(|| OpCandidate {
+                market: mi,
+                payload: payload.clone(),
+                bid_wei,
+                profit: s.profit,
+                gas_used: s.gas_used,
+                gas_pay_wei,
+                loan_usd,
+                loan_decimals: m.meta.loan_decimals,
+                profit_usd: net_after_bid * loan_usd,
+            });
+            (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "net_after_bid_usd": net_after_bid * loan_usd, "gas_pay_eth": gas_pay_eth, "gas_used": s.gas_used }), cand)
         }
-        Err(e) => (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": false, "error": crate::revert::explain(&e) }), None),
+        Err(e) => (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": false, "gas_pay_eth": gas_pay_eth, "error": crate::revert::explain(&e) }), None),
     })
 }
 
 /// A batch solver op over a bundle's whole plan: the bid comes from the estimate (gross minus the
-/// whole metacall gas Atlas charges, decision 3), and the simulation only gates the send (its
-/// profit, gas and the gap to the estimate are journaled to recalibrate the gas constants).
+/// whole metacall gas Atlas charges, decision 3), and the op pays that same gas in ETH out of its
+/// proceeds (gasPayWei), so the simulated profit is the real net after the bid and the gas. The
+/// simulation gates the send (its profit, gas and the gap to the estimate are journaled to
+/// recalibrate the gas constants).
 #[allow(clippy::too_many_arguments)]
 async fn batch_op<P: Provider>(
     provider: &P,
@@ -1305,13 +1415,15 @@ async fn batch_op<P: Provider>(
     deadline: u64,
     solver_gas_limit: u64,
     gas_headroom: f64,
-    atlas_gas_usd: f64,
+    cost: OpCost,
     eth_usd: f64,
 ) -> (serde_json::Value, Option<OpCandidate>) {
     let loan = m.meta.params.loanToken;
-    let bid_basis = bundle.gross_usd - (plan.gas_est + atlas_venue::METACALL_FIXED_GAS) as f64 * atlas_gas_usd;
+    let bid_basis = bundle.gross_usd - (plan.gas_est + atlas_venue::METACALL_FIXED_GAS) as f64 * cost.gas_usd;
+    let gas_pay_wei = cost.price.gas_pay_wei(plan.gas_est);
+    let gas_pay_eth = math::units(gas_pay_wei, 18);
     let row = |extra: serde_json::Value| {
-        let mut base = json!({ "bid_basis": "batch_est", "positions": plan.items.len(), "router": plan.router, "bid_basis_usd": bid_basis, "est_gas": plan.gas_est });
+        let mut base = json!({ "bid_basis": "batch_est", "positions": plan.items.len(), "router": plan.router, "bid_basis_usd": bid_basis, "est_gas": plan.gas_est, "gas_pay_eth": gas_pay_eth });
         base.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         base
     };
@@ -1324,8 +1436,8 @@ async fn batch_op<P: Provider>(
     };
     let bid_wei = U256::from((bid_usd / eth_usd.max(1.0) * 1e18) as u128);
     let inner = solver.batch_inner(&m.meta, plan, deadline);
-    let calldata = solver.calldata(loan, &inner, bid_wei, U256::ZERO);
-    let venue = atlas_venue::AtlasBid { solver, bid_wei };
+    let calldata = solver.calldata(loan, &inner, bid_wei, U256::ZERO, gas_pay_wei);
+    let venue = atlas_venue::AtlasBid { solver, bid_wei, gas_pay_wei, gas_liability_wei: cost.liability(plan.gas_est) };
     let at = Some(venue::SimAt { number: block + 1, time: sim_time });
     let t_sim = std::time::Instant::now();
     let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
@@ -1340,29 +1452,73 @@ async fn batch_op<P: Provider>(
             }
             let net_after_bid = math::units(s.profit, m.meta.loan_decimals);
             let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, loan, eth_usd).unwrap_or(0.0);
-            // Candidate when the op nets positive after the bid; the minProfit (profit x keep) that
-            // protects it against state drift is patched in at submit, as for the single-position op.
+            // Candidate when the op nets positive after the bid and its gas; the minProfit (profit x
+            // keep) that protects it against state drift is set at submit, as for the single op.
             let cand = (!s.profit.is_zero()).then(|| OpCandidate {
                 market: mi,
                 payload: executor::Payload { to: solver.solver, calldata: inner, min_profit: atlas_venue::SOLVER_MIN_PROFIT },
                 bid_wei,
                 profit: s.profit,
                 gas_used: s.gas_used,
+                gas_pay_wei,
+                loan_usd,
+                loan_decimals: m.meta.loan_decimals,
                 profit_usd: net_after_bid * loan_usd,
             });
-            (row(json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used, "batch_sim_ms": batch_sim_ms })), cand)
+            (row(json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "net_after_bid_usd": net_after_bid * loan_usd, "gas_used": s.gas_used, "batch_sim_ms": batch_sim_ms })), cand)
         }
         Err(e) => (row(json!({ "bid_usd": bid_usd, "ok": false, "error": crate::revert::explain(&e), "batch_sim_ms": batch_sim_ms })), None),
     }
 }
 
-/// Signs and submits the simulated solver op `c` for auction `a` (see solver_op): minProfit after
-/// the bid = the simulated net x min_profit_keep, gas = simulated x gas_limit_buffer (within the
-/// DappControl's limit), the auction's own max fee and deadline. Refused when the kill switch is
-/// on, when this EOA already bid for that block, or when the op's worst-case gas charge to the
-/// bond, on top of the bond's shrinkage today, does not fit `[atlas.solver] atlas_bond_budget_usd`.
-/// Returns whether the endpoint accepted it, and the journal row saying what happened. The block's one-op slot is held only by an
-/// accepted op: a refusal after claiming it gives it back for the auction's next candidate.
+/// Why the bond does not let an op go (see `bond_allows`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BondRefusal {
+    /// No bond reading yet.
+    Unread,
+    /// Below `[atlas.solver] bond_min_eth`.
+    BelowMin { bonded: U256 },
+    /// The op's maximum liability exceeds the bonded atlETH: Atlas would not run it.
+    Insufficient { liability: U256, bonded: U256 },
+}
+
+/// Whether the bond lets an op with this maximum liability go: Atlas checks `bonded >= liability`
+/// before it runs a solver op (else InsufficientEscrow), and below `min` the bot sends nothing.
+fn bond_allows(bonded: Option<U256>, min: U256, liability: U256) -> Result<(), BondRefusal> {
+    let bonded = bonded.ok_or(BondRefusal::Unread)?;
+    if bonded < min {
+        return Err(BondRefusal::BelowMin { bonded });
+    }
+    if liability > bonded {
+        return Err(BondRefusal::Insufficient { liability, bonded });
+    }
+    Ok(())
+}
+
+/// The op's profit (loan-token units) once the gas pay set at submission (`send_pay`) replaces the
+/// simulated one (`sim_pay`): the swap buys the difference out of the proceeds, so an increase comes
+/// out of the profit (at the ETH and loan-token prices); a decrease is left out (conservative).
+fn profit_at_gas_pay(profit: U256, sim_pay: U256, send_pay: U256, eth_usd: f64, loan_usd: f64, loan_decimals: u8) -> U256 {
+    let extra_eth = math::units(send_pay.saturating_sub(sim_pay), 18);
+    if extra_eth == 0.0 {
+        return profit;
+    }
+    if loan_usd <= 0.0 {
+        return U256::ZERO; // no price to convert at: count it as eating the whole profit
+    }
+    let extra = extra_eth * eth_usd / loan_usd * 10f64.powi(loan_decimals as i32);
+    profit.saturating_sub(U256::from(extra.ceil() as u128))
+}
+
+/// Signs and submits the simulated solver op `c` for auction `a` (see solver_op): gas = simulated x
+/// gas_limit_buffer (within the DappControl's limit); the gas it pays in ETH recomputed from that
+/// gas (the valuation priced the estimate) and any increase taken out of its profit; minProfit = that
+/// net x min_profit_keep; the auction's own max fee and deadline. Refused when the kill switch is on,
+/// when this EOA already bid for that block, when the bond is below `bond_min_eth`, or when the op's
+/// maximum liability (its gas + the metacall's non-solver gas, at the max fee + surcharges) exceeds
+/// the bonded atlETH (Atlas would not run it). Returns whether the endpoint accepted it, and the
+/// journal row saying what happened. The block's one-op slot is held only by an accepted op: a
+/// refusal after claiming it gives it back for the auction's next candidate.
 async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, solver: &atlas_venue::AtlasSolver, a: &atlas::Auction, m: &AuctionMarket, c: &OpCandidate, eth_usd: f64) -> (bool, serde_json::Value) {
     let e = &parts.exec;
     let refused = |why: String| (false, json!({ "ok": false, "error": why }));
@@ -1370,25 +1526,29 @@ async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, s
         return refused("kill switch file present".into());
     }
     let gas = ((c.gas_used as f64 * e.gas_limit_buffer) as u64).min(sub.gas_limit);
-    // What Atlas may take from the bond for this op: all of its gas at the auction's max fee plus
-    // the escrow's surcharge (also when the op fails).
-    let worst_usd = gas as f64 * a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
-    // The bond's shrinkage today plus this op's worst case must fit `[atlas.solver] atlas_bond_budget_usd`.
-    let (lost, bond) = {
-        let l = parts.ledger.lock().unwrap();
-        (l.atlas_loss_usd(eth_usd), l.bond_wei())
-    };
-    if let Some(b) = bond.filter(|b| math::units(*b, 18) < parts.atlas_min_bond_eth) {
-        return refused(format!("atlETH bond {} < atlas.solver.min_bond_eth {}", math::units(b, 18), parts.atlas_min_bond_eth));
+    let price = parts.op_gas_price(a);
+    let liability = price.liability_wei(gas, parts.non_solver_gas(a));
+    let bonded = parts.ledger.lock().unwrap().bond_wei();
+    let min = parts.bond_band.map_or(U256::ZERO, |b| b.min_wei);
+    match bond_allows(bonded, min, liability) {
+        Ok(()) => {}
+        Err(BondRefusal::Unread) => return refused("atlETH bond not read yet".into()),
+        Err(BondRefusal::BelowMin { bonded }) => return refused(format!("atlETH bond {} < atlas.solver.bond_min_eth {}", math::units(bonded, 18), math::units(min, 18))),
+        Err(BondRefusal::Insufficient { liability, bonded }) => {
+            return (false, json!({ "ok": false, "skipped": "bond_insufficient", "liability_eth": math::units(liability, 18), "bonded_eth": math::units(bonded, 18), "gas": gas }));
+        }
     }
-    if lost + worst_usd > parts.atlas_bond_budget_usd {
-        return refused(format!("atlas bond budget: lost {lost:.4} USD today + this op's worst case {worst_usd:.4} > {}", parts.atlas_bond_budget_usd));
+    // The gas paid in ETH, from the gas the op is sent with (erring high is credited to the bond).
+    let gas_pay = price.gas_pay_wei(gas);
+    let profit = profit_at_gas_pay(c.profit, c.gas_pay_wei, gas_pay, eth_usd, c.loan_usd, c.loan_decimals);
+    if profit.is_zero() {
+        return refused(format!("no profit left after paying the op's gas at its simulated gas ({} ETH)", math::units(gas_pay, 18)));
     }
     if !sub.claim(a.deadline) {
         return refused("this EOA already bid for that block (one op per block per EOA)".into());
     }
-    let min_profit = c.profit * U256::from((e.min_profit_keep * 1e4) as u64) / U256::from(10_000u64);
-    let data = solver.op_data(m.meta.params.loanToken, &c.payload.calldata, c.bid_wei, min_profit);
+    let min_profit = profit * U256::from((e.min_profit_keep * 1e4) as u64) / U256::from(10_000u64);
+    let data = solver.op_data(m.meta.params.loanToken, &c.payload.calldata, c.bid_wei, min_profit, gas_pay);
     let signed = match sub.op(solver.solver, a.user_op_hash, a.deadline, a.max_fee_per_gas, gas, c.bid_wei, data).and_then(|op| atlas_submit::sign(op, &sub.domain, &sub.signer)) {
         Ok(x) => x,
         Err(err) => {
@@ -1398,10 +1558,14 @@ async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, s
     };
     match atlas_submit::submit(&sub.http, &sub.endpoint, &a.id, &signed).await {
         Ok(r) => {
-            // Whether Atlas ran it is not observed here: the bond is read again soon (ledger.rs).
+            // Whether Atlas ran it is seen later, in its SolverTxResult logs (the bond check).
             parts.bond_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-            warn!(auction = %a.id, market = %m.meta.name, bid_eth = math::units(c.bid_wei, 18), gas, "ATLAS solver op SUBMITTED");
-            (true, json!({ "ok": true, "bid_wei": c.bid_wei.to_string(), "gas": gas, "min_profit": min_profit.to_string(), "answer": r }))
+            parts.submitted_ops.lock().unwrap().push(SubmittedOp { deadline: a.deadline, bid_wei: c.bid_wei, gas_pay_wei: gas_pay });
+            warn!(auction = %a.id, market = %m.meta.name, bid_eth = math::units(c.bid_wei, 18), gas_pay_eth = math::units(gas_pay, 18), gas, "ATLAS solver op SUBMITTED");
+            (
+                true,
+                json!({ "ok": true, "bid_wei": c.bid_wei.to_string(), "gas": gas, "gas_pay_wei": gas_pay.to_string(), "liability_eth": math::units(liability, 18), "bonded_eth": bonded.map(|b| math::units(b, 18)), "min_profit": min_profit.to_string(), "answer": r }),
+            )
         }
         Err(err) => {
             sub.unclaim(a.deadline);
@@ -1435,9 +1599,15 @@ async fn valuation<P: Provider>(
     // that contract (built for the main venue, the proceeds land elsewhere and the flash loan
     // cannot be repaid).
     let exit_holder = parts.solver.as_ref().map(|s| s.liquidator.liquidator);
-    // What Atlas charges a solver op's gas (metacall gas price + surcharge, per unit, USD); the batch
-    // op needs it, and it runs inside the future (S1) concurrently with the per-position plans.
-    let atlas_gas_usd = a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd;
+    // What Atlas charges this auction's solver ops for gas (per unit, with surcharges; in USD for
+    // the bid basis) and the non-solver part of their maximum liability. The batch op needs it, and
+    // it runs inside the future (S1) concurrently with the per-position plans.
+    let cost = OpCost { price: parts.op_gas_price(a), non_solver: parts.non_solver_gas(a), gas_usd: a.max_fee_per_gas as f64 * (1.0 + parts.atlas_surcharge) / 1e18 * eth_usd };
+    // Atlas runs an op only if the bond covers its maximum liability, so the bond caps how large an
+    // op can be: bundles are sized to what it affords (the op is submitted with the simulated gas x
+    // gas_limit_buffer) instead of being priced and then refused whole.
+    let bonded = parts.bond_band.and_then(|_| parts.ledger.lock().unwrap().bond_wei());
+    let solver_gas = bond_capped_solver_gas(atlas.solver_gas_limit, bonded, &cost, parts.exec.gas_limit_buffer);
     // Borrow the planners so each market's `async move` future moves a copy of the reference (not the
     // Planner itself); join_all awaits them all before this function returns.
     let (planner, planner_top) = (&planner, &planner_top);
@@ -1446,10 +1616,10 @@ async fn valuation<P: Provider>(
         overrides.insert(m.meta.params.oracle, AccountOverride { code: Some(sim::constant_price_oracle(m.snap.price)), ..Default::default() });
         // One solver op holds only so many liquidations: bundle the largest that fit (liq is sorted
         // by bonus) instead of pricing an op that cannot exist.
-        let fit = &m.liq[..m.liq.len().min(atlas_venue::bundle_capacity(atlas.solver_gas_limit, atlas.max_bundle_positions))];
+        let fit = &m.liq[..m.liq.len().min(atlas_venue::bundle_capacity(solver_gas, atlas.max_bundle_positions))];
         let bundle = match fit.is_empty() {
             true => None,
-            false => Some(planner.quote_bundle(provider, &m.meta, &m.snap, fit, head.number, &overrides, head.base_fee, eth_usd, atlas_venue::bundle_swap_budget(atlas.solver_gas_limit, fit.len()), atlas_venue::ATLAS_BUNDLE_GAS, live, atlas.flash_headroom_bps, Some(auction_gas_wei), exit_holder).await),
+            false => Some(planner.quote_bundle(provider, &m.meta, &m.snap, fit, head.number, &overrides, head.base_fee, eth_usd, atlas_venue::bundle_swap_budget(solver_gas, fit.len()), atlas_venue::ATLAS_BUNDLE_GAS, live, atlas.flash_headroom_bps, Some(auction_gas_wei), exit_holder).await),
         };
         let bundle_ms = a.seen.elapsed().as_millis() as u64;
         let ctxs: Vec<PlanCtx<Morpho>> = m
@@ -1460,14 +1630,14 @@ async fn valuation<P: Provider>(
             .collect();
         // The batch op (bundle only) runs concurrently with the per-position plans (diagnostics + the
         // single-position fallback), so slow plans do not delay the op that gets sent.
-        let batch_fut = batch_solver_op(provider, parts, mi, m, bundle.as_ref(), &overrides, head.number, sim_time, a.deadline, atlas.min_bonus_usd, atlas.solver_gas_limit, atlas.bundle_gas_headroom, atlas_gas_usd, eth_usd);
+        let batch_fut = batch_solver_op(provider, parts, mi, m, bundle.as_ref(), &overrides, head.number, sim_time, a.deadline, atlas.min_bonus_usd, atlas.solver_gas_limit, atlas.bundle_gas_headroom, cost, eth_usd);
         let plans_fut = futures::future::join_all(ctxs.iter().enumerate().map(|(i, c)| if i == 0 { planner_top.plan(provider, c) } else { planner.plan(provider, c) }));
         let (outcome, plans) = tokio::join!(batch_fut, plans_fut);
         let plans: Vec<_> = ctxs.iter().map(|c| c.view).zip(plans).map(|(v, p)| (v.clone(), p)).collect();
         let op = match outcome {
-            BatchOutcome::Row(r, c) => Some((r, c)),
+            BatchOutcome::Row(r, c) => Some((r, c.map(|c| *c))),
             BatchOutcome::NoRow => None,
-            BatchOutcome::NeedSingle => single_solver_op(provider, parts, mi, m, plans.first().map(|(_, p)| p), &overrides, head.number, sim_time, atlas_gas_usd, eth_usd).await,
+            BatchOutcome::NeedSingle => single_solver_op(provider, parts, mi, m, plans.first().map(|(_, p)| p), &overrides, head.number, sim_time, cost, eth_usd).await,
         };
         (bundle, bundle_ms, overrides, plans, op)
     }))
@@ -1519,7 +1689,7 @@ async fn valuation<P: Provider>(
         // The bid basis ("batch_est"): the bundle's exit gain minus the whole metacall gas Atlas
         // charges (the solver op's estimate plus the fixed metacall overhead), at the auction's gas
         // price, so a bid never spends what the solver owes Atlas.
-        let atlas_net = bundle.as_ref().and_then(|b| b.net_usd.map(|_| b.gross_usd - (b.gas_units + atlas_venue::METACALL_FIXED_GAS) as f64 * atlas_gas_usd));
+        let atlas_net = bundle.as_ref().and_then(|b| b.net_usd.map(|_| b.gross_usd - (b.gas_units + atlas_venue::METACALL_FIXED_GAS) as f64 * cost.gas_usd));
         bundle_net += atlas_net.unwrap_or(0.0).max(0.0);
         if bundle.is_some() {
             bundle_ms_max = bundle_ms_max.max(bundle_ms);
@@ -1773,6 +1943,80 @@ fn on_settled(s: actor::Settled, block: u64, now_unix: u64, eth_usd: f64, cooldo
     Ok(included)
 }
 
+/// Blocks a bond tx (unbond / withdraw / ETH sent on) stays valid before it counts as dropped.
+const BOND_TX_DEADLINE_BLOCKS: u64 = 150;
+
+/// Our ops' Atlas results since the last check: journaled and counted (won, failed); a won op that
+/// matches one we submitted (same bid, deadline not before its block: one op per block per EOA)
+/// records the gas it paid in ETH. Submissions long past their deadline are dropped.
+fn record_op_results(parts: &PlannerParts, results: &[atlas_bond::OpResult], now_unix: u64, block: u64, journal: &mut std::fs::File) -> Result<(u32, u32)> {
+    let (mut won, mut failed) = (0u32, 0u32);
+    let mut subs = parts.submitted_ops.lock().unwrap();
+    for r in results {
+        let paid = if r.success {
+            won += 1;
+            subs.iter().position(|s| s.bid_wei == r.bid_wei && s.deadline >= r.block).map(|i| subs.remove(i).gas_pay_wei)
+        } else {
+            failed += 1;
+            None
+        };
+        if let Some(p) = paid {
+            parts.ledger.lock().unwrap().record_gas_paid(now_unix, p);
+        }
+        writeln!(
+            journal,
+            "{}",
+            json!({ "kind": "atlas_op_result", "block": r.block, "tx": r.tx, "bid_eth": math::units(r.bid_wei, 18), "executed": r.executed, "success": r.success, "result": r.result.saturating_to::<u64>(), "gas_pay_eth": paid.map(|p| math::units(p, 18)) })
+        )?;
+    }
+    subs.retain(|s| s.deadline + SUBMITTED_KEEP_BLOCKS > block);
+    Ok((won, failed))
+}
+
+/// Sends the bond's next tx (unbond, withdraw, or the withdrawn ETH on to PROFIT_RECEIVER) through
+/// the executor at the normal priority fee, one at a time (its key group is exclusive). Returns the
+/// step's tag and amount when it was sent.
+async fn send_bond_tx(e: &ExecHandle, step: &atlas_bond::BondStep, atlas: Address, receiver: Address, block: u64, base_fee_wei: u128, priority_fee_wei: u128) -> Result<Option<(u8, U256)>> {
+    use atlas_bond::BondStep;
+    let (tag, to, calldata, value, gas_limit, amount) = match *step {
+        BondStep::Unbond(x) => (atlas_bond::TAG_UNBOND, atlas, atlas_bond::unbond_calldata(x), U256::ZERO, atlas_bond::BOND_TX_GAS, x),
+        BondStep::Withdraw(x) => (atlas_bond::TAG_WITHDRAW, atlas, atlas_bond::withdraw_calldata(x), U256::ZERO, atlas_bond::BOND_TX_GAS, x),
+        BondStep::Send(x) => (atlas_bond::TAG_SEND, receiver, alloy::primitives::Bytes::new(), x, atlas_bond::SEND_GAS, x),
+        _ => return Ok(None),
+    };
+    if e.is_group_inflight(atlas_bond::BOND_TX_GROUP) {
+        return Ok(None);
+    }
+    let req = executor::SendRequest {
+        payload: executor::Payload { to, calldata, min_profit: executor::MinProfitSlot { offset: 0, width: 0 } },
+        min_profit: U256::ZERO,
+        gas_limit,
+        base_fee_wei,
+        priority_fee_wei,
+        key: atlas_bond::tx_key(tag),
+        exclusive_group: true,
+        block,
+        deadline_block: block + BOND_TX_DEADLINE_BLOCKS,
+    };
+    e.send_with_value(req, value).await?;
+    Ok(Some((tag, amount)))
+}
+
+/// A settled bond tx: an unbond moves that much out of the bond (not a loss), a withdrawal leaves
+/// ETH to send on (kept across restarts), the send clears it. A failed or dropped one changes
+/// nothing: the next bond check decides again from the chain.
+fn on_bond_tx_settled(ledger: &mut Ledger, tag: u8, amount: U256, success: bool, now_unix: u64) {
+    if !success {
+        return;
+    }
+    match tag {
+        atlas_bond::TAG_UNBOND => ledger.record_unbond(now_unix, amount),
+        atlas_bond::TAG_WITHDRAW => ledger.set_bond_send_pending(Some(amount)),
+        atlas_bond::TAG_SEND => ledger.set_bond_send_pending(None),
+        _ => {}
+    }
+}
+
 /// USD paid to `receiver` in the receipt of `hash`: ERC20 Transfers of the tracked markets' loan
 /// tokens (`loan_tokens`: token -> decimals), priced by the loan-token model. Other tokens (a
 /// connector leftover) are logged and not counted.
@@ -1827,7 +2071,9 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         }
         None => Ledger::in_memory(),
     };
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: build_submitter(engine, live.as_ref().map(|l| &l.0)).await?, ledger: std::sync::Mutex::new(ledger), bond_dirty: Default::default(), atlas_bond_budget_usd: engine.cfg.atlas.solver.atlas_bond_budget_usd, atlas_min_bond_eth: engine.cfg.atlas.solver.min_bond_eth, auction, priority });
+    let (submitter, bond_band) = build_submitter(engine, live.as_ref().map(|l| &l.0)).await?.unzip();
+    let dapp_gas = read_dapp_gas(engine, submitter.is_some()).await?;
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter, ledger: std::sync::Mutex::new(ledger), bond_dirty: Default::default(), dapp_gas, user_op_gas: engine.cfg.atlas.user_op_gas, bond_band, submitted_ops: Default::default(), auction, priority });
 
     // Watchlist rows are journaled only when a position enters it or its HF moves > 0.2%.
     let mut last_logged_hf: HashMap<(usize, Address), f64> = HashMap::new();
@@ -1935,6 +2181,11 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     let mut head_ms: Vec<u64> = Vec::new();
     let mut skipped_heads = 0u64;
     let mut heads_since_bond = BOND_CHECK_HEADS;
+    // Where the next scan for our ops' Atlas results starts, and the bond tx in flight (tag, amount).
+    let mut result_scan_from: Option<u64> = None;
+    let mut bond_tx: Option<(u8, U256)> = None;
+    // The out-of-band bond state last warned about (warned once per episode).
+    let mut bond_alerted: Option<std::mem::Discriminant<atlas_bond::BondStep>> = None;
     let loan_decimals: HashMap<Address, u8> = engine.metas.iter().map(|m| (m.params.loanToken, m.loan_decimals)).collect();
 
     loop {
@@ -2122,8 +2373,19 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         let mut included_txs = vec![];
         if let Some(rx) = settled.as_mut() {
             while let Ok(s) = rx.try_recv() {
+                let key = s.inflight.key;
+                let success = matches!(s.outcome, executor::Outcome::Included { success: true, .. });
                 if let Some(t) = on_settled(s, number, h.timestamp, eth_usd, engine.cfg.exec.failure_cooldown_secs, &mut parts.ledger.lock().unwrap(), &mut journal)? {
                     included_txs.push(t);
+                }
+                // One of the bond's own txs (auto-withdraw): its effect on the ledger, then a fresh
+                // reading of the bond decides the next step.
+                if key.group == atlas_bond::BOND_TX_GROUP
+                    && let Some((tag, amount)) = bond_tx.take()
+                {
+                    on_bond_tx_settled(&mut parts.ledger.lock().unwrap(), tag, amount, success, h.timestamp);
+                    writeln!(journal, "{}", json!({ "kind": "atlas_bond_tx", "block": number, "tag": tag, "amount_eth": math::units(amount, 18), "success": success }))?;
+                    parts.bond_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -2295,14 +2557,65 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             }
             heads_since_bond += 1;
             let bond_due = parts.bond_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) || heads_since_bond >= BOND_CHECK_HEADS;
-            if let (Some(sub), true) = (parts.submitter.as_ref(), bond_due) {
+            if let (Some(sub), Some(band), true) = (parts.submitter.as_ref(), parts.bond_band, bond_due) {
                 heads_since_bond = 0;
-                match atlas_submit::bonded(&engine.provider, sub.atlas, sub.signer.address()).await {
-                    Ok(b) => {
-                        parts.ledger.lock().unwrap().observe_bond(h.timestamp, b);
+                let signer = sub.signer.address();
+                match atlas_bond::read_bond_state(&engine.provider, sub.atlas, signer, number).await {
+                    Ok(state) => {
+                        // Our ops' Atlas results since the last check (a failed scan is retried
+                        // from the same block next time), then the reading they explain.
+                        let from = result_scan_from.unwrap_or(number).max(number.saturating_sub(RESULT_SCAN_BLOCKS));
+                        let results = match atlas_bond::scan_results(&engine.provider, sub.atlas, signer, from, number).await {
+                            Ok(r) => {
+                                result_scan_from = Some(number + 1);
+                                r
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Atlas op results scan failed; retried at the next bond check");
+                                vec![]
+                            }
+                        };
+                        let (won, failed) = record_op_results(&parts, &results, h.timestamp, number, &mut journal)?;
+                        let pending = {
+                            let mut l = parts.ledger.lock().unwrap();
+                            l.observe_bond(h.timestamp, state.bonded, won, failed);
+                            l.bond_send_pending()
+                        };
                         changed = true;
-                        if math::units(b, 18) < engine.cfg.atlas.solver.min_bond_eth {
-                            warn!(bonded_eth = math::units(b, 18), min = engine.cfg.atlas.solver.min_bond_eth, "HALTED: atlETH bond below atlas.solver.min_bond_eth; no solver op is submitted until it is topped up");
+                        let step = atlas_bond::next_step(&state, band.min_wei, band.max_wei, band.auto_withdraw, pending);
+                        let eth = |w: U256| math::units(w, 18);
+                        writeln!(
+                            journal,
+                            "{}",
+                            json!({ "kind": "atlas_bond", "block": number, "bonded_eth": eth(state.bonded), "unbonding_eth": eth(state.unbonding), "free_eth": eth(state.free),
+                                    "min_eth": eth(band.min_wei), "max_eth": eth(band.max_wei), "won": won, "failed": failed, "step": format!("{step:?}") })
+                        )?;
+                        // Out of the band: a warning (alerted on by the watchdog) when it starts, then
+                        // only an info line while it lasts, so a bond left above the max is not mailed
+                        // every ~100 s.
+                        let out_of_band = matches!(step, atlas_bond::BondStep::BelowMin | atlas_bond::BondStep::AboveMax { .. }).then(|| std::mem::discriminant(&step));
+                        let new_alert = out_of_band.is_some() && out_of_band != bond_alerted;
+                        bond_alerted = out_of_band;
+                        match &step {
+                            atlas_bond::BondStep::BelowMin if new_alert => warn!(bonded_eth = eth(state.bonded), min = eth(band.min_wei), "HALTED: atlETH bond below atlas.solver.bond_min_eth; no solver op is submitted until it is topped up"),
+                            atlas_bond::BondStep::AboveMax { excess } if new_alert => warn!(bonded_eth = eth(state.bonded), max = eth(band.max_wei), excess_eth = eth(*excess), "atlETH bond above atlas.solver.bond_max_eth: withdraw the excess to PROFIT_RECEIVER (or set bond_auto_withdraw)"),
+                            atlas_bond::BondStep::BelowMin | atlas_bond::BondStep::AboveMax { .. } => info!(bonded_eth = eth(state.bonded), step = ?step, "atlETH bond still out of its band"),
+                            atlas_bond::BondStep::Wait { until_block } => info!(until_block, unbonding_eth = eth(state.unbonding), "atlETH unbonding: withdrawable after Atlas's escrow wait"),
+                            atlas_bond::BondStep::Idle => {}
+                            // An auto-withdraw step: live, kill switch off, one at a time.
+                            _ => match exec.as_ref() {
+                                Some(e) if !gates::kill_switch_on(&engine.cfg.exec.kill_switch_file) && bond_tx.is_none() => {
+                                    match send_bond_tx(e, &step, sub.atlas, band.receiver, number, h.base_fee, engine.cfg.exec.priority_fee_wei).await {
+                                        Ok(Some(sent)) => {
+                                            warn!(step = ?step, "atlETH bond auto-withdraw: tx sent");
+                                            bond_tx = Some(sent);
+                                        }
+                                        Ok(None) => {}
+                                        Err(err) => warn!(error = %err, step = ?step, "atlETH bond auto-withdraw tx not sent"),
+                                    }
+                                }
+                                _ => {}
+                            },
                         }
                     }
                     Err(e) => warn!(error = %e, "bond read failed"),
@@ -2540,6 +2853,48 @@ mod tests {
         assert_eq!(arrival_to_valued_ms(100, valued, now), 0);
         // No timestamp (old row): the auction's age.
         assert_eq!(arrival_to_valued_ms(700, None, now), 700);
+    }
+
+    #[test]
+    fn the_bond_must_cover_the_ops_maximum_liability() {
+        let (min, liability) = (U256::from(60u64), U256::from(85u64));
+        assert_eq!(bond_allows(None, min, liability), Err(BondRefusal::Unread), "no reading, no op");
+        assert_eq!(bond_allows(Some(U256::from(50u64)), min, liability), Err(BondRefusal::BelowMin { bonded: U256::from(50u64) }));
+        // Atlas runs the op only if bonded >= its maximum liability.
+        assert_eq!(bond_allows(Some(U256::from(84u64)), min, liability), Err(BondRefusal::Insufficient { liability, bonded: U256::from(84u64) }));
+        assert_eq!(bond_allows(Some(U256::from(85u64)), min, liability), Ok(()));
+    }
+
+    #[test]
+    fn the_bond_sizes_the_bundle_instead_of_refusing_it_whole() {
+        // 15.005 gwei, 10 % surcharge, 3M non-solver gas (userOp 0.5M + dappGasLimit 2M + 0.5M).
+        let cost = OpCost { price: atlas_venue::OpGasPrice::new(15_005_000_000, 0.1), non_solver: 3_000_000, gas_usd: 0.0 };
+        let milli = |m: u64| U256::from(m) * U256::from(10u64).pow(U256::from(15u64));
+        // Not live / not read: the DappControl's limit.
+        assert_eq!(bond_capped_solver_gas(6_000_000, None, &cost, 1.2), 6_000_000);
+        // A large bond: still the limit.
+        assert_eq!(bond_capped_solver_gas(6_000_000, Some(milli(500)), &cost, 1.2), 6_000_000);
+        // 0.1 ETH covers ~3.06M of op gas; with a 1.2 buffer the plan gets ~2.55M, and the op it
+        // makes (x 1.2) is still covered.
+        let g = bond_capped_solver_gas(6_000_000, Some(milli(100)), &cost, 1.2);
+        assert!((2_500_000..2_600_000).contains(&g), "{g}");
+        assert!(cost.price.liability_wei((g as f64 * 1.2) as u64, cost.non_solver) <= milli(100));
+        // A bond below the non-solver part affords no op at all.
+        assert_eq!(bond_capped_solver_gas(6_000_000, Some(milli(40)), &cost, 1.2), 0);
+    }
+
+    #[test]
+    fn a_higher_gas_pay_at_submit_comes_out_of_the_profit() {
+        let usdc = |x: u64| U256::from(x * 1_000_000);
+        let wei = |milli: u64| U256::from(milli) * U256::from(10u64).pow(U256::from(15u64));
+        // 0.002 ETH more gas pay at $3000/ETH, USDC at $1: $6 less profit.
+        assert_eq!(profit_at_gas_pay(usdc(100), wei(10), wei(12), 3000.0, 1.0, 6), usdc(94));
+        // Less gas pay than simulated: the profit is not raised (conservative).
+        assert_eq!(profit_at_gas_pay(usdc(100), wei(12), wei(10), 3000.0, 1.0, 6), usdc(100));
+        // More than the whole profit: nothing left (the op is then not sent).
+        assert_eq!(profit_at_gas_pay(usdc(5), wei(10), wei(12), 3000.0, 1.0, 6), U256::ZERO);
+        // No loan-token price: an increase counts as eating the profit.
+        assert_eq!(profit_at_gas_pay(usdc(100), wei(10), wei(11), 3000.0, 0.0, 6), U256::ZERO);
     }
 
     #[test]

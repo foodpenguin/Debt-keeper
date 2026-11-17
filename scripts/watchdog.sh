@@ -10,7 +10,7 @@
 # Alerts (bundled into one email per check, at most MAX_MAILS_PER_HOUR):
 #   - bot process gone (re-mailed every DOWN_REALERT_HOURS while still down; the instruction depends
 #     on MODE: shadow = systemd restarts it, live = restart by hand), or no block for STALE_SECS
-#   - LIVE tx SENT / LIVE tx outcome / LIVE send failed / HALTED / "sending paused" / "cannot cover worst-case gas"
+#   - LIVE tx SENT / LIVE tx outcome / LIVE send failed / HALTED / "sending paused" / "cannot cover worst-case gas" / atlETH bond above bond_max_eth or an auto-withdraw step
 #   - hot wallet below MIN_HOT_ETH (checked hourly)
 #   - blocks reaching the bot late: median head_age_ms above HEAD_LAG_MS for LAG_CHECKS checks in a
 #     row (re-measure the baseline on each host; about +680 ms on the old WSL host)
@@ -170,7 +170,7 @@ check() {
   fi
   if [[ -n "$new" ]]; then
     local ev
-    ev=$(grep -E 'LIVE tx SENT|LIVE tx outcome|LIVE send failed|HALTED|sending paused|cannot cover worst-case gas|balance check failed|fell behind|kill switch written|atlas_dropped|ATLAS solver op SUBMITTED' <<<"$new" | cut -c1-400 || true)
+    ev=$(grep -E 'LIVE tx SENT|LIVE tx outcome|LIVE send failed|HALTED|sending paused|cannot cover worst-case gas|balance check failed|fell behind|kill switch written|atlas_dropped|ATLAS solver op SUBMITTED|above atlas.solver.bond_max_eth|bond auto-withdraw' <<<"$new" | cut -c1-400 || true)
     [[ -n "$ev" ]] && alerts+=("log events:"$'\n'"$ev")
     # counters for the daily summary
     put n_blocks $(( $(get n_blocks 0) + $(grep -c 'runner: block ' <<<"$new" || true) ))

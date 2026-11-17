@@ -4,10 +4,13 @@
 //!
 //! - Block path PnL per settled tx: what the liquidator paid PROFIT_RECEIVER (its receipt's ERC20
 //!   `Transfer`s, in USD by the loan-token price model) minus the gas and L1 fee.
-//! - Atlas: what an op cost is not seen per op (it runs inside someone else's metacall); the bond's
-//!   shrinkage over the day is (`bonded(day start) - bonded(now)`). Atlas income is not counted
-//!   until reconciliation exists: the day's PnL is a lower bound, so the loss stop can only fire
-//!   early, never late.
+//! - Atlas: a won op pays its gas in ETH out of its proceeds (`gasPayWei`); Atlas then credits the
+//!   bond with what it paid beyond the real charge or takes the shortfall, and a failed op's gas is
+//!   taken from the bond. Kept apart (`AtlasDay`): the gas won ops paid, the bond's credits and debits
+//!   between readings (a debit in an interval with failed ops of ours and no win counts as failed-op
+//!   gas), and what the bot itself unbonded (moved out, not lost). Atlas income (the op's profit,
+//!   paid to PROFIT_RECEIVER in the loan token) is not counted: the day's PnL is a lower bound, so the
+//!   loss stop (net bond debits) can only fire early, never late.
 //!
 //! File: line 1 `v1`, line 2 JSON; written to `<path>.tmp` then renamed. A file this version cannot
 //! read refuses live mode (see `load`). Reservations of txs in flight are not persisted: a crash
@@ -31,6 +34,32 @@ struct Stored {
     /// atlETH bonded at the day's first reading (decimal wei).
     bond_day_start_wei: Option<String>,
     block_pnl_usd: f64,
+    /// The last bond reading (decimal wei): the next reading's change is attributed against it.
+    #[serde(default)]
+    bond_last_wei: Option<String>,
+    #[serde(default)]
+    atlas: AtlasDay,
+    /// ETH withdrawn from the bond and not yet sent on to PROFIT_RECEIVER (decimal wei).
+    #[serde(default)]
+    bond_send_pending_wei: Option<String>,
+}
+
+/// The Atlas side of a UTC day, in ETH.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AtlasDay {
+    /// Our ops that won (ran and paid their bid) / failed (ran or were rejected without winning).
+    pub won: u32,
+    pub failed: u32,
+    /// Gas won ops paid in ETH out of their proceeds (their gasPayWei).
+    pub gas_paid_eth: f64,
+    /// Bond increases between readings: Atlas crediting what won ops overpaid (or a top-up).
+    pub bond_credit_eth: f64,
+    /// Bond decreases between readings not caused by our own unbonding.
+    pub bond_debit_eth: f64,
+    /// The part of the debits from intervals with failed ops and no win: failed ops' gas.
+    pub failed_gas_eth: f64,
+    /// What the bot unbonded (on its way to PROFIT_RECEIVER): moved out, not lost.
+    pub unbonded_eth: f64,
 }
 
 #[derive(Debug, Default)]
@@ -43,6 +72,8 @@ pub struct Ledger {
     bond_day_start: Option<U256>,
     bond_now: Option<U256>,
     block_pnl_usd: f64,
+    pub atlas: AtlasDay,
+    bond_send_pending: Option<U256>,
 }
 
 impl Ledger {
@@ -57,8 +88,12 @@ impl Ledger {
         let (version, json) = text.split_once('\n').unwrap_or((text.as_str(), ""));
         anyhow::ensure!(version.trim() == FORMAT, "ledger {} has format {:?}, this bot reads {FORMAT:?} (move the file away to start a fresh day)", path.display(), version.trim());
         let s: Stored = serde_json::from_str(json.trim()).with_context(|| format!("parsing ledger {}", path.display()))?;
-        let bond_day_start = s.bond_day_start_wei.map(|w| w.parse::<U256>()).transpose().with_context(|| format!("ledger {}: bond_day_start_wei", path.display()))?;
-        Ok(Self { path: Some(path), day: s.day, failed: s.failed, bond_day_start, bond_now: bond_day_start, block_pnl_usd: s.block_pnl_usd })
+        let wei = |v: Option<String>, what: &str| v.map(|w| w.parse::<U256>()).transpose().with_context(|| format!("ledger {}: {what}", path.display()));
+        let bond_day_start = wei(s.bond_day_start_wei, "bond_day_start_wei")?;
+        // A ledger from before v0.4.0 has no last reading: start from the day's first one.
+        let bond_now = wei(s.bond_last_wei, "bond_last_wei")?.or(bond_day_start);
+        let bond_send_pending = wei(s.bond_send_pending_wei, "bond_send_pending_wei")?;
+        Ok(Self { path: Some(path), day: s.day, failed: s.failed, bond_day_start, bond_now, block_pnl_usd: s.block_pnl_usd, atlas: s.atlas, bond_send_pending })
     }
 
     /// An in-memory ledger (shadow mode, tests).
@@ -71,6 +106,7 @@ impl Ledger {
         if day != self.day {
             self.day = day;
             self.block_pnl_usd = 0.0;
+            self.atlas = AtlasDay::default();
             // The new day starts from the bond as it is now (read again at the next check).
             self.bond_day_start = self.bond_now;
         }
@@ -82,13 +118,52 @@ impl Ledger {
         self.block_pnl_usd += income_usd - cost_usd;
     }
 
-    /// A reading of the atlETH bonded by the solver signer.
-    pub fn observe_bond(&mut self, unix_secs: u64, bonded_wei: U256) {
+    /// A reading of the atlETH bonded by the solver signer, with how many of our ops won and failed
+    /// since the previous reading (Atlas's results): the change since then is a credit or a debit,
+    /// and a debit with failed ops and no win is failed-op gas.
+    pub fn observe_bond(&mut self, unix_secs: u64, bonded_wei: U256, won: u32, failed: u32) {
         self.roll(unix_secs);
         if self.bond_day_start.is_none() {
             self.bond_day_start = Some(bonded_wei);
         }
+        let eth = |w: U256| crate::morpho::math::units(w, 18);
+        if let Some(prev) = self.bond_now {
+            if bonded_wei > prev {
+                self.atlas.bond_credit_eth += eth(bonded_wei - prev);
+            } else if bonded_wei < prev {
+                let d = eth(prev - bonded_wei);
+                self.atlas.bond_debit_eth += d;
+                if failed > 0 && won == 0 {
+                    self.atlas.failed_gas_eth += d;
+                }
+            }
+        }
+        self.atlas.won += won;
+        self.atlas.failed += failed;
         self.bond_now = Some(bonded_wei);
+    }
+
+    /// A won op paid `gas_pay_wei` of its gas in ETH.
+    pub fn record_gas_paid(&mut self, unix_secs: u64, gas_pay_wei: U256) {
+        self.roll(unix_secs);
+        self.atlas.gas_paid_eth += crate::morpho::math::units(gas_pay_wei, 18);
+    }
+
+    /// The bot unbonded `amount_wei` (its unbond tx settled): the next reading's drop by that much
+    /// is not a debit.
+    pub fn record_unbond(&mut self, unix_secs: u64, amount_wei: U256) {
+        self.roll(unix_secs);
+        self.atlas.unbonded_eth += crate::morpho::math::units(amount_wei, 18);
+        self.bond_now = self.bond_now.map(|b| b.saturating_sub(amount_wei));
+    }
+
+    /// ETH withdrawn from the bond and not yet sent on to PROFIT_RECEIVER (survives restarts).
+    pub fn bond_send_pending(&self) -> Option<U256> {
+        self.bond_send_pending
+    }
+
+    pub fn set_bond_send_pending(&mut self, wei: Option<U256>) {
+        self.bond_send_pending = wei;
     }
 
     /// The last bond reading (None = not read yet).
@@ -96,12 +171,11 @@ impl Ledger {
         self.bond_now
     }
 
-    /// How much the bond shrank today, in USD (a deposit counts as no loss).
+    /// What the bond lost today on its own account, in USD: debits net of credits (failed ops' gas,
+    /// won ops that paid less than charged). The bot's own unbonding is not a loss; a top-up counts
+    /// as a credit.
     pub fn atlas_loss_usd(&self, eth_usd: f64) -> f64 {
-        match (self.bond_day_start, self.bond_now) {
-            (Some(s), Some(n)) => crate::morpho::math::units(s.saturating_sub(n), 18) * eth_usd,
-            _ => 0.0,
-        }
+        (self.atlas.bond_debit_eth - self.atlas.bond_credit_eth).max(0.0) * eth_usd
     }
 
     /// Today's realized PnL so far: block path receipts minus the bond's shrinkage.
@@ -116,7 +190,15 @@ impl Ledger {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let s = Stored { day: self.day, failed: self.failed.clone(), bond_day_start_wei: self.bond_day_start.map(|w| w.to_string()), block_pnl_usd: self.block_pnl_usd };
+        let s = Stored {
+            day: self.day,
+            failed: self.failed.clone(),
+            bond_day_start_wei: self.bond_day_start.map(|w| w.to_string()),
+            block_pnl_usd: self.block_pnl_usd,
+            bond_last_wei: self.bond_now.map(|w| w.to_string()),
+            atlas: self.atlas.clone(),
+            bond_send_pending_wei: self.bond_send_pending.map(|w| w.to_string()),
+        };
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, format!("{FORMAT}\n{}\n", serde_json::to_string(&s)?)).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, path).with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
@@ -167,13 +249,13 @@ mod tests {
         let mut l = Ledger::load(path.clone()).unwrap();
         l.failed.charge(now, 1.5);
         l.record_block_tx(now, 3.0, 0.25);
-        l.observe_bond(now, U256::from(10u64).pow(U256::from(16u64))); // 0.01 ETH
-        l.observe_bond(now + 1, U256::from(9u64) * U256::from(10u64).pow(U256::from(15u64))); // 0.009
+        l.observe_bond(now, U256::from(10u64).pow(U256::from(16u64)), 0, 0); // 0.01 ETH
+        l.observe_bond(now + 1, U256::from(9u64) * U256::from(10u64).pow(U256::from(15u64)), 0, 1); // 0.009
         l.save().unwrap();
         let mut back = Ledger::load(path.clone()).unwrap();
         assert_eq!(back.failed.spent_usd(now + 2), 1.5, "failed gas survives a restart");
         // The start-of-day bond survives; the current one is read again after the restart.
-        back.observe_bond(now + 2, U256::from(9u64) * U256::from(10u64).pow(U256::from(15u64)));
+        back.observe_bond(now + 2, U256::from(9u64) * U256::from(10u64).pow(U256::from(15u64)), 0, 0);
         assert!((back.atlas_loss_usd(2000.0) - 2.0).abs() < 1e-9, "0.001 ETH shrinkage at $2000");
         assert!((back.pnl_usd(now + 3, 2000.0) - (2.75 - 2.0)).abs() < 1e-9);
         let _ = std::fs::remove_file(&path);
@@ -183,14 +265,71 @@ mod tests {
     fn a_new_day_starts_from_the_current_bond() {
         let mut l = Ledger::in_memory();
         let day = 86_400 * 7;
-        l.observe_bond(day, U256::from(100u64));
-        l.observe_bond(day + 10, U256::from(60u64));
+        l.observe_bond(day, U256::from(100u64), 0, 0);
+        l.observe_bond(day + 10, U256::from(60u64), 0, 0);
         l.record_block_tx(day + 20, 0.0, 1.0);
         assert!(l.pnl_usd(day + 30, 1e18) < 0.0);
         // Next UTC day: the PnL restarts at zero and the bond baseline is the last reading.
         assert_eq!(l.pnl_usd(day + 86_400, 1e18), 0.0);
-        l.observe_bond(day + 86_401, U256::from(60u64));
+        l.observe_bond(day + 86_401, U256::from(60u64), 0, 0);
         assert_eq!(l.atlas_loss_usd(1e18), 0.0);
+    }
+
+    fn milli(m: u64) -> U256 {
+        U256::from(m) * U256::from(10u64).pow(U256::from(15u64))
+    }
+
+    #[test]
+    fn the_bond_side_is_kept_apart() {
+        let mut l = Ledger::in_memory();
+        let t = 86_400 * 9;
+        l.observe_bond(t, milli(100), 0, 0);
+        // A win that overpaid: credited. Its gas, paid in ETH, is recorded on its own.
+        l.record_gas_paid(t + 1, milli(10));
+        l.observe_bond(t + 2, milli(102), 1, 0);
+        // A failed op and no win: the drop is failed-op gas.
+        l.observe_bond(t + 3, milli(99), 0, 1);
+        // A win that underpaid: a debit, but not failed-op gas.
+        l.observe_bond(t + 4, milli(98), 1, 0);
+        // A win and a failure in one interval: the drop cannot be told apart, so it is a debit but
+        // not counted as failed-op gas.
+        l.observe_bond(t + 5, milli(97), 1, 1);
+        let a = &l.atlas;
+        assert_eq!((a.won, a.failed), (3, 2));
+        assert!((a.gas_paid_eth - 0.010).abs() < 1e-12);
+        assert!((a.bond_credit_eth - 0.002).abs() < 1e-12);
+        assert!((a.bond_debit_eth - 0.005).abs() < 1e-12);
+        assert!((a.failed_gas_eth - 0.003).abs() < 1e-12, "only the interval with a failure and no win");
+        // Net loss: 0.005 debited - 0.002 credited.
+        assert!((l.atlas_loss_usd(1000.0) - 3.0).abs() < 1e-9);
+        // The bot's own unbonding moves ETH out without a loss.
+        l.record_unbond(t + 6, milli(20));
+        l.observe_bond(t + 7, milli(77), 0, 0);
+        assert!((l.atlas.unbonded_eth - 0.020).abs() < 1e-12);
+        assert!((l.atlas_loss_usd(1000.0) - 3.0).abs() < 1e-9, "unbonding is not a loss");
+    }
+
+    #[test]
+    fn a_withdrawal_waiting_to_be_sent_survives_a_restart() {
+        let path = tmp("pending");
+        let _ = std::fs::remove_file(&path);
+        let mut l = Ledger::load(path.clone()).unwrap();
+        l.observe_bond(86_400 * 3, milli(90), 0, 0);
+        l.set_bond_send_pending(Some(milli(25)));
+        l.save().unwrap();
+        let back = Ledger::load(path.clone()).unwrap();
+        assert_eq!(back.bond_send_pending(), Some(milli(25)));
+        assert_eq!(back.bond_wei(), Some(milli(90)), "the last reading is kept, not only the day's first");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_ledger_from_before_the_bond_band_still_loads() {
+        let path = tmp("old");
+        std::fs::write(&path, "v1\n{\"day\":5,\"failed\":{\"day\":5,\"spent_usd\":0.0},\"bond_day_start_wei\":\"1000\",\"block_pnl_usd\":1.5}\n").unwrap();
+        let l = Ledger::load(path.clone()).unwrap();
+        assert_eq!((l.bond_wei(), l.atlas.clone(), l.bond_send_pending()), (Some(U256::from(1000u64)), AtlasDay::default(), None));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
