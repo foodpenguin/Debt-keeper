@@ -124,7 +124,9 @@ impl Runner<()> {
             None
         } else {
             info!(rpc = ?atlas_specs.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), "atlas valuation endpoints");
-            let p = rpc::RpcPool::new(atlas_specs)?;
+            // Hedge the valuation sim immediately: the first endpoint often lags a block, and the
+            // extra request is worth racing on this latency-critical path (S6).
+            let p = rpc::RpcPool::new(atlas_specs)?.with_eager_hedge(["eth_simulateV1".to_string()]);
             Some((ProviderBuilder::new().connect_client(alloy::rpc::client::RpcClient::new(p.clone(), false)), p))
         };
         let morpho = Morpho::from_config(&cfg);
