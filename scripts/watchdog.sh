@@ -8,7 +8,8 @@
 #   DRY_RUN=1 ./scripts/watchdog.sh --once   # print emails instead of sending
 #
 # Alerts (bundled into one email per check, at most MAX_MAILS_PER_HOUR):
-#   - bot process gone, or no block processed for STALE_SECS
+#   - bot process gone (re-mailed every DOWN_REALERT_HOURS while still down; the instruction depends
+#     on MODE: shadow = systemd restarts it, live = restart by hand), or no block for STALE_SECS
 #   - LIVE tx SENT / LIVE tx outcome / LIVE send failed / HALTED / "sending paused" / "cannot cover worst-case gas"
 #   - hot wallet below MIN_HOT_ETH (checked hourly)
 #   - blocks reaching the bot late: median head_age_ms above HEAD_LAG_MS for LAG_CHECKS checks in a
@@ -66,6 +67,13 @@ HEAD_LAG_MS="${HEAD_LAG_MS:-700}"
 LAG_CHECKS="${LAG_CHECKS:-5}"
 DRY_RUN="${DRY_RUN:-0}"
 BOT_NAME="${BOT_NAME:-bot}"   # process name (comm) of the bot binary (the private build: keeper)
+# How the bot is run, so the downtime alert gives the right instruction: "shadow" (systemd restarts
+# it automatically) or "live" (a person restarts it by hand; it needs the keystore password).
+MODE="${MODE:-shadow}"
+SERVICE="${SERVICE:-debt-keeper-shadow}"   # systemd unit, named in the shadow downtime alert
+# While the bot stays down, re-send the downtime alert this often (hours) so a multi-day outage is
+# not a single mail you miss.
+DOWN_REALERT_HOURS="${DOWN_REALERT_HOURS:-4}"
 export PATH="$PATH:$HOME/.foundry/bin"
 mkdir -p "$STATE"
 
@@ -126,11 +134,29 @@ live_running() {
 check() {
   local alerts=() t; t=$(now)
 
-  # 1. process alive (alert once per outage, and once when it is back)
+  # 1. process alive: alert when it goes down, re-alert every DOWN_REALERT_HOURS while still down,
+  #    and once when it is back. The instruction depends on MODE (shadow restarts itself via systemd;
+  #    live needs a person with the keystore password).
   if bot_running; then
-    [[ "$(get down 0)" == 1 ]] && { alerts+=("bot process is running again"); put down 0; }
+    if [[ "$(get down 0)" == 1 ]]; then
+      local was=$(( t - $(get down_at "$t") ))
+      alerts+=("bot process is running again (was down ~$(( was / 60 )) min)")
+      put down 0
+    fi
   else
-    [[ "$(get down 0)" == 0 ]] && { alerts+=("BOT PROCESS IS NOT RUNNING (crashed, stopped, or WSL restarted). Restart it by hand: it needs the keystore password."); put down 1; }
+    local down_msg
+    if [[ "${MODE,,}" == live ]]; then
+      down_msg="Restart it BY HAND: live mode needs the keystore password, typed by a person."
+    else
+      down_msg="systemd should restart it automatically (shadow). Check: 'systemctl status $SERVICE' and 'journalctl -u $SERVICE -n 50'. If it stays down, the host or the service is wedged."
+    fi
+    if [[ "$(get down 0)" == 0 ]]; then
+      alerts+=("BOT PROCESS IS NOT RUNNING (crashed, stopped, or the host restarted). $down_msg")
+      put down 1; put down_at "$t"; put down_mail "$t"
+    elif (( t - $(get down_mail "$t") >= DOWN_REALERT_HOURS * 3600 )); then
+      alerts+=("BOT PROCESS STILL NOT RUNNING after ~$(( (t - $(get down_at "$t")) / 3600 )) h. $down_msg")
+      put down_mail "$t"
+    fi
   fi
 
   # 2. new log lines since the last check

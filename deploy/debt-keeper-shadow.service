@@ -9,9 +9,10 @@
 Description=Liquidation bot (shadow mode)
 Wants=network-online.target
 After=network-online.target
-# Restart back-off window (these keys belong in [Unit]): at most 10 starts per 10 minutes.
-StartLimitIntervalSec=600
-StartLimitBurst=10
+# Never give up restarting: a multi-day RPC outage (seen 2026-11-13, a flaky endpoint tripped a
+# crash loop that hit the old 10-starts/10-min limit and systemd stopped the bot for 4 days) must
+# not permanently stop it. The back-off below, not a start limit, keeps a crash loop gentle.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -20,9 +21,12 @@ WorkingDirectory=@WORKDIR@
 ExecStart=@BIN@ -c @CONFIG@ watch
 Environment=NO_COLOR=1
 Environment=RUST_LOG=info
-# Restart after crashes or RPC outages, but back off if it keeps failing.
+# Restart after crashes or RPC outages, backing off from 15 s up to 5 min as failures repeat
+# (systemd >= 254; the VM runs 255), so a persistent outage retries slowly instead of giving up.
 Restart=always
 RestartSec=15
+RestartSteps=5
+RestartMaxDelaySec=300
 StandardOutput=append:@LOG@
 StandardError=append:@LOG@
 # Shadow mode needs no privileges.

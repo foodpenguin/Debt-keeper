@@ -35,6 +35,12 @@ pub struct Config {
     /// Max block range for one getLogs call; a bigger gap triggers a full borrower reload instead.
     #[serde(default = "default_log_range")]
     pub max_log_range: u64,
+    /// A head reported more than this many blocks ahead of our last block is cross-checked against
+    /// the provider's tip before it is trusted: a single endpoint can report a wildly wrong block
+    /// number (seen 2026-11-13, ~8.7M ahead), which must not trip a full reload and crash loop. The
+    /// head is dropped only if it is also this far beyond the freshly read tip.
+    #[serde(default = "default_head_sanity_gap")]
+    pub head_sanity_gap: u64,
     pub journal_path: String,
     /// The lending protocol this bot tracks (Morpho Blue, the first impl). Another protocol gets
     /// its own section and `LendingProtocol` impl (the README lists the keys still Morpho-bound).
@@ -731,6 +737,11 @@ pub struct MarketEntry {
 
 fn default_poll_ms() -> u64 {
     1000
+}
+fn default_head_sanity_gap() -> u64 {
+    // A chain never advances this many blocks between heads; only a lying endpoint does. Still small
+    // enough that a genuine catch-up after a pause (confirmed against the tip) is never dropped.
+    500
 }
 fn default_refresh_secs() -> u64 {
     // Events catch new borrowers; the full API walk (~20 s) is only a safety net.

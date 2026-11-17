@@ -35,6 +35,7 @@ pub mod oracle_logs;
 pub mod planner;
 pub mod policy;
 pub mod protocol;
+pub mod revert;
 pub mod risk;
 pub mod router;
 pub mod runner;

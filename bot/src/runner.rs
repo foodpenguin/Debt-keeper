@@ -745,6 +745,14 @@ fn must_refetch_snapshots(has_prev: bool, oracle_updated: bool, touched_any: boo
     !has_prev || oracle_updated || touched_any || !fresh_enough
 }
 
+/// Whether a reported head block number is plausible. A head far ahead of our last processed block
+/// is only trusted when it is within `sanity_gap` of the freshly read chain tip: a single endpoint
+/// can report a wildly wrong number (2026-11-13, ~8.7M ahead), which, left unchecked, is passed as
+/// the query block and makes every multicall fail "from block is greater than latest".
+fn head_plausible(head: u64, last_block: u64, tip: u64, sanity_gap: u64) -> bool {
+    head <= last_block + sanity_gap || head <= tip + sanity_gap
+}
+
 /// The chain's block time from the last BLOCK_CLOCK_HEADS heads: follows a block-time change (Base
 /// Denim: 2 s -> 0.2 s) within that many blocks, no setting to switch.
 #[derive(Debug, Default)]
@@ -1230,7 +1238,7 @@ async fn solver_op<P: Provider>(
             let cand = (!s.profit.is_zero()).then(|| OpCandidate { market: mi, payload: payload.clone(), bid_wei, profit: s.profit, gas_used: s.gas_used, profit_usd: net_after_bid * loan_usd });
             (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used }), cand)
         }
-        Err(e) => (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() }), None),
+        Err(e) => (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": false, "error": crate::revert::explain(&e) }), None),
     })
 }
 
@@ -1289,7 +1297,7 @@ async fn batch_op<P: Provider>(
             });
             (row(json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "gas_used": s.gas_used })), cand)
         }
-        Err(e) => (row(json!({ "bid_usd": bid_usd, "ok": false, "error": e.to_string().chars().take(200).collect::<String>() })), None),
+        Err(e) => (row(json!({ "bid_usd": bid_usd, "ok": false, "error": crate::revert::explain(&e) })), None),
     }
 }
 
@@ -1907,6 +1915,19 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
                 continue;
             }
         };
+        // A single endpoint can report a wildly wrong block number (seen 2026-11-13, ~8.7M ahead):
+        // confirm a head far ahead of our last block against a fresh tip read before trusting it. A
+        // bogus number, left unchecked, is passed as the query block and makes every multicall fail
+        // "from block is greater than latest" on all endpoints, which exits the bot.
+        if !replaying
+            && h.number > last_block + engine.cfg.head_sanity_gap
+            && let Ok(tip) = engine.provider.get_block_number().await
+            && !head_plausible(h.number, last_block, tip, engine.cfg.head_sanity_gap)
+        {
+            warn!(head = h.number, tip, last = last_block, "head block number implausibly far ahead of the tip; dropping this head (bad endpoint?)");
+            tokio::time::sleep(Duration::from_millis(engine.cfg.poll_ms)).await;
+            continue;
+        }
         known_tip = known_tip.max(h.number);
         let number = h.number;
         // The executor task checks its txs in flight on this block, alongside the fetch below.
@@ -1927,7 +1948,13 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             // Too far behind for one getLogs: liquidations in the gap are not analysed.
             warn!(gap, "fell behind; full reload");
             engine.positions.clear();
-            engine.refresh_borrowers(number.into()).await?;
+            // Not fatal: a transient RPC failure here must retry (last_block unchanged), not exit the
+            // bot. Positions stay empty until a reload succeeds (the head cross-check above already
+            // rejects the bogus-number trigger, so this is a genuine transient fetch error).
+            if let Err(e) = engine.refresh_borrowers(number.into()).await {
+                warn!(block = number, error = format!("{e:#}"), "full reload failed; retrying next head");
+                continue;
+            }
             last_refresh = Instant::now();
             last_block = number - 1;
             prev_snaps = None;
@@ -2407,6 +2434,21 @@ mod tests {
         assert!(must_refetch_snapshots(true, true, false, true), "oracle updated");
         assert!(must_refetch_snapshots(true, false, true, true), "a market was touched");
         assert!(must_refetch_snapshots(true, false, false, false), "snapshot too old");
+    }
+
+    #[test]
+    fn head_plausibility_rejects_a_number_far_beyond_the_tip() {
+        let gap = 500;
+        // Normal: the head is at or just past our last block.
+        assert!(head_plausible(1_000, 1_000, 1_000, gap));
+        assert!(head_plausible(1_050, 1_000, 1_050, gap));
+        // A genuine catch-up after a pause: far ahead of last_block, but the tip confirms it.
+        assert!(head_plausible(5_000, 1_000, 5_001, gap), "tip agrees we fell behind");
+        // A lying endpoint: ~8.7M ahead of both our last block and the real tip -> rejected.
+        assert!(!head_plausible(8_699_503, 1_000, 1_002, gap), "number far beyond the real tip");
+        // Just past the tip by more than the gap is rejected; within the gap is kept.
+        assert!(!head_plausible(2_000 + gap + 1, 1_000, 2_000, gap));
+        assert!(head_plausible(2_000 + gap, 1_000, 2_000, gap));
     }
 
     #[test]
