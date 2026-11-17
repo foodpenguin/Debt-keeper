@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.0 (unreleased)
+## v0.4.0 (2026-11-17)
 
 Atlas solver ops pay their own gas out of their proceeds, so the bond no longer shrinks with every
 win. Needs onchain-core v0.1.5. **Breaking: the solver contract's ABI and the `[atlas.solver]` bond
