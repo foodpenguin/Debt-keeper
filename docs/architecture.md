@@ -669,6 +669,35 @@ of on-chain liquidations (decoded once from tx + receipt and cached), RPC usage.
 a read-only page on `127.0.0.1:live_port` with the positions closest to liquidation, from the
 snapshot `watch` writes every block.
 
+### Shadow-run hardening (v0.3.2)
+
+From the first multi-day GCP shadow run:
+
+- **Surviving a broken RPC.** A single endpoint can report a wildly wrong block number; a head more
+  than `head_sanity_gap` beyond the freshly read tip is dropped (`runner::head_plausible`), so a bad
+  number is never passed as the query block (which would make every multicall fail "from block >
+  latest"). `load_markets` retries empty/garbage market data a desynced endpoint returns with a 200
+  (which the pool does not fail over), and the "fell behind" full reload is non-fatal — all so one
+  bad endpoint logs and retries instead of exiting.
+- **Revert reasons.** A reverted solver/liquidator sim is decoded by `bot/src/revert.rs` (the custom
+  errors, recursing into the `CallFailed`/`SwapFailed`/`BidSwapFailed` nested reason, plus
+  `Error(string)`/`Panic`); the full revert hex is kept (≤ 4 KB), never truncated.
+- **Op reliability.** A Kyber build that fails on an RFQ/PMM route re-quotes over pools only; the
+  aggregator exit's gas carries extra safety (`BundleGas::agg_swap_safety`) and a batch op whose
+  *real* simulated gas exceeds `bundle_gas_headroom × solver_gas_limit` is not sent; the bid swap
+  uses the deepest loan-token/WETH pool per loan token (probed at startup).
+- **Latency.** The batch op simulates concurrently with the per-position plans (diagnostics plus the
+  single-position fallback), so slow plans do not delay the op that gets sent; Kyber calls have a
+  time budget; the Atlas valuation pool hedges `eth_simulateV1` immediately
+  (`onchain_core::rpc::RpcPool::with_eager_hedge`). The journal records `kyber_quote_ms`,
+  `kyber_build_ms`, `batch_sim_ms` and `ready_ms` (arrival → op sendable); paper trading times
+  against `ready_ms`.
+- **Future work (not yet done): pre-quoting.** The per-auction Kyber quote + build + sim is on the
+  critical path. Pre-quoting the likely exits for tracked markets on each head (before an auction
+  arrives) and reusing a fresh-enough quote would cut the auction-time latency, at the cost of
+  speculative Kyber load; it needs a freshness bound tight enough for a price that moved in the
+  auctioned update.
+
 ## Adding a protocol
 
 1. Create `bot/src/<protocol>/` and implement `LendingProtocol` (see `morpho/mod.rs`). Choose the

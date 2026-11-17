@@ -305,6 +305,16 @@ bot 從不為 Atlas 移動資金；這些都由操作者在自己的終端機執
 
 `bot dashboard` 把 journal 和執行 log 匯入 SQLite（`dashboard.db_path`），產生一個靜態 HTML 頁面（不需要伺服器）：KPI、延遲、清算、拍賣估值、鏈上清算的出場路徑分析（從 tx 和 receipt 解碼一次後快取）、RPC 用量。`bot live` 在 `127.0.0.1:live_port` 提供唯讀頁面，顯示最接近被清算的倉位，資料來自 `watch` 每個區塊寫出的快照。
 
+### Shadow 運行的強化（v0.3.2）
+
+第一次在 GCP 上跑多天 shadow 後：
+
+- **撐過壞掉的 RPC。**單一 endpoint 可能回報完全錯誤的區塊號；比剛讀到的 tip 還多出 `head_sanity_gap` 以上的 head 會被丟掉（`runner::head_plausible`），避免把錯誤的號碼當成查詢區塊（那會讓每個 multicall 都以「from block > latest」失敗）。`load_markets` 會重試 desynced endpoint 回傳的空值／垃圾市場資料（pool 不會對這種 200 回應 failover），「fell behind」的 full reload 也改成非致命——都是為了讓一個壞 endpoint 只記 log 重試，而不是整個退出。
+- **Revert 原因。**revert 的 solver／liquidator 模擬由 `bot/src/revert.rs` 解碼（自訂錯誤，遞迴進 `CallFailed`/`SwapFailed`/`BidSwapFailed` 的巢狀 reason，以及 `Error(string)`/`Panic`）；完整的 revert hex（≤ 4 KB）保留、不截斷。
+- **op 可靠性。**Kyber build 在 RFQ/PMM 路由失敗時只用池子重新 quote；聚合器出場的 gas 加了安全係數（`BundleGas::agg_swap_safety`），批次 op 的**實際**模擬 gas 超過 `bundle_gas_headroom × solver_gas_limit` 就不送；bid swap 依每個借款代幣挑最深的借款代幣/WETH 池（啟動時探測）。
+- **延遲。**批次 op 的模擬和每個部位的 plan（診斷＋單一部位退路）並行跑，所以慢的 plan 不會拖到真正要送的 op；Kyber 呼叫有時間預算；Atlas 估值的 pool 對 `eth_simulateV1` 立即 hedge（`onchain_core::rpc::RpcPool::with_eager_hedge`）。journal 記錄 `kyber_quote_ms`、`kyber_build_ms`、`batch_sim_ms` 和 `ready_ms`（拍賣抵達 → op 可送），紙上交易用 `ready_ms` 判斷期限。
+- **未來工作（尚未實作）：預先 quote。**每場拍賣的 Kyber quote + build + sim 在關鍵路徑上。對追蹤中的市場在每個 head 預先 quote 可能的出場（在拍賣抵達前），並重用夠新的報價，可以砍掉拍賣當下的延遲，代價是投機性的 Kyber 負載；需要夠緊的新鮮度界線，以配合被拍賣的更新中已變動的價格。
+
 ## 加入一個協議
 
 1. 建立 `bot/src/<protocol>/`，實作 `LendingProtocol`（參考 `morpho/mod.rs`）。選好關聯型別；讀取要批次；`evaluate` 要是純函式。

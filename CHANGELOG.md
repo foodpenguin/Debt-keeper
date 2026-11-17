@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.3.2 (unreleased)
+
+Fixes from the v0.3.1 GCP shadow run (2026-11-08..13). Needs onchain-core v0.1.4.
+
+- Restart & alerting: `debt-keeper-shadow.service` never gives up restarting
+  (`StartLimitIntervalSec=0`) with a 15 s→5 min back-off (`RestartSteps`/`RestartMaxDelaySec`,
+  systemd ≥ 254) — a flaky endpoint tripped a crash loop that hit the old 10-starts/10-min limit and
+  stopped the bot for 4 days. `watchdog.sh` re-mails the downtime alert every `DOWN_REALERT_HOURS`
+  and words it by `MODE` (shadow restarts itself; live needs a person with the keystore password).
+- Survive a broken RPC without exiting: a head whose block number is implausibly far beyond the
+  freshly read tip is dropped (`head_sanity_gap`) — a single endpoint reporting ~8.7M ahead tripped a
+  full reload whose multicalls then all failed "from block > latest"; `load_markets` retries
+  empty/garbage market data (a desynced endpoint the pool does not fail over); the full reload is
+  non-fatal.
+- Diagnostics: the solver error is no longer truncated to 200 chars — the full revert hex (≤ 4 KB) is
+  kept and decoded, recursing into the `CallFailed`/`SwapFailed`/`BidSwapFailed` nested reasons and
+  `Error(string)`/`Panic`.
+- Atlas op reliability: a Kyber build failing on an RFQ/PMM route re-quotes over pools only
+  (`kyber_rfq_exclude`); the aggregator exit's gas carries extra safety and a batch op whose
+  *simulated* gas exceeds `bundle_gas_headroom × solver_gas_limit` is not sent (an under-estimated
+  Kyber exit ran 5.95M against a 4.9M estimate, near the 6M cap); the bid swap picks the deepest
+  loan-token/WETH pool per loan token (`bid_fee_tiers`/`bid_factory`) instead of one fixed fee.
+- Latency: the batch op simulates concurrently with the per-position plans (which are diagnostics
+  plus the single-position fallback), so slow plans no longer delay the op that gets sent; Kyber
+  calls have a time budget (`kyber_timeout_ms`, 700 ms); the Atlas valuation pool hedges
+  `eth_simulateV1` immediately (onchain-core `with_eager_hedge`). The journal gains `kyber_quote_ms`,
+  `kyber_build_ms`, `batch_sim_ms` and `ready_ms` (arrival → op sendable), and paper trading times
+  against `ready_ms`.
+
 ## v0.3.1 (2026-11-09)
 
 - onchain-core v0.1.3: a reverted simulation now reports its revert data (it read as a bare "0x").
