@@ -321,7 +321,19 @@ async fn atlas_surcharge<P: Provider>(engine: &MorphoEngine<P>) -> f64 {
 
 /// The Atlas solver venue (`[atlas.solver] simulate`): the solver and its MorphoLiquidator are
 /// injected unless deployed, and Atlas is replaced by its stand-in in every simulation.
-async fn build_atlas_solver<P: Provider>(engine: &MorphoEngine<P>) -> Result<Option<atlas_venue::AtlasSolver>> {
+/// The Atlas solver start-up line, by whether this run actually submits ops — i.e. whether a
+/// submitter is wired for this code path, not merely whether the config enables submission. The
+/// value-auction/replay path and shadow mode build the solver but never send, so they must not claim
+/// ops are signed and submitted.
+fn atlas_solver_log(submitting: bool) -> &'static str {
+    if submitting {
+        "atlas: solver operations are simulated, then signed and submitted when profitable"
+    } else {
+        "atlas: solver operations are simulated (never signed or sent)"
+    }
+}
+
+async fn build_atlas_solver<P: Provider>(engine: &MorphoEngine<P>, submitting: bool) -> Result<Option<atlas_venue::AtlasSolver>> {
     let c = &engine.cfg.atlas.solver;
     if !c.simulate {
         return Ok(None);
@@ -348,7 +360,7 @@ async fn build_atlas_solver<P: Provider>(engine: &MorphoEngine<P>) -> Result<Opt
     // pool at one fixed fee (2026-11-13: BidSwapFailed).
     let loan_tokens: Vec<Address> = engine.metas.iter().map(|m| m.params.loanToken).collect();
     let bid_fees = atlas_venue::probe_bid_fees(p, c.bid_factory, c.weth, &loan_tokens, &c.bid_fee_tiers).await;
-    info!(%solver, %signer, bid_fee_overrides = bid_fees.len(), "atlas: solver operations are simulated (never signed or sent)");
+    info!(%solver, %signer, bid_fee_overrides = bid_fees.len(), "{}", atlas_solver_log(submitting));
     Ok(Some(atlas_venue::AtlasSolver::new(atlas, c.address, signer, c.weth, c.bid_router, c.bid_fee, liq, solver_code, stub).with_bid_fees(bid_fees)))
 }
 
@@ -809,6 +821,11 @@ const BLOCK_TS_KEEP: u64 = 600;
 /// RPC. `bond_dirty` still forces an immediate read whenever it actually matters.
 const BOND_CHECK_HEADS: u64 = 500;
 
+/// A meta-oracle market's `currentOracle()` is re-read every this many heads. A deviation-timelock
+/// switch has a public timelock of hours before it can take effect, so ~minutes between reads is far
+/// inside the warning window while adding only one `eth_call` per meta-oracle market per interval.
+const META_RECHECK_HEADS: u64 = 900;
+
 /// Whether a head must fetch fresh market snapshots rather than reuse the previous ones (the A1
 /// snapshot throttle). Refetch with no snapshot yet, on an oracle update, when a market log touched
 /// a position or a liquidation happened, or when the last snapshot is older than
@@ -900,6 +917,9 @@ struct AtlasState<P> {
     /// Auctions the feed task dropped on a full channel (journaled as they grow).
     dropped: Arc<std::sync::atomic::AtomicU64>,
     dropped_journaled: u64,
+    /// Head at which the meta-oracle markets' `currentOracle()` was last re-read (see
+    /// `META_RECHECK_HEADS`). Starts at the load block, so the first recheck is a full interval in.
+    last_meta_recheck: u64,
 }
 
 impl<P: Provider + Clone + 'static> AtlasState<P> {
@@ -956,9 +976,23 @@ impl<P: Provider + Clone + 'static> AtlasState<P> {
     /// Per block: held logs of this block or earlier, SVR primaries past their cutoff, and the
     /// cross-check of the PREVIOUS block's snapshot against the model (one block later, so that the
     /// logs of that block have arrived; a mismatch is a missed event: resynced and counted).
-    async fn on_head(&mut self, head: &Head, prev: Option<(u64, &[Option<morpho::onchain::MarketSnapshot>])>) {
+    async fn on_head(&mut self, head: &Head, prev: Option<(u64, &[Option<morpho::onchain::MarketSnapshot>])>, replaying: bool) {
         self.block_ts.insert(head.number, head.timestamp);
         self.block_ts.retain(|b, _| b + BLOCK_TS_KEEP > head.number);
+        // Low-frequency meta-oracle `currentOracle()` recheck (the timelock gives hours of warning).
+        // A switch rebuilds the market's model against its new underlying oracle, possibly adding
+        // feeds, so refresh the watched-aggregator set the logs subscribe to afterwards. Skipped while
+        // replaying: it would read `currentOracle()` at historical blocks, which is useless for a
+        // catch-up (we act on live switches) and fails/warn-spams on a non-archive endpoint.
+        if !replaying && head.number >= self.last_meta_recheck + META_RECHECK_HEADS {
+            self.last_meta_recheck = head.number;
+            let before = self.model.aggregators();
+            self.model.recheck_meta_oracles(&self.provider, head.number.into()).await;
+            let after = self.model.aggregators();
+            if after != before {
+                self.logs.set_addresses(after);
+            }
+        }
         for ev in std::mem::take(&mut self.held) {
             let Some(at) = ev.pos() else { continue };
             if at.block > head.number {
@@ -1148,7 +1182,7 @@ async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngi
     let price = base.price * U256::from(10_000 - drop_bps) / U256::from(10_000u64);
     let m = auction_market(engine, mi, &base, price);
     let (kyber, simulator) = build_planner_parts(engine).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: None, ledger: std::sync::Mutex::new(Ledger::in_memory()), bond_dirty: Default::default(), dapp_gas: read_dapp_gas(engine, false).await?, user_op_gas: engine.cfg.atlas.user_op_gas, bond_band: None, submitted_ops: Default::default(), auction, priority });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine, false).await?, atlas_surcharge: atlas_surcharge(engine).await, v3: build_v3(engine).await?, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter: None, ledger: std::sync::Mutex::new(Ledger::in_memory()), bond_dirty: Default::default(), dapp_gas: read_dapp_gas(engine, false).await?, user_op_gas: engine.cfg.atlas.user_op_gas, bond_band: None, submitted_ops: Default::default(), auction, priority });
     let a = atlas::Auction {
         id: format!("replay-{market}-{at_block}"),
         aggregator: Address::ZERO,
@@ -2098,7 +2132,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
     };
     let (submitter, bond_band) = build_submitter(engine, live.as_ref().map(|l| &l.0)).await?.unzip();
     let dapp_gas = read_dapp_gas(engine, submitter.is_some()).await?;
-    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter, ledger: std::sync::Mutex::new(ledger), bond_dirty: Default::default(), dapp_gas, user_op_gas: engine.cfg.atlas.user_op_gas, bond_band, submitted_ops: Default::default(), auction, priority });
+    let parts = Arc::new(PlannerParts { protocol: engine.protocol.clone(), kyber, venue: simulator, solver: build_atlas_solver(engine, submitter.is_some()).await?, atlas_surcharge: atlas_surcharge(engine).await, v3, exec: engine.cfg.exec.clone(), bids: std::sync::Mutex::new(WinningBids::new(engine.cfg.exec.bid_window_secs)), submitter, ledger: std::sync::Mutex::new(ledger), bond_dirty: Default::default(), dapp_gas, user_op_gas: engine.cfg.atlas.user_op_gas, bond_band, submitted_ops: Default::default(), auction, priority });
 
     // Watchlist rows are journaled only when a position enters it or its HF moves > 0.2%.
     let mut last_logged_hf: HashMap<(usize, Address), f64> = HashMap::new();
@@ -2195,6 +2229,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             auction_cache: Arc::default(),
             dropped,
             dropped_journaled: 0,
+            last_meta_recheck: last_block,
         });
     }
     drop(side_tx);
@@ -2316,7 +2351,7 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         // the model's prices, so a missed log would not show up — see the snapshot throttle below).
         if let Some(st) = atlas_st.as_mut() {
             let cross = if prev_fresh { prev_snaps.as_deref().map(|s| (last_block, s)) } else { None };
-            st.on_head(&h, cross).await;
+            st.on_head(&h, cross, replaying).await;
         }
 
         // 1. Events since the last block, then the market snapshots. Side events arriving meanwhile
@@ -2799,6 +2834,7 @@ mod tests {
             auction_cache: Arc::default(),
             dropped: Arc::default(),
             dropped_journaled: 0,
+            last_meta_recheck: 0,
         };
         let old = st.model.price(0).unwrap();
         let new_answer = U256::from(228_747_000_000u64);
@@ -2810,14 +2846,31 @@ mod tests {
         let snap = |price| Some(morpho::onchain::MarketSnapshot { price, totals: Default::default(), raw: Default::default() });
         let head = |number, timestamp| Head { number, timestamp, base_fee: 0, seen_at: Instant::now(), source: 0 };
         // Head 100 (ts 1010): not past the cutoff yet; block 99 has the old price.
-        st.on_head(&head(100, 1010), Some((99, &[snap(old)]))).await;
+        st.on_head(&head(100, 1010), Some((99, &[snap(old)])), false).await;
         assert_eq!((st.model.price(0), st.missed_streak), (Some(old), 0));
         // Head 101 (ts 1012): past the cutoff, applied; block 100 still has the old price.
-        st.on_head(&head(101, 1012), Some((100, &[snap(old)]))).await;
+        st.on_head(&head(101, 1012), Some((100, &[snap(old)])), false).await;
         assert_eq!((st.model.price(0), st.missed_streak), (Some(new), 0), "block 100 is not a missed update");
         // Head 102: block 101 has the new price, as the model.
-        st.on_head(&head(102, 1014), Some((101, &[snap(new)]))).await;
+        st.on_head(&head(102, 1014), Some((101, &[snap(new)])), false).await;
         assert_eq!((st.model.price(0), st.missed_streak), (Some(new), 0));
+
+        // The meta-oracle recheck is gated on !replaying: a replay head past the interval does not
+        // run it (it would read currentOracle() at historical blocks), so the recheck clock does not
+        // advance; a live head past the interval does run it and advances the clock.
+        assert_eq!(st.last_meta_recheck, 0);
+        st.on_head(&head(1000, 20000), None, true).await;
+        assert_eq!(st.last_meta_recheck, 0, "replaying: recheck skipped");
+        st.on_head(&head(1000, 20000), None, false).await;
+        assert_eq!(st.last_meta_recheck, 1000, "live head past the interval runs the recheck");
+    }
+
+    #[test]
+    fn atlas_solver_log_reflects_whether_ops_are_submitted() {
+        // The line must key on whether a submitter is wired (the arg), not on the config: the
+        // value-auction/replay path and shadow mode pass false and must not claim submission.
+        assert!(super::atlas_solver_log(true).contains("signed and submitted"));
+        assert!(super::atlas_solver_log(false).contains("never signed or sent"));
     }
 
     #[test]
