@@ -264,7 +264,11 @@ priority fee 依鏈上看到的競爭來決定。追蹤市場裡的每一筆清�
 
 ### 預言機 log 與價格模型（`bot/src/oracle_logs.rs`、`bot/src/oracle.rs`）
 
-Atlas 拍賣用拍賣的 median 估值：`PriceModel::preview` 換掉一個 aggregator 的答案，重算所有用到它的市場，所以模型必須知道每個 feed 的最新答案。模型在啟動時載入（和每個預言機的 `price()` 核對；重現不了的市場不納入），之後用被監看的 aggregator 在正式區塊上的 log 更新：
+Atlas 拍賣用拍賣的 median 估值：`PriceModel::preview` 換掉一個 aggregator 的答案，重算所有用到它的市場，所以模型必須知道每個 feed 的最新答案。模型在啟動時載入（和每個預言機的 `price()` 核對），之後用被監看的 aggregator 在正式區塊上的 log 更新。
+
+`MorphoChainlinkOracleV2` 直接建模。`MetaOracleDeviationTimelock`（在 primary 與 backup 預言機之間切換的偏差 timelock，用「`currentOracle()` 不 revert」判定）則透過它當下選中的底層預言機建模，最多遞迴一層，並且一樣和 meta 預言機自己的 `price()` 核對。primary↔backup 的切換有數小時的公開 timelock，所以只要低頻重讀 `currentOracle()`（`recheck_meta_oracles`，每 `META_RECHECK_HEADS` 個 head）就足以察覺，並用新的預言機重建該市場的模型。重現不了的市場（不是 V2／meta 預言機、有 ERC-4626 vault 換算、feed 讀取失敗，或模型和 `price()` 不符）會留在區塊路徑，啟動時連同原因寫進 log，並列在載入那行的 `unmodelled` 裡——不再默默略過。
+
+套用到已載入模型的 log 更新：
 
 - `NewTransmission(round, answer)`：公開的 transmit。一般 feed 的答案立刻生效；SVR feed 的答案連同 round 和區塊時間先暫存（Morpho 還讀不到）。
 - `SecondaryRoundIdUpdated(round)`：拍賣得標者的 Atlas metacall 寫入的 SVR secondary。它只帶 round；同一個 round 暫存的答案隨即生效。

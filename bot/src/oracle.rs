@@ -73,6 +73,12 @@ sol! {
     interface IOcr2Aggregator { function getTransmitters() external view returns (address[]); }
     interface IAuthorizedForwarder { function getAuthorizedSenders() external view returns (address[]); }
     interface ITypeAndVersion { function typeAndVersion() external view returns (string); }
+    /// A Morpho `MetaOracleDeviationTimelock`: `price()` delegates to whichever underlying oracle is
+    /// selected now. `currentOracle()` reverts on a plain `MorphoChainlinkOracleV2`, so it doubles as
+    /// the meta-oracle probe. A switch (primary<->backup) emits `ChallengeAccepted`/`HealingAccepted`
+    /// but only after a public timelock of hours, so a low-frequency re-read of `currentOracle()` is
+    /// enough to notice it.
+    interface IMetaOracle { function currentOracle() external view returns (address); }
 }
 
 async fn call<P: Provider, C: SolCall>(p: &P, to: Address, c: C, block: BlockId) -> Result<C::Return> {
@@ -122,6 +128,72 @@ struct MarketFeeds {
     quote: Vec<usize>,
 }
 
+/// A market whose Morpho oracle is a `MetaOracleDeviationTimelock`. The feeds are modelled from the
+/// selected underlying oracle (`current`), and `recheck_meta_oracles` watches `meta.currentOracle()`
+/// for a primary<->backup switch, rebuilding the model against the new oracle when it moves. A binding
+/// is kept even while the market is on the block path, so the recheck can retry a build that failed
+/// for a non-structural reason.
+#[derive(Debug, Clone)]
+struct MetaBinding {
+    /// The market's Morpho oracle: the meta-oracle itself (`MarketMeta::params.oracle`).
+    meta: Address,
+    /// The underlying oracle `currentOracle()` the model was last built (or last attempted) against.
+    current: Address,
+    /// The market's name, for the switch log.
+    name: String,
+    /// The market is on the block path after a non-structural build failure against `current` (a
+    /// failed read, or a momentary `price()` disagreement): the recheck retries it even though
+    /// `currentOracle()` has not moved. Cleared once it is modelled, or when the reason is structural.
+    pending_retry: bool,
+}
+
+/// Why a market cannot be put on the fast path. Structural reasons are properties of the oracle that
+/// will not clear on their own (so a `recheck` does not keep retrying them); the others are worth a
+/// retry on the next recheck.
+#[derive(Debug, Clone)]
+enum BlockReason {
+    /// Neither a `MorphoChainlinkOracleV2` nor a meta-oracle (no vault/`currentOracle` interface).
+    NotOracleV2,
+    /// An ERC-4626 vault conversion factor is present.
+    VaultConversion,
+    /// A meta-oracle whose `currentOracle` is itself a meta-oracle (only one level is modelled).
+    NestedMeta,
+    /// The model does not reproduce `price()` (model, on-chain) — possibly a momentary race.
+    PriceMismatch(Option<U256>, U256),
+    /// An RPC read failed (likely transient).
+    ReadFailed(String),
+}
+
+impl BlockReason {
+    /// A property of the oracle that will not clear on its own, so the recheck should not keep
+    /// rebuilding against the same `currentOracle` for it.
+    fn is_structural(&self) -> bool {
+        matches!(self, BlockReason::NotOracleV2 | BlockReason::VaultConversion | BlockReason::NestedMeta)
+    }
+}
+
+impl std::fmt::Display for BlockReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockReason::NotOracleV2 => write!(f, "not a MorphoChainlinkOracleV2 or meta-oracle (no vault/currentOracle interface)"),
+            BlockReason::VaultConversion => write!(f, "ERC-4626 vault conversion factor present: not modelled"),
+            BlockReason::NestedMeta => write!(f, "meta-oracle nests another meta-oracle (only one level modelled)"),
+            BlockReason::PriceMismatch(model, onchain) => write!(f, "model does not reproduce price() (model {model:?}, price {onchain})"),
+            BlockReason::ReadFailed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Whether one market's oracle could be put on the fast path, with a reason when not (so the load
+/// never silently drops a market: every block-path market is logged with why). `meta_current` is
+/// `Some(currentOracle)` whenever the market's oracle was detected as a `MetaOracleDeviationTimelock`
+/// — on both arms — so the caller can keep (or retry) a meta binding even when it is not modelled.
+#[derive(Debug)]
+enum OracleModel {
+    Fast { feeds: MarketFeeds, meta_current: Option<Address> },
+    Block { reason: BlockReason, meta_current: Option<Address> },
+}
+
 /// A public SVR primary seen but not yet in effect. Morpho reads it only once an Atlas metacall
 /// carries it (`Secondary`) or it is older than the aggregator's cutoff (`Expired`). More than one
 /// can be in flight at once for the same aggregator when primaries arrive faster than the cutoff
@@ -159,16 +231,31 @@ pub struct PriceModel {
     /// SVR aggregator -> its cutoff (seconds), read from the DualAggregator's `CutoffTimeSet` log.
     /// Absent until a log arrives: `due` then falls back to the config `svr_cutoff_secs`.
     cutoffs: HashMap<Address, u64>,
+    /// market index -> its meta-oracle binding, for markets whose Morpho oracle is a
+    /// `MetaOracleDeviationTimelock`. `recheck_meta_oracles` walks this to notice a switch.
+    meta_bindings: HashMap<usize, MetaBinding>,
 }
 
 impl PriceModel {
     pub async fn load<P: Provider>(p: &P, metas: &[MarketMeta], block: BlockId) -> Self {
         let mut model = PriceModel::default();
-        for meta in metas {
+        let mut unmodelled: Vec<&str> = vec![];
+        for (mi, meta) in metas.iter().enumerate() {
             let m = match model.load_market(p, meta.params.oracle, block).await {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(market = %meta.name, error = %e, "oracle not modelled: block path only for this market");
+                OracleModel::Fast { feeds, meta_current } => {
+                    if let Some(current) = meta_current {
+                        model.meta_bindings.insert(mi, MetaBinding { meta: meta.params.oracle, current, name: meta.name.clone(), pending_retry: false });
+                    }
+                    Some(feeds)
+                }
+                OracleModel::Block { reason, meta_current } => {
+                    warn!(market = %meta.name, oracle = %meta.params.oracle, reason = %reason, "oracle not modelled: block path only for this market");
+                    unmodelled.push(meta.name.as_str());
+                    // A detected meta-oracle that failed to build keeps a binding so the recheck can
+                    // retry it (a non-structural failure) or notice a later switch (a structural one).
+                    if let Some(current) = meta_current {
+                        model.meta_bindings.insert(mi, MetaBinding { meta: meta.params.oracle, current, name: meta.name.clone(), pending_retry: !reason.is_structural() });
+                    }
                     None
                 }
             };
@@ -176,38 +263,122 @@ impl PriceModel {
         }
         let fast: Vec<&str> = metas.iter().zip(&model.markets).filter(|(_, m)| m.is_some()).map(|(meta, _)| meta.name.as_str()).collect();
         let transmitters: usize = model.watched.read().unwrap().values().map(|a| a.forwarders.len() + a.direct.len()).sum();
-        info!(markets = ?fast, feeds = model.feeds.len(), transmitters, "oracle price model loaded");
+        info!(markets = ?fast, unmodelled = ?unmodelled, feeds = model.feeds.len(), transmitters, meta_oracles = model.meta_bindings.len(), "oracle price model loaded");
         model
     }
 
-    async fn load_market<P: Provider>(&mut self, p: &P, oracle: Address, block: BlockId) -> Result<Option<MarketFeeds>> {
+    /// Tries to put `oracle` (a market's Morpho oracle) on the fast path. A `MetaOracleDeviationTimelock`
+    /// (detected by a non-reverting `currentOracle()`) is modelled through its selected underlying
+    /// oracle, one level deep; the feed math is cross-checked against the OUTER oracle's `price()`, so
+    /// a meta that falls back to its other oracle, or an unexpected shape, lands on the block path with
+    /// a reason instead of a wrong price.
+    async fn load_market<P: Provider>(&mut self, p: &P, oracle: Address, block: BlockId) -> OracleModel {
+        use IMorphoChainlinkOracleV2 as O;
+        // A meta-oracle exposes `currentOracle()`; a plain V2 reverts it. When present, model the
+        // selected underlying oracle, but keep comparing against the meta's own `price()`. `meta_current`
+        // is carried on both arms so a build that fails here still leaves a binding to retry/track.
+        let meta_current = call(p, oracle, IMetaOracle::currentOracleCall {}, block).await.ok();
+        let block_with = |reason: BlockReason| OracleModel::Block { reason, meta_current };
+        let underlying = meta_current.unwrap_or(oracle);
+        if meta_current.is_some() && call(p, underlying, IMetaOracle::currentOracleCall {}, block).await.is_ok() {
+            return block_with(BlockReason::NestedMeta);
+        }
+        let m = match self.build_v2_feeds(p, underlying, block).await {
+            Ok(m) => m,
+            Err(reason) => return block_with(reason),
+        };
+        let onchain = match call(p, oracle, O::priceCall {}, block).await {
+            Ok(x) => x,
+            Err(e) => return block_with(BlockReason::ReadFailed(format!("price() read failed: {e}"))),
+        };
+        let model = self.compute(&m);
+        if model != Some(onchain) {
+            return block_with(BlockReason::PriceMismatch(model, onchain));
+        }
+        OracleModel::Fast { feeds: m, meta_current }
+    }
+
+    /// The feed set of a plain `MorphoChainlinkOracleV2` at `oracle` (no price cross-check: the caller
+    /// does that against the right outer oracle). `Err(reason)` categorises why it is not modellable.
+    async fn build_v2_feeds<P: Provider>(&mut self, p: &P, oracle: Address, block: BlockId) -> std::result::Result<MarketFeeds, BlockReason> {
         use IMorphoChainlinkOracleV2 as O;
         let vaults = (call(p, oracle, O::BASE_VAULTCall {}, block).await, call(p, oracle, O::QUOTE_VAULTCall {}, block).await);
-        let (Ok(bv), Ok(qv)) = vaults else { return Ok(None) }; // not a ChainlinkOracleV2
+        let (Ok(bv), Ok(qv)) = vaults else {
+            return Err(BlockReason::NotOracleV2);
+        };
         if !bv.is_zero() || !qv.is_zero() {
-            return Ok(None); // vault conversion factors: not modelled
+            return Err(BlockReason::VaultConversion);
         }
-        let scale = call(p, oracle, O::SCALE_FACTORCall {}, block).await?;
+        let feed = |e: anyhow::Error| BlockReason::ReadFailed(format!("feed read failed: {e}"));
+        let scale = call(p, oracle, O::SCALE_FACTORCall {}, block).await.map_err(feed)?;
         let slots = [
-            call(p, oracle, O::BASE_FEED_1Call {}, block).await?,
-            call(p, oracle, O::BASE_FEED_2Call {}, block).await?,
-            call(p, oracle, O::QUOTE_FEED_1Call {}, block).await?,
-            call(p, oracle, O::QUOTE_FEED_2Call {}, block).await?,
+            call(p, oracle, O::BASE_FEED_1Call {}, block).await.map_err(feed)?,
+            call(p, oracle, O::BASE_FEED_2Call {}, block).await.map_err(feed)?,
+            call(p, oracle, O::QUOTE_FEED_1Call {}, block).await.map_err(feed)?,
+            call(p, oracle, O::QUOTE_FEED_2Call {}, block).await.map_err(feed)?,
         ];
         let mut idx = [None; 4];
         for (i, proxy) in slots.iter().enumerate() {
             if !proxy.is_zero() {
-                idx[i] = Some(self.feed_index(p, *proxy, block).await?);
+                idx[i] = Some(self.feed_index(p, *proxy, block).await.map_err(feed)?);
             }
         }
-        let m = MarketFeeds { scale, base: idx[..2].iter().flatten().copied().collect(), quote: idx[2..].iter().flatten().copied().collect() };
-        let onchain = call(p, oracle, O::priceCall {}, block).await?;
-        let model = self.compute(&m);
-        if model != Some(onchain) {
-            warn!(%oracle, ?model, %onchain, "oracle model mismatch: block path only for this market");
-            return Ok(None);
+        Ok(MarketFeeds { scale, base: idx[..2].iter().flatten().copied().collect(), quote: idx[2..].iter().flatten().copied().collect() })
+    }
+
+    /// Low-frequency re-read of each meta-oracle market's `currentOracle()`. A deviation timelock gives
+    /// hours of public warning before a primary<->backup switch, so this need not be real-time. A market
+    /// is (re)built against its current underlying oracle when it switched, or when it is on the block
+    /// path after a non-structural failure (so a transient failure never strands it); the caller
+    /// refreshes the watched-aggregator set afterwards, as new feeds may have appeared.
+    pub async fn recheck_meta_oracles<P: Provider>(&mut self, p: &P, block: BlockId) {
+        let bindings: Vec<(usize, Address, Address, String, bool)> =
+            self.meta_bindings.iter().map(|(mi, b)| (*mi, b.meta, b.current, b.name.clone(), b.pending_retry)).collect();
+        for (mi, meta, current, name, pending_retry) in bindings {
+            let now = match call(p, meta, IMetaOracle::currentOracleCall {}, block).await {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(market = %name, oracle = %meta, error = %e, "meta-oracle currentOracle() read failed; keeping the current model");
+                    continue;
+                }
+            };
+            let switched = now != current;
+            if !switched && !pending_retry {
+                continue; // modelled and unchanged, or structurally blocked against the same oracle
+            }
+            if switched {
+                warn!(market = %name, oracle = %meta, old = %current, new = %now, "meta-oracle switched underlying oracle; rebuilding this market's model");
+            }
+            self.markets[mi] = None; // block path until the rebuild lands
+            match self.load_market(p, meta, block).await {
+                OracleModel::Fast { feeds, meta_current } => {
+                    self.markets[mi] = Some(feeds);
+                    match meta_current {
+                        // Still a meta-oracle (the expected case): track its selection, modelled now.
+                        Some(c) => {
+                            if let Some(b) = self.meta_bindings.get_mut(&mi) {
+                                b.current = c;
+                                b.pending_retry = false;
+                            }
+                        }
+                        // No longer a meta-oracle: forget the binding (a plain V2 needs no recheck).
+                        None => {
+                            self.meta_bindings.remove(&mi);
+                        }
+                    }
+                }
+                OracleModel::Block { reason, .. } => {
+                    warn!(market = %name, oracle = %meta, reason = %reason, "meta-oracle's underlying oracle is not modelled: block path only");
+                    // Advance `current` so a structural failure is not re-detected as a switch every
+                    // recheck; keep retrying a non-structural failure (a read error or a momentary
+                    // price mismatch) on the next recheck. A later switch is still noticed either way.
+                    if let Some(b) = self.meta_bindings.get_mut(&mi) {
+                        b.current = now;
+                        b.pending_retry = !reason.is_structural();
+                    }
+                }
+            }
         }
-        Ok(Some(m))
     }
 
     async fn read_feed<P: Provider>(p: &P, proxy: Address, block: BlockId) -> Result<Feed> {
@@ -265,6 +436,15 @@ impl PriceModel {
     /// Whether `market` is on the fast path (its price may still be momentarily unknown).
     pub fn is_modelled(&self, market: usize) -> bool {
         self.markets.get(market).is_some_and(|m| m.is_some())
+    }
+
+    /// Whether any feed behind `market`'s model is an SVR (DualAggregator) feed.
+    #[cfg(test)]
+    pub fn market_has_svr_feed(&self, market: usize) -> bool {
+        self.markets
+            .get(market)
+            .and_then(|m| m.as_ref())
+            .is_some_and(|m| m.base.iter().chain(&m.quote).any(|&i| self.feeds[i].svr))
     }
 
     pub fn price(&self, market: usize) -> Option<U256> {
@@ -363,9 +543,13 @@ impl PriceModel {
         self.pending.remove(&aggregator);
     }
 
-    /// The aggregators behind the modelled feeds, sorted (the oracle logs filter).
+    /// The aggregators behind the feeds a modelled market actually uses, sorted (the oracle logs
+    /// filter). Only referenced feeds count, so a meta-oracle that switched away from an oracle stops
+    /// the old feeds' aggregators from being subscribed (the orphaned feeds linger in `self.feeds`
+    /// but drive nothing).
     pub fn aggregators(&self) -> Vec<Address> {
-        let mut a: Vec<Address> = self.feeds.iter().map(|f| f.aggregator).collect();
+        let referenced: HashSet<usize> = self.markets.iter().flatten().flat_map(|m| m.base.iter().chain(&m.quote)).copied().collect();
+        let mut a: Vec<Address> = referenced.iter().map(|&i| self.feeds[i].aggregator).collect();
         a.sort();
         a.dedup();
         a
@@ -462,6 +646,7 @@ impl PriceModel {
             watched: Watched::default(),
             pending: HashMap::new(),
             cutoffs: HashMap::new(),
+            meta_bindings: HashMap::new(),
         }
     }
 }
@@ -658,5 +843,218 @@ mod tests {
         assert_eq!(m.due(1011, 10), vec![(XRP, a1)]);
         assert_eq!(m.apply(XRP, a1, Path::Expired, 1011), Applied::Moved(vec![(1, a1 * e(28))]));
         assert!(m.due(9000, 10).is_empty());
+    }
+
+    // --- meta-oracle (MetaOracleDeviationTimelock) modelling ---------------------------------------
+    //
+    // The RPC calls are mocked in order with alloy's `Asserter` (same technique as
+    // morpho::load_markets_retries_bad_rpc_data_instead_of_failing). Each `push_*` is one `eth_call`
+    // response, consumed in call order; `push_v2_oracle` encodes the full sequence `load_market`
+    // makes for one meta-oracle market with a single base feed.
+
+    use alloy::{
+        primitives::{Bytes, I256},
+        providers::ProviderBuilder,
+        sol_types::SolValue,
+        transports::mock::Asserter,
+    };
+
+    const META: Address = address!("78F772F5Fcc03256260cC1165e34Da9bb3f9BE1C");
+    const PRIMARY: Address = address!("2Be831D635F3D6Fe4fa63C78f66cf793Fa3B3E5b");
+    const BACKUP: Address = address!("41b5637a347A6c199A503fDdeF466080d7256ACc");
+
+    fn b_addr(a: Address) -> Bytes {
+        a.abi_encode().into()
+    }
+    fn b_u(x: U256) -> Bytes {
+        x.abi_encode().into()
+    }
+    fn b_lrd(answer: U256) -> Bytes {
+        (U256::from(1u64), I256::from_raw(answer), U256::ZERO, U256::ZERO, U256::from(1u64)).abi_encode().into()
+    }
+    fn b_str(s: &str) -> Bytes {
+        s.to_string().abi_encode().into()
+    }
+    fn b_addrs(v: &[Address]) -> Bytes {
+        v.to_vec().abi_encode().into()
+    }
+
+    fn meta_market(oracle: Address) -> MarketMeta {
+        use crate::morpho::onchain::MarketParams;
+        MarketMeta {
+            id: alloy::primitives::B256::ZERO,
+            name: "META/USDC".into(),
+            params: MarketParams { loanToken: Address::ZERO, collateralToken: Address::ZERO, oracle, irm: Address::ZERO, lltv: U256::ZERO },
+            loan_decimals: 6,
+            collateral_decimals: 18,
+            loan_symbol: "USDC".into(),
+            collateral_symbol: "META".into(),
+        }
+    }
+
+    /// Pushes the full `load_market` sequence for a meta-oracle at META whose `currentOracle()` is
+    /// `current`, a plain V2 with one base feed (`proxy`/`agg`/`answer`, a single direct transmitter
+    /// `eoa`, non-SVR) and `SCALE_FACTOR = scale`. The outer `price()` is `scale * answer`.
+    fn push_v2_oracle(a: &Asserter, current: Address, scale: U256, proxy: Address, agg: Address, answer: U256, eoa: Address) {
+        a.push_success(&b_addr(current)); // currentOracle(META) -> the selected underlying oracle
+        a.push_failure_msg("execution reverted"); // currentOracle(underlying): plain V2, not nested
+        a.push_success(&b_addr(Address::ZERO)); // BASE_VAULT
+        a.push_success(&b_addr(Address::ZERO)); // QUOTE_VAULT
+        a.push_success(&b_u(scale)); // SCALE_FACTOR
+        a.push_success(&b_addr(proxy)); // BASE_FEED_1
+        a.push_success(&b_addr(Address::ZERO)); // BASE_FEED_2
+        a.push_success(&b_addr(Address::ZERO)); // QUOTE_FEED_1
+        a.push_success(&b_addr(Address::ZERO)); // QUOTE_FEED_2
+        a.push_success(&b_addr(agg)); // feed.aggregator()
+        a.push_success(&b_lrd(answer)); // feed.latestRoundData()
+        a.push_success(&b_str("AccessControlledOffchainAggregator 6.0.0")); // typeAndVersion (not DualAggregator)
+        a.push_success(&b_addrs(&[eoa])); // aggregator.getTransmitters()
+        a.push_failure_msg("execution reverted"); // getAuthorizedSenders(eoa): a direct-transmit EOA
+        a.push_success(&b_u(scale * answer)); // price() on the OUTER meta-oracle
+    }
+
+    /// Pushes a meta-oracle whose `currentOracle()` reads as `current` but whose rebuild fails with a
+    /// transient (non-structural) read error at `SCALE_FACTOR`: a recheck `currentOracle()` detect,
+    /// then `load_market`'s calls up to the failing read.
+    fn push_rebuild_read_fails(a: &Asserter, current: Address) {
+        a.push_success(&b_addr(current)); // recheck's currentOracle(META) detect
+        a.push_success(&b_addr(current)); // load_market: currentOracle(META)
+        a.push_failure_msg("execution reverted"); // currentOracle(underlying): not nested
+        a.push_success(&b_addr(Address::ZERO)); // BASE_VAULT
+        a.push_success(&b_addr(Address::ZERO)); // QUOTE_VAULT
+        a.push_failure_msg("HTTP error 429 with empty body"); // SCALE_FACTOR: a transient read failure
+    }
+
+    #[tokio::test]
+    async fn meta_oracle_models_the_primary_when_it_is_current() {
+        let asserter = Asserter::new();
+        let (scale, answer) = (e(18), U256::from(200_000_000u64));
+        push_v2_oracle(&asserter, PRIMARY, scale, Address::repeat_byte(0xa1), Address::repeat_byte(0xb1), answer, Address::repeat_byte(0xc1));
+        let p = ProviderBuilder::new().disable_recommended_fillers().connect_mocked_client(asserter);
+        let model = PriceModel::load(&p, std::slice::from_ref(&meta_market(META)), BlockId::latest()).await;
+        assert!(model.is_modelled(0), "the meta-oracle market is on the fast path");
+        assert_eq!(model.price(0), Some(scale * answer), "modelled through the primary oracle");
+    }
+
+    #[tokio::test]
+    async fn meta_oracle_models_the_backup_when_it_is_current() {
+        let asserter = Asserter::new();
+        // Deviant state: currentOracle() is the backup, a different oracle with a different answer.
+        let (scale, answer) = (e(18), U256::from(199_000_000u64));
+        push_v2_oracle(&asserter, BACKUP, scale, Address::repeat_byte(0xa2), Address::repeat_byte(0xb2), answer, Address::repeat_byte(0xc2));
+        let p = ProviderBuilder::new().disable_recommended_fillers().connect_mocked_client(asserter);
+        let model = PriceModel::load(&p, std::slice::from_ref(&meta_market(META)), BlockId::latest()).await;
+        assert!(model.is_modelled(0), "the meta-oracle market is on the fast path via the backup");
+        assert_eq!(model.price(0), Some(scale * answer), "modelled through the backup oracle");
+    }
+
+    #[tokio::test]
+    async fn meta_oracle_recheck_rebuilds_the_model_after_a_switch() {
+        let asserter = Asserter::new();
+        let scale = e(18);
+        let (primary_answer, backup_answer) = (U256::from(200_000_000u64), U256::from(199_000_000u64));
+        // Load: primary is current.
+        push_v2_oracle(&asserter, PRIMARY, scale, Address::repeat_byte(0xa1), Address::repeat_byte(0xb1), primary_answer, Address::repeat_byte(0xc1));
+        // Recheck sees a switch: currentOracle() is read once to detect it, then load_market rebuilds.
+        asserter.push_success(&b_addr(BACKUP)); // recheck's currentOracle(META) -> changed to backup
+        push_v2_oracle(&asserter, BACKUP, scale, Address::repeat_byte(0xa2), Address::repeat_byte(0xb2), backup_answer, Address::repeat_byte(0xc2));
+
+        let p = ProviderBuilder::new().disable_recommended_fillers().connect_mocked_client(asserter);
+        let mut model = PriceModel::load(&p, std::slice::from_ref(&meta_market(META)), BlockId::latest()).await;
+        assert_eq!(model.price(0), Some(scale * primary_answer), "starts on the primary");
+
+        model.recheck_meta_oracles(&p, BlockId::latest()).await;
+        assert!(model.is_modelled(0), "still on the fast path after the switch");
+        assert_eq!(model.price(0), Some(scale * backup_answer), "rebuilt against the backup oracle");
+    }
+
+    #[tokio::test]
+    async fn meta_oracle_retries_a_transient_rebuild_failure_after_a_switch() {
+        // A switch whose rebuild fails for a non-structural reason (a 429) must not strand the market
+        // on the block path: the next recheck retries it even though currentOracle() has not moved.
+        let a = Asserter::new();
+        let scale = e(18);
+        let (primary_answer, backup_answer) = (U256::from(200_000_000u64), U256::from(199_000_000u64));
+        push_v2_oracle(&a, PRIMARY, scale, Address::repeat_byte(0xa1), Address::repeat_byte(0xb1), primary_answer, Address::repeat_byte(0xc1));
+        push_rebuild_read_fails(&a, BACKUP); // recheck 1: switched to backup, but the rebuild 429s
+        a.push_success(&b_addr(BACKUP)); // recheck 2: currentOracle(META) detect, still backup
+        push_v2_oracle(&a, BACKUP, scale, Address::repeat_byte(0xa2), Address::repeat_byte(0xb2), backup_answer, Address::repeat_byte(0xc2));
+
+        let p = ProviderBuilder::new().disable_recommended_fillers().connect_mocked_client(a);
+        let mut model = PriceModel::load(&p, std::slice::from_ref(&meta_market(META)), BlockId::latest()).await;
+        assert_eq!(model.price(0), Some(scale * primary_answer));
+        model.recheck_meta_oracles(&p, BlockId::latest()).await;
+        assert!(!model.is_modelled(0), "block path after the transient rebuild failure");
+        model.recheck_meta_oracles(&p, BlockId::latest()).await;
+        assert!(model.is_modelled(0), "retried without a further switch and modelled against the backup");
+        assert_eq!(model.price(0), Some(scale * backup_answer));
+    }
+
+    #[tokio::test]
+    async fn meta_oracle_detected_but_unbuilt_at_load_is_retried_by_recheck() {
+        // A meta-oracle detected at load whose feeds fail to read (a 429) must keep a binding so the
+        // recheck can retry it, instead of being stuck on the block path until a restart.
+        let a = Asserter::new();
+        let (scale, answer) = (e(18), U256::from(200_000_000u64));
+        // load: currentOracle(META) ok, nested check revert, vaults ok, then SCALE_FACTOR 429s.
+        a.push_success(&b_addr(PRIMARY));
+        a.push_failure_msg("execution reverted");
+        a.push_success(&b_addr(Address::ZERO));
+        a.push_success(&b_addr(Address::ZERO));
+        a.push_failure_msg("HTTP error 429 with empty body");
+        // recheck: currentOracle unchanged, but the binding's pending retry drives a rebuild; succeeds.
+        a.push_success(&b_addr(PRIMARY)); // recheck detect
+        push_v2_oracle(&a, PRIMARY, scale, Address::repeat_byte(0xa1), Address::repeat_byte(0xb1), answer, Address::repeat_byte(0xc1));
+
+        let p = ProviderBuilder::new().disable_recommended_fillers().connect_mocked_client(a);
+        let mut model = PriceModel::load(&p, std::slice::from_ref(&meta_market(META)), BlockId::latest()).await;
+        assert!(!model.is_modelled(0), "block path after the load-time read failure");
+        model.recheck_meta_oracles(&p, BlockId::latest()).await;
+        assert!(model.is_modelled(0), "recheck retried the detected meta and modelled it");
+        assert_eq!(model.price(0), Some(scale * answer));
+    }
+
+    #[test]
+    fn aggregators_ignores_feeds_no_modelled_market_uses() {
+        // An orphan feed (e.g. one left behind by a meta-oracle switch) must not keep its aggregator
+        // in the subscription set: only feeds a modelled market references count.
+        let m = PriceModel::for_test(
+            vec![
+                (Address::repeat_byte(1), ETH, U256::from(1u64), false),
+                (Address::repeat_byte(2), USDC, U256::from(1u64), false),
+                (Address::repeat_byte(3), XRP, U256::from(1u64), true), // referenced by no market
+            ],
+            vec![Some((e(24), vec![0], vec![1]))],
+        );
+        let aggs = m.aggregators();
+        assert!(aggs.contains(&ETH) && aggs.contains(&USDC), "referenced feeds stay subscribed");
+        assert!(!aggs.contains(&XRP), "an unreferenced feed's aggregator is dropped");
+    }
+
+    /// The real Base meta-oracle: its model must reproduce `price()` and include an SVR feed. The
+    /// load fans out one `eth_call` per feed, aggregator and transmitter, so a rate-limited archive
+    /// endpoint can 429 a read and drop the market to the block path; that is retried (a genuine
+    /// modelling defect fails every attempt). Needs an archive URL (`BASE_FORK_URL`, e.g. Alchemy).
+    #[tokio::test]
+    #[ignore = "needs a Base archive/live fork; run with --ignored (BASE_FORK_URL)"]
+    async fn fork_meta_oracle_is_modelled_through_its_current_oracle() {
+        let url = std::env::var("BASE_FORK_URL").unwrap_or_else(|_| "https://base.gateway.tenderly.co".into());
+        let p = ProviderBuilder::new().connect_http(url.parse().unwrap());
+        for attempt in 0..8u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            let Ok(block) = p.get_block_number().await else { continue };
+            let at = BlockId::number(block);
+            let model = PriceModel::load(&p, std::slice::from_ref(&meta_market(META)), at).await;
+            if !model.is_modelled(0) {
+                continue; // a transient read failure dropped it to the block path; retry
+            }
+            let Ok(onchain) = call(&p, META, IMorphoChainlinkOracleV2::priceCall {}, at).await else { continue };
+            assert_eq!(model.price(0), Some(onchain), "the model reproduces the meta-oracle's price()");
+            assert!(model.market_has_svr_feed(0), "the current oracle has at least one SVR (DualAggregator) feed");
+            return;
+        }
+        panic!("meta-oracle never modelled across the retry budget (archive endpoint rate-limiting the reads?)");
     }
 }

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Oracle model: support Morpho's `MetaOracleDeviationTimelock`. A market whose oracle is a deviation
+  timelock (detected by a non-reverting `currentOracle()`) is now modelled through whichever
+  underlying oracle it currently selects (one level deep, still cross-checked against the
+  meta-oracle's own `price()`), instead of being silently left on the block path. Its
+  `currentOracle()` is re-read at a low frequency (`META_RECHECK_HEADS` heads; a primary↔backup
+  switch has a public timelock of hours), and on a switch the market drops to the block path and is
+  rebuilt against the new oracle.
+- Oracle model: every market left on the block path is now logged at start with a reason (not a
+  MorphoChainlinkOracleV2/meta oracle, an ERC-4626 vault conversion factor, a failed feed read, or a
+  model that disagrees with `price()`), and the load line lists them under `unmodelled`. There is no
+  longer any silent fallback.
+- Log: in live mode with `[atlas.solver] submit`, the Atlas solver start-up line now says the ops are
+  "simulated, then signed and submitted when profitable" instead of always claiming they are "never
+  signed or sent".
+
 ## v0.4.0 (2026-11-17)
 
 Atlas solver ops pay their own gas out of their proceeds, so the bond no longer shrinks with every

@@ -560,8 +560,21 @@ read refuses live mode (a ledger from before v0.4.0 reads with an empty Atlas da
 
 Atlas auctions are valued at the auction's median: `PriceModel::preview` replaces one aggregator's
 answer and recomputes every market using it, so the model must know every feed's current answer.
-It is loaded at start (verified against each oracle's `price()`; markets it cannot reproduce are
-left out) and kept current from canonical-block logs of the watched aggregators:
+It is loaded at start (verified against each oracle's `price()`) and kept current from canonical-block
+logs of the watched aggregators.
+
+A `MorphoChainlinkOracleV2` is modelled directly. A `MetaOracleDeviationTimelock` (a deviation
+timelock that selects between a primary and a backup oracle, detected by a non-reverting
+`currentOracle()`) is modelled through whichever underlying oracle it currently selects, one level
+deep, and still cross-checked against the meta-oracle's own `price()`. A primary<->backup switch has
+a public timelock of hours, so a low-frequency re-read of `currentOracle()` (`recheck_meta_oracles`,
+every `META_RECHECK_HEADS` heads) is enough to notice it and rebuild the market's model against the
+new oracle. A market the model cannot reproduce (a non-V2/meta oracle, an ERC-4626 vault conversion
+factor, a feed read that failed, or a model that disagrees with `price()`) is left on the block path
+and logged at start with the reason, and listed under `unmodelled` in the load line — never dropped
+silently.
+
+The log updates applied to the loaded model:
 
 - `NewTransmission(round, answer)`: a public transmit. A plain feed's answer is in effect at once;
   an SVR feed's is kept pending with its round and block time (Morpho does not read it yet).
