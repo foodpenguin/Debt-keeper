@@ -358,7 +358,7 @@ async fn e2e_atlas_batch_solver_op() {
     use alloy::{eips::BlockId, rpc::types::state::StateOverride};
 
     use crate::{
-        atlas_venue::{AtlasBid, AtlasSolver, SIM_SOLVER},
+        atlas_venue::{AtlasBid, AtlasSolver, OpGasPrice, SIM_GAS_SAFETY, SIM_SOLVER},
         dex::ExitRoute,
         planner::BundlePlan,
         venue::LiquidationVenue,
@@ -403,17 +403,30 @@ async fn e2e_atlas_batch_solver_op() {
     let plan = BundlePlan { items: items.clone(), total_seize, flash_assets, exit: ExitRoute::Packed(route.into()), router: "direct", gas_est: 1_500_000 };
 
     let mut nets = vec![];
+    let mut gas0 = 0u64;
     for bid_wei in [U256::ZERO, U256::from(10u64).pow(U256::from(15)), U256::from(10u64).pow(U256::from(18))] {
         let inner = solver.batch_inner(&meta, &plan, n + 5);
         let calldata = solver.calldata(USDC, &inner, bid_wei, U256::ZERO, U256::ZERO);
         let venue = AtlasBid { solver: &solver, bid_wei, gas_pay_wei: U256::ZERO, gas_liability_wei: U256::ZERO };
         let r = venue.simulate(&p, calldata, BlockId::number(n), &StateOverride::default(), None, None, None).await;
         println!("e2e atlas batch ({} positions): bid {bid_wei} wei -> {:?}", items.len(), r.as_ref().map(|s| (s.profit, s.gas_used)).map_err(|e| e.to_string()));
+        if bid_wei.is_zero() {
+            gas0 = r.as_ref().map(|s| s.gas_used).unwrap_or(0);
+        }
         nets.push(r.ok().map(|s| s.profit));
     }
     let (free, bid) = (nets[0].expect("no-bid batch op succeeds"), nets[1].expect("0.001 ETH bid batch op succeeds"));
     assert!(free > U256::ZERO && bid < free, "the bid is paid out of the bundle's profit: {free} -> {bid}");
     assert!(nets[2].is_none(), "a 1 ETH bid on this small bundle cannot be paid");
+
+    // v0.4.2: the bid is repriced on the SIMULATED gas, not the 1.5M estimate. The batch op runs far
+    // under its estimate, so at the SVR gas price the estimate over-reserves gas the sim-based bid
+    // reclaims — the slack the repricing turns into a higher bid (bounded by the proven profit, so
+    // the on-chain op in batch_op is re-simulated before it is sent; that path is unit-tested).
+    let price = OpGasPrice::new(15_005_000_000, 0.1);
+    let sim_gas = (gas0 as f64 * SIM_GAS_SAFETY).ceil() as u64;
+    assert!(gas0 > 0 && sim_gas < plan.gas_est, "the batch op simulates ({sim_gas}) below its {}-gas estimate", plan.gas_est);
+    assert!(price.gas_pay_wei(sim_gas) < price.gas_pay_wei(plan.gas_est), "repricing on the lower simulated gas frees ETH to bid");
 }
 
 /// v0.4.0: an Atlas solver op pays its own gas in ETH out of the liquidation (simulation only, the

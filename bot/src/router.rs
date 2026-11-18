@@ -115,7 +115,13 @@ impl Quote {
 /// passes (callers that can simulate check the real gas; bundles count it as the whole budget):
 /// if Kyber ever drops the field, that keeps Kyber working instead of silently rejecting it.
 fn pick_within_budget(quotes: Vec<Quote>, gas_budget: u64) -> Option<Quote> {
-    quotes.into_iter().filter(|q| q.real_gas().is_none_or(|g| g <= gas_budget)).max_by_key(|q| q.amount_out)
+    within_budget(quotes, gas_budget).into_iter().max_by_key(|q| q.amount_out)
+}
+
+/// The quotes whose estimated real gas fits the budget (see `pick_within_budget` for the no-estimate
+/// rule). `quotes_within` hands them all back so the caller can score each by value net of gas.
+fn within_budget(quotes: Vec<Quote>, gas_budget: u64) -> Vec<Quote> {
+    quotes.into_iter().filter(|q| q.real_gas().is_none_or(|g| g <= gas_budget)).collect()
 }
 
 fn parse_u256(v: &Value) -> Option<U256> {
@@ -179,16 +185,32 @@ impl Kyber {
     /// (KYBER_GAS_LADDER) collapses it, e.g. 1 path / 0.47M gas for 0.24% less out; all rungs are
     /// quoted in parallel and the best one that fits wins.
     pub async fn quote_within(&self, token_in: Address, token_out: Address, amount_in: U256, gas_budget: u64) -> Result<Quote> {
+        let ok = self.quote_rungs(token_in, token_out, amount_in).await?;
+        pick_within_budget(ok, gas_budget).with_context(|| format!("kyber: no route within {gas_budget} gas"))
+    }
+
+    /// Every rung whose swap fits `gas_budget`, for a caller that scores each by value net of gas (an
+    /// Atlas bundle weighs gas at the auction's ~15 gwei) rather than taking the most output: the
+    /// forcing rung (fewer paths, far less gas) can win on net even when it gives up a little output.
+    /// Errs only when a rung quoted but none fit.
+    pub async fn quotes_within(&self, token_in: Address, token_out: Address, amount_in: U256, gas_budget: u64) -> Result<Vec<Quote>> {
+        let ok = self.quote_rungs(token_in, token_out, amount_in).await?;
+        let within = within_budget(ok, gas_budget);
+        if within.is_empty() {
+            bail!("kyber: no route within {gas_budget} gas");
+        }
+        Ok(within)
+    }
+
+    /// Quotes every rung of `KYBER_GAS_LADDER` in parallel; errs only if they all failed.
+    async fn quote_rungs(&self, token_in: Address, token_out: Address, amount_in: U256) -> Result<Vec<Quote>> {
         let rungs = futures::future::join_all(KYBER_GAS_LADDER.iter().map(|g| self.quote(token_in, token_out, amount_in, *g, ""))).await;
         let mut last_err = None;
-        let ok: Vec<Quote> = rungs
-            .into_iter()
-            .filter_map(|r| r.map_err(|e| last_err = Some(e)).ok())
-            .collect();
+        let ok: Vec<Quote> = rungs.into_iter().filter_map(|r| r.map_err(|e| last_err = Some(e)).ok()).collect();
         if ok.is_empty() {
             return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("kyber: no quote")));
         }
-        pick_within_budget(ok, gas_budget).with_context(|| format!("kyber: no route within {gas_budget} gas"))
+        Ok(ok)
     }
 
     /// Calldata for the quoted route; `sender` is the contract that holds the tokens and calls the
@@ -241,6 +263,14 @@ impl crate::dex::Dex for Kyber {
 
     async fn quote_within(&self, token_in: Address, token_out: Address, amount_in: U256, gas_budget: u64) -> Result<Quote> {
         Kyber::quote_within(self, token_in, token_out, amount_in, gas_budget).await
+    }
+
+    async fn quotes_within(&self, token_in: Address, token_out: Address, amount_in: U256, gas_budget: u64) -> Result<Vec<Quote>> {
+        Kyber::quotes_within(self, token_in, token_out, amount_in, gas_budget).await
+    }
+
+    fn rung_gas_price_wei(&self, quote: &Quote) -> Option<u128> {
+        quote.gas_price_wei
     }
 
     fn amount_out(&self, quote: &Quote) -> U256 {
@@ -309,5 +339,16 @@ mod tests {
         // No estimate: passes (the simulation or the bundle's full budget accounts for it).
         let unknown = Quote { amount_out: U256::from(1u8), gas: None, summary: Value::Null, token_in: Address::ZERO, token_out: Address::ZERO, amount_in: U256::ZERO, gas_price_wei: None };
         assert!(pick_within_budget(vec![unknown], 1).is_some());
+    }
+
+    #[test]
+    fn within_budget_keeps_every_fitting_rung_for_net_scoring() {
+        // Same three rungs: at 8M only the single-path rung fits, at 30M all three do. quotes_within
+        // hands them ALL back (not just the highest-output one) so the caller can pick by net gas.
+        let ladder = || vec![q(162_258, 15_566_630), q(162_249, 11_120_140), q(161_882, 467_166)];
+        let tight: Vec<u64> = within_budget(ladder(), 8_000_000).iter().map(|q| q.amount_out.to()).collect();
+        assert_eq!(tight, vec![161_882u64], "only the single-path rung fits 8M after the 1.6x safety");
+        assert_eq!(within_budget(ladder(), 30_000_000).len(), 3, "a loose budget keeps all rungs for the caller to weigh");
+        assert!(within_budget(ladder(), 500_000).is_empty(), "nothing fits");
     }
 }

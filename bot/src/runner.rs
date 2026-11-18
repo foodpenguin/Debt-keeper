@@ -1333,6 +1333,32 @@ impl OpCost {
     fn bid_basis(&self, gross_usd: f64, op_gas: u64) -> f64 {
         gross_usd - (op_gas + atlas_venue::METACALL_FIXED_GAS) as f64 * self.gas_usd
     }
+
+    /// The bid basis repriced on an op's *simulated* gas rather than its estimate. The simulated gas
+    /// carries only a small safety (`SIM_GAS_SAFETY`) because it is the real execution path, so when
+    /// the estimate ran high (the usual case) this frees gas to bid; when the simulation ran dearer
+    /// than the estimate it lowers the bid instead (safer). The op built on this basis is always
+    /// re-simulated before it is sent, so the bid is never larger than a simulation has proven pays.
+    fn bid_basis_from_sim(&self, gross_usd: f64, sim_gas: u64) -> f64 {
+        self.bid_basis(gross_usd, sim_bid_gas(sim_gas))
+    }
+}
+
+/// The simulated batch gas with the small bid-repricing safety (`SIM_GAS_SAFETY`): the gas the bid,
+/// its gas pay and the re-bid basis are all priced at. Always ≥ the simulated gas.
+fn sim_bid_gas(sim_gas: u64) -> u64 {
+    (sim_gas as f64 * atlas_venue::SIM_GAS_SAFETY).ceil() as u64
+}
+
+/// One batch solver-op simulation: builds the `atlasSolverCall` for `bid_wei`/`gas_pay_wei` and runs
+/// it against the Atlas stand-in reporting `gas_liability_wei`. The returned profit is the real net
+/// after the bid and the gas the op pays in ETH (see `batch_op`).
+#[allow(clippy::too_many_arguments)]
+async fn sim_batch<P: Provider>(provider: &P, solver: &atlas_venue::AtlasSolver, loan: Address, inner: &alloy::primitives::Bytes, overrides: &StateOverride, block: u64, sim_time: u64, bid_wei: U256, gas_pay_wei: U256, gas_liability_wei: U256) -> Result<venue::SimResult> {
+    let calldata = solver.calldata(loan, inner, bid_wei, U256::ZERO, gas_pay_wei);
+    let venue = atlas_venue::AtlasBid { solver, bid_wei, gas_pay_wei, gas_liability_wei };
+    let at = Some(venue::SimAt { number: block + 1, time: sim_time });
+    venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await
 }
 
 /// What a solver op is sent with: its gas limit (simulated gas x `gas_limit_buffer`, within the
@@ -1452,11 +1478,14 @@ async fn single_solver_op<P: Provider>(
     })
 }
 
-/// A batch solver op over a bundle's whole plan: the bid comes from the estimate (gross minus the
-/// whole metacall gas Atlas charges, decision 3), and the op pays that same gas in ETH out of its
-/// proceeds (gasPayWei), so the simulated profit is the real net after the bid and the gas. The
-/// simulation gates the send (its profit, gas and the gap to the estimate are journaled to
-/// recalibrate the gas constants).
+/// A batch solver op over a bundle's whole plan. Two simulations: sim #1 bids on the conservative
+/// estimate (gross minus the whole metacall gas Atlas charges) and measures the real gas; the bid is
+/// then repriced on that simulated gas (x SIM_GAS_SAFETY) — higher when the estimate ran loose, the
+/// usual case — and sim #2 proves the repriced op before it can be sent (raising the bid enlarges the
+/// bid swap, which sim #1 did not price). The op pays its gas in ETH out of its proceeds (gasPayWei),
+/// so a simulation's profit is the real net after the bid and the gas, and it gates the send. Both
+/// bid bases and which was used are journaled. If the re-bid cannot be priced or does not simulate,
+/// the estimate-bid op (proven by sim #1) is kept.
 #[allow(clippy::too_many_arguments)]
 async fn batch_op<P: Provider>(
     provider: &P,
@@ -1476,55 +1505,93 @@ async fn batch_op<P: Provider>(
     eth_usd: f64,
 ) -> (serde_json::Value, Option<OpCandidate>) {
     let loan = m.meta.params.loanToken;
-    let bid_basis = cost.bid_basis(bundle.gross_usd, plan.gas_est);
-    let gas_pay_wei = cost.price.gas_pay_wei(plan.gas_est);
-    let gas_pay_eth = math::units(gas_pay_wei, 18);
+    let decimals = m.meta.loan_decimals;
+    // Estimate-based bid: the conservative figure that also backs the swap budget and the bond
+    // liability. The bid itself is repriced on the simulated gas below.
+    let bid_basis_est = cost.bid_basis(bundle.gross_usd, plan.gas_est);
+    let gas_pay_wei_est = cost.price.gas_pay_wei(plan.gas_est);
+    let gas_pay_eth_est = math::units(gas_pay_wei_est, 18);
     let row = |extra: serde_json::Value| {
-        let mut base = json!({ "bid_basis": "batch_est", "positions": plan.items.len(), "router": plan.router, "bid_basis_usd": bid_basis, "est_gas": plan.gas_est, "gas_pay_eth": gas_pay_eth });
+        let mut base = json!({ "positions": plan.items.len(), "router": plan.router, "est_gas": plan.gas_est, "gas_pay_eth": gas_pay_eth_est });
         base.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         base
     };
     // Gas floor: the estimated metacall gas already costs more than the gross -> do not bid.
-    if bid_basis <= 0.0 {
-        return (row(json!({ "ok": false, "skipped": "gas_floor" })), None);
+    if bid_basis_est <= 0.0 {
+        return (row(json!({ "bid_basis": "batch_est", "bid_basis_est_usd": bid_basis_est, "ok": false, "skipped": "gas_floor" })), None);
     }
-    let Some(bid_usd) = parts.auction.bid_usd(Some(&m.meta.name), bid_basis, eth_usd) else {
-        return (row(json!({ "ok": false, "skipped": "policy" })), None);
+    let Some(bid_usd_est) = parts.auction.bid_usd(Some(&m.meta.name), bid_basis_est, eth_usd) else {
+        return (row(json!({ "bid_basis": "batch_est", "bid_basis_est_usd": bid_basis_est, "ok": false, "skipped": "policy" })), None);
     };
-    let bid_wei = U256::from((bid_usd / eth_usd.max(1.0) * 1e18) as u128);
+    let bid_wei_est = U256::from((bid_usd_est / eth_usd.max(1.0) * 1e18) as u128);
     let inner = solver.batch_inner(&m.meta, plan, deadline);
-    let calldata = solver.calldata(loan, &inner, bid_wei, U256::ZERO, gas_pay_wei);
-    let venue = atlas_venue::AtlasBid { solver, bid_wei, gas_pay_wei, gas_liability_wei: cost.liability(plan.gas_est) };
-    let at = Some(venue::SimAt { number: block + 1, time: sim_time });
+
+    // Sim #1: the estimate-bid op. It measures the real gas and is the proven fallback if the re-bid
+    // below cannot be priced or does not simulate.
     let t_sim = std::time::Instant::now();
-    let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
+    let r = sim_batch(provider, solver, loan, &inner, overrides, block, sim_time, bid_wei_est, gas_pay_wei_est, cost.liability(plan.gas_est)).await;
     let batch_sim_ms = t_sim.elapsed().as_millis() as u64;
-    match r {
-        Ok(s) => {
-            // The real sim gas is the hard safety (an aggregator exit can run well above its
-            // estimate): too close to the DappControl's solverGasLimit and the op risks running out
-            // of gas on-chain, so it is not sent even though the sim passed.
-            if !atlas_venue::fits_solver_gas(s.gas_used, solver_gas_limit, gas_headroom) {
-                return (row(json!({ "ok": false, "skipped": "gas_near_limit", "gas_used": s.gas_used, "limit": solver_gas_limit, "batch_sim_ms": batch_sim_ms })), None);
-            }
-            let net_after_bid = math::units(s.profit, m.meta.loan_decimals);
-            let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, loan, eth_usd).unwrap_or(0.0);
-            // Candidate when the op nets positive after the bid and its gas; the minProfit (profit x
-            // keep) that protects it against state drift is set at submit, as for the single op.
-            let cand = (!s.profit.is_zero()).then(|| OpCandidate {
-                market: mi,
-                payload: executor::Payload { to: solver.solver, calldata: inner, min_profit: atlas_venue::SOLVER_MIN_PROFIT },
-                bid_wei,
-                profit: s.profit,
-                gas_used: s.gas_used,
-                gas_pay_wei,
-                loan_usd,
-                loan_decimals: m.meta.loan_decimals,
-                profit_usd: net_after_bid * loan_usd,
-            });
-            (row(json!({ "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "net_after_bid_usd": net_after_bid * loan_usd, "gas_used": s.gas_used, "batch_sim_ms": batch_sim_ms })), cand)
+    let s = match r {
+        Ok(s) => s,
+        Err(e) => return (row(json!({ "bid_basis": "batch_est", "bid_basis_est_usd": bid_basis_est, "bid_usd": bid_usd_est, "ok": false, "error": crate::revert::explain(&e), "batch_sim_ms": batch_sim_ms })), None),
+    };
+    // The real sim gas is the hard safety (an aggregator exit can run well above its estimate): too
+    // close to the DappControl's solverGasLimit and the op risks running out of gas on-chain, so it
+    // is not sent even though the sim passed.
+    if !atlas_venue::fits_solver_gas(s.gas_used, solver_gas_limit, gas_headroom) {
+        return (row(json!({ "bid_basis": "batch_est", "bid_basis_est_usd": bid_basis_est, "ok": false, "skipped": "gas_near_limit", "gas_used": s.gas_used, "limit": solver_gas_limit, "batch_sim_ms": batch_sim_ms })), None);
+    }
+    let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, loan, eth_usd).unwrap_or(0.0);
+    // Reprice the bid on the simulated gas (x SIM_GAS_SAFETY) instead of the conservative estimate:
+    // the estimate runs ~1.4x the real gas, so an estimate-based bid gives up gas savings that could
+    // be bid (and, when the sim ran dearer, over-bids). Raising the bid enlarges the bid swap (it
+    // buys bid + gas pay), which sim #1 did not price, so the re-bid op is SIMULATED AGAIN before it
+    // can be a candidate — never sent on the strength of sim #1 alone. minProfit still guards it.
+    let bid_basis_sim = cost.bid_basis_from_sim(bundle.gross_usd, s.gas_used);
+    let mk_cand = |bid_wei: U256, gas_pay_wei: U256, r: &venue::SimResult| OpCandidate {
+        market: mi,
+        payload: executor::Payload { to: solver.solver, calldata: inner.clone(), min_profit: atlas_venue::SOLVER_MIN_PROFIT },
+        bid_wei,
+        profit: r.profit,
+        gas_used: r.gas_used,
+        gas_pay_wei,
+        loan_usd,
+        loan_decimals: decimals,
+        profit_usd: math::units(r.profit, decimals) * loan_usd,
+    };
+    // The sim-gas bid, re-simulated. Some only when it prices, fits the gas limit and still pays.
+    let rebid = async {
+        if bid_basis_sim <= 0.0 {
+            return None;
         }
-        Err(e) => (row(json!({ "bid_usd": bid_usd, "ok": false, "error": crate::revert::explain(&e), "batch_sim_ms": batch_sim_ms })), None),
+        let bid_usd_sim = parts.auction.bid_usd(Some(&m.meta.name), bid_basis_sim, eth_usd)?;
+        let bid_wei_sim = U256::from((bid_usd_sim / eth_usd.max(1.0) * 1e18) as u128);
+        let gas_pay_sim = cost.price.gas_pay_wei(sim_bid_gas(s.gas_used));
+        // The stub liability only has to cover the gas pay in the sim; keep it at the larger of the
+        // estimate and the sim-priced gas so the op pays its whole gas pay.
+        let liability = cost.liability(plan.gas_est.max(sim_bid_gas(s.gas_used)));
+        let t2 = std::time::Instant::now();
+        let s2 = sim_batch(provider, solver, loan, &inner, overrides, block, sim_time, bid_wei_sim, gas_pay_sim, liability).await.ok()?;
+        let rebid_sim_ms = t2.elapsed().as_millis() as u64;
+        (atlas_venue::fits_solver_gas(s2.gas_used, solver_gas_limit, gas_headroom) && !s2.profit.is_zero()).then_some((bid_usd_sim, bid_wei_sim, gas_pay_sim, s2, rebid_sim_ms))
+    }
+    .await;
+
+    match rebid {
+        Some((bid_usd_sim, bid_wei_sim, gas_pay_sim, s2, rebid_sim_ms)) => {
+            let net_after_bid = math::units(s2.profit, decimals);
+            let cand = Some(mk_cand(bid_wei_sim, gas_pay_sim, &s2));
+            (row(json!({ "bid_basis": "batch_sim", "bid_basis_est_usd": bid_basis_est, "bid_basis_sim_usd": bid_basis_sim, "bid_usd": bid_usd_sim, "ok": true, "net_after_bid": net_after_bid, "net_after_bid_usd": net_after_bid * loan_usd, "gas_used": s.gas_used, "sim_gas": s2.gas_used, "batch_sim_ms": batch_sim_ms, "rebid_sim_ms": rebid_sim_ms })), cand)
+        }
+        None => {
+            // Keep the estimate-bid op, which sim #1 proved (the re-bid was below the gas floor at the
+            // simulated gas, rejected by policy, or did not simulate). Submission reprices its gas pay
+            // from the simulated gas, as before.
+            let net_after_bid = math::units(s.profit, decimals);
+            let ok = !s.profit.is_zero();
+            let cand = ok.then(|| mk_cand(bid_wei_est, gas_pay_wei_est, &s));
+            (row(json!({ "bid_basis": "batch_est", "bid_basis_est_usd": bid_basis_est, "bid_basis_sim_usd": bid_basis_sim, "bid_usd": bid_usd_est, "ok": ok, "net_after_bid": net_after_bid, "net_after_bid_usd": net_after_bid * loan_usd, "gas_used": s.gas_used, "batch_sim_ms": batch_sim_ms })), cand)
+        }
     }
 }
 
@@ -3035,6 +3102,33 @@ mod tests {
         assert_eq!(profit_at_gas_pay(usdc(5), wei(10), wei(12), 3000.0, 1.0, 6), U256::ZERO);
         // No loan-token price: an increase counts as eating the profit.
         assert_eq!(profit_at_gas_pay(usdc(100), wei(10), wei(11), 3000.0, 0.0, 6), U256::ZERO);
+    }
+
+    #[test]
+    fn repricing_the_bid_on_simulated_gas_follows_the_sim_up_or_down() {
+        // 15.005 gwei, 10 % surcharge, ETH $3000. Estimate 1.5M gas, gross $100.
+        let cost = OpCost::new(atlas_venue::OpGasPrice::new(15_005_000_000, 0.1), 3_000_000, 3000.0);
+        let (gross, est) = (100.0, 1_500_000u64);
+        let est_basis = cost.bid_basis(gross, est);
+        // The usual case: the op simulates well under the estimate (0.7M) -> the bid basis rises...
+        let cheaper = cost.bid_basis_from_sim(gross, 700_000);
+        assert!(cheaper > est_basis, "a cheaper sim frees gas to bid: {cheaper} vs {est_basis}");
+        // ...by exactly the gas the op no longer needs x the per-gas USD, so the extra bid is covered
+        // by the realized gas saving — it cannot eat the simulated profit that minProfit protects.
+        let saved = (est - sim_bid_gas(700_000)) as f64 * cost.gas_usd;
+        assert!((cheaper - est_basis - saved).abs() < 1e-9);
+        // When the sim ran dearer than the estimate the bid basis falls instead (safer, bids less).
+        assert!(cost.bid_basis_from_sim(gross, 1_900_000) < est_basis);
+    }
+
+    #[test]
+    fn the_sim_bid_gas_never_prices_below_the_simulated_gas() {
+        // The repricing gas (what the bid, its gas pay and the re-bid basis use) always covers the gas
+        // Atlas will charge: the simulated gas rounded up by a safety >= 1.
+        for g in [0u64, 1, 999_999, 1_500_000, 7_000_000] {
+            assert!(sim_bid_gas(g) >= g, "sim_bid_gas({g}) = {}", sim_bid_gas(g));
+        }
+        assert!(sim_bid_gas(1_000_000) > 1_000_000, "a safety > 1 adds headroom over the simulated gas");
     }
 
     #[test]

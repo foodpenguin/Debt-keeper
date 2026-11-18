@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+Atlas exit-gas optimisation: the batch solver op now chooses its exit by value net of gas and bids
+what it really saves. No config or contract change.
+
+- Aggregator exit: the gas ladder's rungs are now chosen by value **net of gas**, not by output. In
+  an Atlas bundle (priced at the auction's ~15 gwei) each rung is scored like the direct route, so a
+  forcing rung that gives up a little output for far less gas can win when the extra gas costs more
+  than the extra output. Off the auction path (the block / single-exit path, no auction gas price)
+  the behaviour is unchanged: the highest-output rung within the budget. New `Dex::quotes_within`
+  and `Dex::rung_gas_price_wei` default trait methods (the trait names no protocol/vendor); the rungs
+  and which one was selected are journaled in the bundle row as `agg_rungs`.
+- Atlas bid: the batch op's bid is now computed from the **simulated** gas, not the conservative
+  estimate. The estimate runs ~1.4× the real gas (measured on live batch ops: simulated/estimated
+  median ~0.7, range 0.43–1.29), so an estimate-based bid gives up gas savings that could be bid.
+  `batch_op` simulates the op once at the estimate bid to measure the real gas, reprices the bid on
+  that simulated gas × `SIM_GAS_SAFETY` (raising it when the estimate ran loose, lowering it when the
+  sim ran dearer), and **simulates the repriced op again** before it can be sent — raising the bid
+  enlarges the bid swap, which the first simulation did not price, so the bid is never sent on faith;
+  `minProfit` still guards the real net on-chain. The conservative estimate still backs the swap
+  budget and the bond's gas liability; only the bid changed. The journal records both bases
+  (`bid_basis_est_usd`, `bid_basis_sim_usd`) and which was used (`batch_est`/`batch_sim`). If the
+  re-bid cannot be priced or does not simulate, the estimate-bid op (proven by the first simulation)
+  is kept.
+
 ## v0.4.1 (2026-11-18)
 
 Morpho markets whose oracle is a `MetaOracleDeviationTimelock` are now valued on the Atlas path, and

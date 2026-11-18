@@ -319,6 +319,16 @@ pub fn bundle_swap_budget(solver_gas_limit: u64, n: usize) -> u64 {
     solver_gas_limit.saturating_sub(BUNDLE_OVERHEAD_GAS + BUNDLE_GAS_PER_POSITION * n as u64)
 }
 
+/// Safety on the *simulated* batch gas when it reprices the bid (`batch_op`). The simulation runs
+/// the real op at block N, but Atlas charges the winner the gas the metacall actually uses at
+/// execution (block N+1), which can drift a little higher (cold→warm storage, a position healed in
+/// between). Atlas's gas *price* is fixed (the SVR auction's 15.005 gwei), so only the units move; a
+/// small factor covers that drift. 1.08 keeps the sim-based bid from overshooting the real charge
+/// while still recapturing most of the slack the estimate leaves (measured on live batch ops:
+/// simulated/estimated median ~0.7, range 0.43–1.29). The conservative estimate still backs the
+/// budget and the bond liability — only the bid uses this.
+pub const SIM_GAS_SAFETY: f64 = 1.08;
+
 /// Extra safety on an *aggregator* exit's gas in the bundle estimate (on top of KYBER_GAS_SAFETY):
 /// the aggregator's own estimate is less reliable than the self-built direct router's (seen
 /// 2026-11-13, a Kyber-exit batch ran ~1.2x its estimate), so its bid is priced and its budget

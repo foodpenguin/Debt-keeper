@@ -65,7 +65,7 @@
 - **以 fee 計價的模擬**：每個計畫的模擬（以及 direct 路由的每次 grid 報價）都帶上不加價送出時的 fee：`Planner::sim_fee` = max fee 為 2 × base fee + `priority_fee_wei`、priority 為 `priority_fee_wei`。會讀 `tx.gasprice` 的 venue（priority fee 稅、動態手續費）回應的就是實際交易會拿到的結果。
 - **以 USD 記帳**：`Plan::sim_profit` 是借款代幣單位；`profit_usd` = 它 × `loan_usd`；`gas_cost_usd` = 以規劃 priority 計的 L2 gas + L1 data fee（`l1_fee_usd` 單獨列出）；`net_usd` = `profit_usd - gas_cost_usd`。沒有借款代幣價格的市場會成為計畫錯誤。
 - 對模擬結果做**合理性檢查**（利潤和報價的差距、節點實際模擬的區塊）。
-- `quote_bundle` 把一個市場在同一個組合上的所有可清算倉位當成一次出場來估值（Atlas 估值用；一個 batch solver op 會清算全部）；`gross_usd` 以 USD 計，`gas_units` 是整個操作的估計 gas（清算 + swap + 固定開銷，來自呼叫者傳入的 `BundleGas`：Atlas solver op 用 `atlas_venue::ATLAS_BUNDLE_GAS`）。它同時產出一份可執行的 `BundlePlan`（部位全額 seize、flash loan 金額，以及單一的全額出場），由 `atlas_venue::AtlasSolver::batch_inner` 轉成 solver op 內層的 `liquidateBatch` 呼叫。v1 每個部位都全額清算、賣 100%，所以 direct 路線只有在它的配置能賣掉全部時才會被選（route 模式要剛好花掉 seize 的量）；出場路線用拍賣的 gas 價格比較（gas 在這裡是主導因素）。出價就是這個估計值（`batch_est`：gross 減去整筆 metacall 的 gas，含 `METACALL_FIXED_GAS`）；op 的模擬只用來把關送單。gas 以 `contracts/test/AtlasBundleGas.fork.t.sol` 校正（30 個部位的 batch 扣掉出場 swap 約 1.5M gas，每多一個約 34k）。
+- `quote_bundle` 把一個市場在同一個組合上的所有可清算倉位當成一次出場來估值（Atlas 估值用；一個 batch solver op 會清算全部）；`gross_usd` 以 USD 計，`gas_units` 是整個操作的估計 gas（清算 + swap + 固定開銷，來自呼叫者傳入的 `BundleGas`：Atlas solver op 用 `atlas_venue::ATLAS_BUNDLE_GAS`）。它同時產出一份可執行的 `BundlePlan`（部位全額 seize、flash loan 金額，以及單一的全額出場），由 `atlas_venue::AtlasSolver::batch_inner` 轉成 solver op 內層的 `liquidateBatch` 呼叫。v1 每個部位都全額清算、賣 100%，所以 direct 路線只有在它的配置能賣掉全部時才會被選（route 模式要剛好花掉 seize 的量）；出場路線用拍賣的 gas 價格比較（gas 在這裡是主導因素）。聚合器的每個 rung（gas 階梯的兩次報價）都和 direct 一起用**淨值（扣掉 gas）**評分，所以在 gas 貴的時候，低產出但 gas 省很多的強制收斂 rung 也可能勝出；哪些 rung、選了哪個都寫進 journal（`agg_rungs`）。但出價**不是用估計值送出**：`batch_op` 先用估計出價模擬一次（`batch_est`：gross 減去整筆 metacall 的 gas，含 `METACALL_FIXED_GAS`）量出真實 gas，再用「模擬 gas × `SIM_GAS_SAFETY`」重算出價（估計值大約是真實 gas 的 1.4 倍，所以這樣能把省下來的 gas 拿去出價；模擬比估計高時則把出價降低），然後在送出前**再模擬一次**這個新出價的 op——提高出價會放大 bid swap，而第一次模擬沒有為放大的 swap 定價。兩種 basis（`bid_basis_est_usd`、`bid_basis_sim_usd`）和實際用的是哪一種（`batch_est`/`batch_sim`）都寫進 journal；預算和 bond 的 gas 責任仍然用保守的估計值。不論如何，鏈上的 `minProfit` 都保護扣掉出價和 gas 後的真實淨利。gas 以 `contracts/test/AtlasBundleGas.fork.t.sol` 校正（30 個部位的 batch 扣掉出場 swap 約 1.5M gas，每多一個約 34k）。
 
 ### `LiquidationVenue<L>`（`bot/src/venue.rs`）
 
@@ -92,7 +92,7 @@
 
 ### `Dex`（`bot/src/dex.rs`）
 
-`quote_within(token_in, token_out, amount_in, gas_budget)`、`amount_out`、`swap_gas`、`build(quote, sender, recipient, slippage_bps) -> SwapCall { target, calldata }`。planner 從不直接相信回傳的 target：它必須在 `exec.allowed_targets` 裡。`router::Kyber` 使用 gas 階梯（用兩種 gas 價格各報一次價，選出符合預算的最佳路線），並把 Kyber 的 gas 估計乘上安全係數。
+`quote_within(token_in, token_out, amount_in, gas_budget)`、`amount_out`、`swap_gas`、`build(quote, sender, recipient, slippage_bps) -> SwapCall { target, calldata }`。planner 從不直接相信回傳的 target：它必須在 `exec.allowed_targets` 裡。`router::Kyber` 使用 gas 階梯（用兩種 gas 價格各報一次價），並把 Kyber 的 gas 估計乘上安全係數。`quote_within` 回傳預算內產出最高的單一路線（區塊／單一出場路徑，這裡不計 gas 價格）；`quotes_within` 回傳預算內**全部**的 rung，讓用高 gas 價格衡量的呼叫者（Atlas bundle）能逐一用淨值評分，選淨值最高而非產出最高的那個。兩者都是 trait 的預設方法——只有一條路線的聚合器不用改；`rung_gas_price_wei`（預設 `None`）把某個 rung 的內部 gas 價格標進 journal。trait 層不出現任何協定或供應商名稱。
 
 ## 出場路由：自建 V3 路由（`bot/src/v3router.rs`）
 

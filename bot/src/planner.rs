@@ -46,6 +46,22 @@ pub struct BundleGas {
 /// single-position plan reserves under max_gas before sizing the Kyber route.
 const LIQUIDATION_OVERHEAD_GAS: u64 = 400_000;
 
+/// One aggregator rung priced for a bundle exit: the journal's record of how the net-of-gas choice
+/// went, so a forcing rung's wins (less output, far less gas) can be measured after the fact.
+#[derive(Debug, Serialize, Clone)]
+pub struct AggRung {
+    /// The aggregator's internal gas-price assumption for this rung (`None` = its default/live price).
+    pub gas_price_wei: Option<u128>,
+    /// Exit output minus repaid debt, in USD, before gas.
+    pub gross_usd: f64,
+    /// The rung's swap gas with the bundle's aggregator safety factor.
+    pub swap_gas: u64,
+    /// `gross_usd` minus the whole op's gas at the auction price: what the choice is made on.
+    pub net_usd: f64,
+    /// Whether this rung was the bundle's chosen exit.
+    pub selected: bool,
+}
+
 /// One Atlas-style bundle: every liquidatable position of a market liquidated together and the
 /// collateral sold as one exit (see `Planner::quote_bundle`).
 #[derive(Debug, Serialize, Default, Clone)]
@@ -66,6 +82,10 @@ pub struct BundleQuote {
     pub swap_gas: u64,
     pub direct_net_usd: Option<f64>,
     pub kyber_net_usd: Option<f64>,
+    /// Each aggregator rung priced for this bundle (empty off the auction path, where gas is not
+    /// priced and only the best-output rung is quoted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agg_rungs: Vec<AggRung>,
     pub error: Option<String>,
     pub quote_ms: u64,
     /// The Kyber /routes and /route/build times (0 when Kyber was not used), to see where a slow
@@ -448,14 +468,18 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
                 return Err(format!("off ({agg_name} quotes the current market only)"));
             }
             let kt = Instant::now();
-            let k = self.aggregator.quote_within(collateral, loan, total_seize, swap_gas_budget).await.map_err(|e| e.to_string())?;
-            let quote_ms = kt.elapsed().as_millis() as u64;
-            let g = gross(self.aggregator.amount_out(&k), total_seize);
-            Ok(((agg_name, 10_000u64, g, self.aggregator.swap_gas(&k).unwrap_or(swap_gas_budget)), k, quote_ms))
+            // At the auction's gas price every rung is weighed by value net of gas, so take them all;
+            // off the auction path (no gas_price_wei) the single best-output rung is all that is used.
+            let ks = match gas_price_wei {
+                Some(_) => self.aggregator.quotes_within(collateral, loan, total_seize, swap_gas_budget).await,
+                None => self.aggregator.quote_within(collateral, loan, total_seize, swap_gas_budget).await.map(|k| vec![k]),
+            }
+            .map_err(|e| e.to_string())?;
+            Ok((ks, kt.elapsed().as_millis() as u64))
         };
         let (direct, kyber) = tokio::join!(direct, kyber);
         q.quote_ms = t0.elapsed().as_millis() as u64;
-        q.kyber_quote_ms = kyber.as_ref().ok().map(|x| x.2).unwrap_or(0);
+        q.kyber_quote_ms = kyber.as_ref().ok().map(|x| x.1).unwrap_or(0);
         // Route selection weighs the exits at the auction's gas price when given (gas dominates at
         // 15 gwei: a lower-gas exit can beat a higher-output one), else the planner's own.
         let gas_price = gas_price_wei.map(|w| w as f64).unwrap_or_else(|| self.route_gas_price(base_fee_wei));
@@ -466,15 +490,41 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             swap + bundle_gas.per_position * views.len() as u64 + bundle_gas.overhead
         };
         let net = |e: &BundleExit| e.2 - gas_units(e) as f64 * gas_price / 1e18 * eth_usd;
-        let de = direct.as_ref().ok().map(|x| &x.0);
-        let ke = kyber.as_ref().ok().map(|x| &x.0);
-        q.direct_net_usd = de.map(net);
-        q.kyber_net_usd = ke.map(net);
-        let best = [de, ke].into_iter().flatten().max_by(|a, b| net(a).total_cmp(&net(b)));
-        let Some(e) = best else {
-            q.error = Some(format!("direct: {}; {agg_name}: {}", direct.as_ref().err().cloned().unwrap_or_default(), kyber.as_ref().err().cloned().unwrap_or_default()));
-            return q;
+        // Each aggregator rung is its own candidate exit, scored by the same net as the direct route,
+        // so the forcing rung (less output, far less gas) can win when gas is dear.
+        let kyber_quotes: &[_] = kyber.as_ref().map(|(ks, _)| ks.as_slice()).unwrap_or(&[]);
+        let kyber_exit = |i: usize| -> BundleExit {
+            let k = &kyber_quotes[i];
+            (agg_name, 10_000u64, gross(self.aggregator.amount_out(k), total_seize), self.aggregator.swap_gas(k).unwrap_or(swap_gas_budget))
         };
+        let de = direct.as_ref().ok().map(|x| &x.0);
+        let best_kyber: Option<(usize, f64)> = (0..kyber_quotes.len()).map(|i| (i, net(&kyber_exit(i)))).max_by(|a, b| a.1.total_cmp(&b.1));
+        q.direct_net_usd = de.map(net);
+        q.kyber_net_usd = best_kyber.map(|(_, n)| n);
+        let direct_wins = match (de.map(net), best_kyber.map(|(_, n)| n)) {
+            (Some(d), Some(k)) => d >= k,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => {
+                q.error = Some(format!("direct: {}; {agg_name}: {}", direct.as_ref().err().cloned().unwrap_or_default(), kyber.as_ref().err().cloned().unwrap_or_default()));
+                return q;
+            }
+        };
+        // Journal every rung and which one won, so the forcing rung's wins can be measured later.
+        q.agg_rungs = (0..kyber_quotes.len())
+            .map(|i| {
+                let e = kyber_exit(i);
+                AggRung {
+                    gas_price_wei: self.aggregator.rung_gas_price_wei(&kyber_quotes[i]),
+                    gross_usd: e.2,
+                    swap_gas: (e.3 as f64 * bundle_gas.agg_swap_safety) as u64,
+                    net_usd: net(&e),
+                    selected: !direct_wins && best_kyber.is_some_and(|(wi, _)| wi == i),
+                }
+            })
+            .collect();
+        let winning_exit: BundleExit = if direct_wins { *de.expect("direct wins") } else { kyber_exit(best_kyber.expect("kyber wins").0) };
+        let e = &winning_exit;
         (q.router, q.fraction_bps, q.gross_usd, q.swap_gas, q.gas_units) = (e.0.to_string(), e.1, e.2, e.3, gas_units(e));
         q.net_usd = Some(net(e));
         q.gas_usd = q.gross_usd - net(e);
@@ -483,13 +533,13 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let headroom = (total_repaid * U256::from(flash_headroom_bps) / U256::from(10_000u64)).max(U256::from(views.len()));
         let flash_assets = total_repaid + headroom;
         let items: Vec<(Address, U256)> = views.iter().map(|v| (v.user, v.max_seize)).collect();
-        let exit = if q.router == "direct" {
+        let exit = if direct_wins {
             let (_, grid, a) = direct.as_ref().expect("direct won");
             Some((ExitRoute::Packed(self.v3.expect("direct needs v3").encode(pair, grid, a)), "direct"))
         } else {
             let holder = exit_holder.unwrap_or_else(|| self.venue.swap_recipient());
             let bt = Instant::now();
-            let built = self.aggregator.build(&kyber.as_ref().expect("kyber won").1, holder, holder, self.cfg.slippage_bps).await;
+            let built = self.aggregator.build(&kyber_quotes[best_kyber.expect("kyber won").0], holder, holder, self.cfg.slippage_bps).await;
             q.kyber_build_ms = bt.elapsed().as_millis() as u64;
             match built {
                 Ok(b) => {
@@ -851,6 +901,65 @@ mod generic_tests {
         let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 }, true, 5, None, None).await;
         assert_eq!(q.router, "notedex (fallback)", "{:?}", q.error);
         assert_eq!(q.plan.as_ref().map(|p| p.router), Some("notedex"), "the executable plan keeps the venue name");
+    }
+
+    /// A two-rung aggregator: a default rung with more output at high gas, and a forcing rung with a
+    /// little less output at far less gas (labelled with its forcing gas price).
+    struct LadderDex;
+
+    impl Dex for LadderDex {
+        type Quote = (U256, u64, Option<u128>);
+        fn name(&self) -> &'static str {
+            "ladderdex"
+        }
+        async fn quote_within(&self, _ti: Address, _to: Address, amount_in: U256, _b: u64) -> Result<Self::Quote> {
+            Ok((amount_in * U256::from(2u8), 4_000_000, None))
+        }
+        async fn quotes_within(&self, _ti: Address, _to: Address, amount_in: U256, _b: u64) -> Result<Vec<Self::Quote>> {
+            Ok(vec![(amount_in * U256::from(2u8), 4_000_000, None), (amount_in * U256::from(2u8) - U256::from(1u8), 300_000, Some(1_000_000_000_000))])
+        }
+        fn rung_gas_price_wei(&self, q: &Self::Quote) -> Option<u128> {
+            q.2
+        }
+        fn amount_out(&self, q: &Self::Quote) -> U256 {
+            q.0
+        }
+        fn swap_gas(&self, q: &Self::Quote) -> Option<u64> {
+            Some(q.1)
+        }
+        async fn build(&self, q: &Self::Quote, _s: Address, _r: Address, _slip: u32) -> Result<crate::dex::SwapCall> {
+            Ok(crate::dex::SwapCall { target: Address::repeat_byte(0x22), calldata: Bytes::from(q.0.to_be_bytes::<32>().to_vec()), note: None })
+        }
+    }
+
+    #[tokio::test]
+    async fn bundle_picks_the_aggregator_rung_by_value_net_of_gas() {
+        // Toy: 0 decimals, loan $1, repay = seize. One position, seize 90, repay 90. The default rung
+        // outputs 180 (gross $90) at 4M swap gas; the forcing rung outputs 179 (gross $89) at 0.3M.
+        let provider = ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap());
+        let (toy, venue, cfg) = (Toy::default(), MockVenue, cfg());
+        let m = Mk { key: key(1), name: "alpha".into() };
+        let v = view(&toy, 0, user(1), &m, &1.0, &(100, 90));
+        let bundle_gas = BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 };
+        let planner = Planner { protocol: &toy, aggregator: &LadderDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "aggregator" };
+        let ov = StateOverride::default();
+        let run = |gas_price: u128| planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &ov, 0, 2000.0, 10_000_000, bundle_gas, true, 5, Some(gas_price), None);
+
+        // At 15 gwei the ~$144 gas the extra 3.7M units cost dwarfs the $1 of output given up, so the
+        // forcing rung wins on net — the opposite of the old "most output" rule. Both rungs journaled.
+        let hi = run(15_000_000_000).await;
+        assert_eq!(hi.router, "ladderdex", "{:?}", hi.error);
+        assert_eq!(hi.swap_gas, 300_000, "the low-gas forcing rung is the exit");
+        assert_eq!(hi.agg_rungs.len(), 2);
+        assert!(!hi.agg_rungs[0].selected && hi.agg_rungs[1].selected, "the forcing rung is selected");
+        assert_eq!(hi.agg_rungs[1].gas_price_wei, Some(1_000_000_000_000), "its forcing gas price is journaled");
+        assert_eq!((hi.agg_rungs[0].swap_gas, hi.agg_rungs[1].swap_gas), (5_200_000, 390_000), "swap gas carries the 1.3x safety");
+        assert!(hi.agg_rungs[1].net_usd > hi.agg_rungs[0].net_usd);
+
+        // At ~0.01 gwei gas is almost free, so the extra output wins: the default rung is selected.
+        let lo = run(10_000_000).await;
+        assert_eq!(lo.swap_gas, 4_000_000, "the high-output default rung is the exit when gas is cheap");
+        assert!(lo.agg_rungs[0].selected && !lo.agg_rungs[1].selected);
     }
 
     #[tokio::test]
