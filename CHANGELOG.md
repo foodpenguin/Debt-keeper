@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.4.1 (2026-11-18)
+
+Morpho markets whose oracle is a `MetaOracleDeviationTimelock` are now valued on the Atlas path, and
+no market is left on the block path without a logged reason. No config or contract change.
 
 - Oracle model: support Morpho's `MetaOracleDeviationTimelock`. A market whose oracle is a deviation
   timelock (detected by a non-reverting `currentOracle()`) is now modelled through whichever
