@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.2 (2026-11-19)
 
 Atlas exit-gas optimisation: the batch solver op now chooses its exit by value net of gas and bids
 what it really saves. No config or contract change.
