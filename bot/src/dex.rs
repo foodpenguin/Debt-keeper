@@ -46,6 +46,23 @@ pub trait Dex: Send + Sync {
     /// `gas_budget`.
     fn quote_within(&self, token_in: Address, token_out: Address, amount_in: U256, gas_budget: u64) -> impl Future<Output = Result<Self::Quote>> + Send;
 
+    /// Every route within `gas_budget` worth comparing by value *net of gas*, not just the
+    /// highest-output one. The default returns the single `quote_within` best, so an aggregator that
+    /// cannot enumerate alternatives needs no change. An aggregator that prices the same trade under
+    /// different internal gas assumptions (cheaper routes that give up a little output) returns each,
+    /// so a caller weighing gas at a high price keeps the one with the best net instead of the one
+    /// with the most output. Errs only when no route fits.
+    fn quotes_within(&self, token_in: Address, token_out: Address, amount_in: U256, gas_budget: u64) -> impl Future<Output = Result<Vec<Self::Quote>>> + Send {
+        async move { Ok(vec![self.quote_within(token_in, token_out, amount_in, gas_budget).await?]) }
+    }
+
+    /// A label for which internal gas-price assumption produced this quote, for the journal only:
+    /// `None` is the aggregator's default (its live price), `Some(wei)` a higher price it was asked
+    /// to assume (fewer, cheaper paths for a little less output). Default: `None`.
+    fn rung_gas_price_wei(&self, _quote: &Self::Quote) -> Option<u128> {
+        None
+    }
+
     /// Output of a quote, in `token_out` base units.
     fn amount_out(&self, quote: &Self::Quote) -> U256;
 

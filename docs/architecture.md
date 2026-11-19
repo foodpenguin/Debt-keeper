@@ -124,10 +124,20 @@ Turns one liquidatable position (or a bundle of positions in one market) into a 
   full-size exit) that `atlas_venue::AtlasSolver::batch_inner` turns into the solver op's inner
   `liquidateBatch` call. v1 liquidates each position in full and sells 100 %, so a direct route is a
   candidate only when its allocation is full-size (route mode spends exactly the seized amount); the
-  exits are weighed at the auction's gas price, where gas dominates. The bid is this estimate
-  (`batch_est`: gross minus the whole metacall gas including `METACALL_FIXED_GAS`); the op's
-  simulation only gates the send. Gas is calibrated on `contracts/test/AtlasBundleGas.fork.t.sol`
-  (a 30-position batch ≈ 1.5M gas before its exit swap, ~34k per extra position).
+  exits are weighed at the auction's gas price, where gas dominates. Each aggregator rung (the gas
+  ladder's two quotes) is scored by value *net of gas* at that price, alongside the direct route, so
+  a forcing rung (less output, far less gas) can win when gas is dear; the rungs and which one was
+  selected are journaled (`agg_rungs`). The bid, however, is NOT sent on the estimate: `batch_op`
+  simulates the op once at the estimate bid (`batch_est`: gross minus the whole metacall gas
+  including `METACALL_FIXED_GAS`) to measure the real gas, then reprices the bid on that simulated
+  gas × `SIM_GAS_SAFETY` (the estimate runs ~1.4× the real gas, so this frees gas to bid; when the
+  sim ran dearer it lowers the bid instead) and simulates the repriced op again before it can be
+  sent — raising the bid enlarges the bid swap, which the first simulation did not price. Both bases
+  (`bid_basis_est_usd`, `bid_basis_sim_usd`) and which was used (`batch_est`/`batch_sim`) are
+  journaled; the conservative estimate still backs the swap budget and the bond's gas liability.
+  `minProfit` guards the real net after the bid and the gas on-chain regardless. Gas is calibrated on
+  `contracts/test/AtlasBundleGas.fork.t.sol` (a 30-position batch ≈ 1.5M gas before its exit swap,
+  ~34k per extra position).
 
 ### `LiquidationVenue<L>` (`bot/src/venue.rs`)
 
@@ -203,8 +213,13 @@ injected at a placeholder address, like MorphoLiquidator.
 `quote_within(token_in, token_out, amount_in, gas_budget)`, `amount_out`, `swap_gas`,
 `build(quote, sender, recipient, slippage_bps) -> SwapCall { target, calldata }`. The planner never
 trusts the returned target: it must be in `exec.allowed_targets`. `router::Kyber` uses a gas ladder
-(two quotes at different gas prices, the best route that fits the budget) and scales Kyber's gas
-estimate by a safety factor.
+(two quotes at different gas prices) and scales Kyber's gas estimate by a safety factor.
+`quote_within` returns the single best route that fits the budget (the block / single-exit path,
+where gas is not priced); `quotes_within` returns *all* the rungs that fit, so a caller weighing gas
+at a high price (an Atlas bundle) can score each by value net of gas and keep the best net rather
+than the most output. Both are default trait methods — an aggregator with one route needs no change,
+and `rung_gas_price_wei` (default `None`) labels a rung's internal gas price for the journal. The
+trait names no protocol or vendor.
 
 ## Exit routing: the self-built V3 router (`bot/src/v3router.rs`)
 
