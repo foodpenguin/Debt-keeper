@@ -319,10 +319,11 @@ fn paper(db: &Connection, clock: &Clock, since: f64, cfg: &Config) -> Result<Val
         let day = ((clock.ts(db, *head) + tz_offset()) / 86_400.0).floor() as i64;
         let d = days.entry(day).or_default();
         (d.0, d.1, d.2) = (d.0 + 1, d.1 + i64::from(won), d.2 + if won { net * m1 } else { 0.0 });
-        // Batch-sim stats: solver rows that actually simulated (ok, or failed with an error).
+        // Batch-sim stats: batch solver rows that actually simulated (ok, or failed with an error). Up
+        // to v0.4.3 most were `batch_est`; from v0.5.0 every simulated batch op is `batch_sim`.
         for mrow in j["markets"].as_array().into_iter().flatten() {
             let s = &mrow["solver"];
-            if s["bid_basis"].as_str() != Some("batch_est") {
+            if !matches!(s["bid_basis"].as_str(), Some("batch_est" | "batch_sim")) {
                 continue;
             }
             let simmed = s["ok"].as_bool() == Some(true) || s.get("error").is_some();

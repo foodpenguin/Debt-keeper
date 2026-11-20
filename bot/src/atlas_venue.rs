@@ -202,6 +202,12 @@ impl AtlasSolver {
         (calls, self.bid_swap(loan_token, bid_wei + gas_pay_wei), loan_token, min_profit, gas_pay_wei).abi_encode_params().into()
     }
 
+    /// The bid swap's pool fee as a share (e.g. 0.0005), for bids repaid in `loan_token`: what buying
+    /// the bid and the gas pay costs on top of their ETH value. 0 when the loan token is WETH.
+    pub fn bid_swap_fee(&self, loan_token: Address) -> f64 {
+        if loan_token == self.weth { 0.0 } else { self.bid_fees.get(&loan_token).copied().unwrap_or(self.bid_fee) as f64 / 1e6 }
+    }
+
     /// The bid swap: buy `eth_wei` (bid + gas pay) of WETH with the loan token (none if the loan is
     /// WETH, unwrapped by the solver, or nothing to buy).
     fn bid_swap(&self, loan_token: Address, eth_wei: U256) -> SwapStep {

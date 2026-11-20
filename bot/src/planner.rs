@@ -30,6 +30,17 @@ use crate::{
 const SEIZE_FRACTIONS_BPS: [u64; 3] = [10_000, 5_000, 2_500];
 /// Gas a second, third... direct path adds beyond its own swap (pool call + callback + transfer).
 const GAS_PER_EXTRA_PATH: u64 = 60_000;
+
+/// How a direct-router exit is allocated (`Planner::direct_exit`).
+#[derive(Debug, Clone, Copy)]
+enum DirectSale {
+    /// Any amount up to the maximum (a single position may be liquidated in part), route gas at the
+    /// planner's own price.
+    Prefix,
+    /// Exactly the maximum (a bundle's route must spend all it seized), route gas at this price
+    /// (wei; None = the planner's own).
+    Full { gas_price_wei: Option<u128> },
+}
 /// Gas of a bundle valuation (`Planner::quote_bundle`): per liquidated position and for the rest
 /// of the operation besides the swap. The venue that runs bundles knows these (see
 /// `atlas_venue::ATLAS_BUNDLE_GAS`).
@@ -356,8 +367,11 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
     }
 
     /// Best direct-router exit for selling up to `max_seize` of `pair.collateral` at `block`:
-    /// one grid quote, then the allocation that maximises out - repay(seize) - extra-leg gas.
-    /// Err = the quote failed, Ok(None) = no profitable allocation.
+    /// one grid quote, then the allocation that maximises out - repay(seize) - route gas.
+    /// `sale` picks the allocation: a prefix (any size up to `max_seize`, the block path's partial
+    /// liquidation) priced at the planner's own gas price, or a full sale of exactly `max_seize`
+    /// (a bundle) with its route gas at the given price (an Atlas auction's).
+    /// Err = the quote failed (or nothing fits the budget), Ok(None) = no profitable allocation.
     #[allow(clippy::too_many_arguments)]
     async fn direct_exit<P: Provider>(
         &self,
@@ -372,6 +386,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         overrides: &StateOverride,
         repay: impl Fn(U256) -> U256,
         gas_budget: Option<u64>,
+        sale: DirectSale,
     ) -> Result<Option<(v3router::Grid, v3router::Allocation)>, String> {
         let v3 = self.v3.expect("checked by caller");
         let loan_dec = self.protocol.token_decimals(meta, pair.debt);
@@ -383,10 +398,20 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         // Quotes priced like the send: pools that read tx.gasprice answer what the tx would get.
         let fee = SimFee { max_fee_per_gas: base_fee_wei * 2 + self.cfg.priority_fee_wei, max_priority_fee_per_gas: self.cfg.priority_fee_wei };
         let grid = v3.grid(p, pair, max_seize, max_conn, block, overrides, Some(fee)).await.map_err(|e| format!("grid quote failed: {e}"))?;
-        let gas_price = self.route_gas_price(base_fee_wei);
         let n_direct = v3.routes[&pair].direct.len();
-        // The extra-path gas cost is weighed against output in loan-token units.
-        match v3router::allocate_within(&grid, n_direct, repay, GAS_PER_EXTRA_PATH, gas_price / 1e18 * eth_usd / loan_usd, |x| num::units(x, loan_dec), gas_budget) {
+        let to_units = |x| num::units(x, loan_dec);
+        // Route gas is weighed against output in loan-token units.
+        let r = match sale {
+            DirectSale::Prefix => {
+                let gas_price = self.route_gas_price(base_fee_wei);
+                v3router::allocate_within(&grid, n_direct, repay, GAS_PER_EXTRA_PATH, gas_price / 1e18 * eth_usd / loan_usd, to_units, gas_budget)
+            }
+            DirectSale::Full { gas_price_wei } => {
+                let per_gas = gas_price_wei.map_or_else(|| self.route_gas_price(base_fee_wei), |w| w as f64) / 1e18 * eth_usd / loan_usd;
+                v3router::allocate_full(&grid, n_direct, max_seize, repay, GAS_PER_EXTRA_PATH, |gas| gas as f64 * per_gas, to_units, gas_budget)
+            }
+        };
+        match r {
             Ok(a) => Ok(a.map(|a| (grid, a))),
             Err(g) => Err(format!("direct route {g} gas > budget {}", gas_budget.unwrap_or(0))),
         }
@@ -449,14 +474,16 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         }
         let repay = |s: U256| bundle_repay(s, total_seize, total_repaid);
         let gross = |out: U256, s: U256| (num::units(out, loan_dec) - num::units(repay(s), loan_dec)) * loan_usd;
-        // v1 sells the whole bundle in one exit: a direct route is a candidate only when its
-        // allocation sells all of `total_seize` (route mode requires spending exactly the seized
-        // amount); Kyber is quoted at the full size. Each candidate carries what builds its exit.
+        // One exit sells the whole bundle: the direct route is a full-sale allocation of exactly
+        // `total_seize` (route mode requires spending exactly the seized amount), its legs weighed
+        // at the auction's gas price; Kyber is quoted at the full size. Each candidate carries what
+        // builds its exit.
         let direct = async {
             if !self.v3.is_some_and(|v| v.routes.get(&pair).is_some_and(|r| !r.is_empty())) {
                 return Err("no direct pools for this pair".to_string());
             }
-            match self.direct_exit(p, meta, pair, snap, total_seize, eth_usd, base_fee_wei, BlockId::number(block), overrides, repay, Some(swap_gas_budget)).await? {
+            let sale = DirectSale::Full { gas_price_wei };
+            match self.direct_exit(p, meta, pair, snap, total_seize, eth_usd, base_fee_wei, BlockId::number(block), overrides, repay, Some(swap_gas_budget), sale).await? {
                 None => Err("no profitable direct allocation".into()),
                 Some((grid, a)) if a.seize == total_seize => Ok((("direct", 10_000u64, gross(a.expected_out, a.seize), a.est_swap_gas), grid, a)),
                 Some(_) => Err("direct route would not sell the whole bundle (route mode needs the exact amount)".into()),
@@ -570,7 +597,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let pair = c.view.pair;
         let repay = |s| self.protocol.repay_for_seize(c.meta, c.snap, pair, s);
         let budget = Some(self.cfg.max_gas.saturating_sub(LIQUIDATION_OVERHEAD_GAS));
-        let exit = self.direct_exit(p, c.meta, pair, c.snap, c.view.max_seize, c.eth_usd, c.base_fee_wei, c.block_id(), &c.overrides, repay, budget).await;
+        let exit = self.direct_exit(p, c.meta, pair, c.snap, c.view.max_seize, c.eth_usd, c.base_fee_wei, c.block_id(), &c.overrides, repay, budget, DirectSale::Prefix).await;
         plan.quote_ms = t0.elapsed().as_millis() as u64;
         let (grid, alloc) = match exit {
             Ok(Some(x)) => x,

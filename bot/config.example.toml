@@ -83,6 +83,7 @@ eth_usd_fallback = 2400.0      # until an on-chain ETH price is read
 # bid_outbid_bps = 500         # ...by 5%
 # bid_min_samples = 5          # winners needed before the model is used (per market, else all markets)
 # bid_window_secs = 604800     # winners older than this are forgotten; seeded from the journal at start
+# outbid_skip_ratio = 4.0      # skip when the predicted winner pays > 4x our (capped) bid: a sure revert (0 = off)
 
 [router]
 mode = "best"                  # best = direct + aggregator (Kyber) in parallel, keep the better; or "direct" / "aggregator" ("kyber" = alias)
@@ -164,6 +165,7 @@ max_concurrent = 1             # valuations at once (they share the RPC pool)
 paper_margins = [0.01, 0.05, 0.1]   # dashboard paper trading: bid = bundle net x (1 - m) vs the decoded winning bid
 paper_deadline_ms = 2000       # a valuation later than this after the auction could not have bid in time
 # user_op_gas = 500000         # the auctioned userOp's gas limit when the feed message omits it (bond check)
+resim = true                   # execution labels: re-simulate each valued op on the block before its metacall (atlas_resim rows; 3 sims per op)
 
 # The AtlasLiquidationSolver venue. simulate: the top position of each valued auction is also wrapped
 # into a solver operation (bid from the auction policy, default its net x (1 - margin)) and simulated
