@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {IMorpho, IMorphoLiquidateCallback, IMorphoFlashLoanCallback, MarketParams} from "./interfaces/IMorpho.sol";
 import {IV3Pool, MIN_SQRT_PRICE_LIMIT, MAX_SQRT_PRICE_LIMIT} from "./interfaces/IV3Pool.sol";
+import {ProfitShares} from "./ProfitShares.sol";
 
 interface IERC20Min {
     function balanceOf(address) external view returns (uint256);
@@ -48,12 +49,14 @@ struct SwapStep {
 ///      callback only runs inside our own batch (transient `inBatch` flag + Morpho sender, once); a
 ///      funder that never calls back reverts (`NotFunded`). The received collateral must match the
 ///      sum of what was seized, and the same minimum-profit, allowlist and no-funds-at-rest
-///      guarantees apply.
-contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback {
+///      guarantees apply. A batch can also exit in a hybrid: a direct route for part of the
+///      collateral, then allowlisted aggregator steps for the rest (`MODE_HYBRID`).
+///
+///      Payouts (profit, unsold collateral, connector remainder) are split on the spot between the
+///      owner-set extra recipients and PROFIT_RECEIVER (`ProfitShares`); `minProfit` is checked on
+///      the whole profit before the split.
+contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback, ProfitShares {
     IMorpho public immutable MORPHO;
-    /// @notice Where every profit goes (cold wallet). Immutable to keep a cold SLOAD off the hot
-    ///         path; changing it means deploying a new liquidator (cheap on Base).
-    address public immutable PROFIT_RECEIVER;
 
     address public owner;
     /// @dev executor and paused share one storage slot: the hot path reads both with one SLOAD.
@@ -79,6 +82,9 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
     /// @dev Set only while our own liquidateBatch() flash loan is in flight, so onMorphoFlashLoan
     ///      cannot be triggered by anyone else and runs once (cleared on entry).
     bool private transient inBatch;
+    /// @dev Set for the whole of a liquidation or batch (payout included): `distribute` is refused
+    ///      while it runs.
+    bool private transient operating;
 
     /// @dev Packed production entry (see fallback): tag(1) loan(20) collateral(20) oracle(20) irm(20)
     ///      lltv(8) borrower(20) seized(16) minProfit(16) deadlineBlock(4) | route...
@@ -94,6 +100,9 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
     bytes1 private constant MODE_ROUTE = 0x01;
     /// @dev Batch exit encoded as abi.encode(SwapStep[]) after this mode byte (see `exit` below).
     bytes1 private constant MODE_STEPS = 0x02;
+    /// @dev Batch exit in two parts: nHops(2) | hops (a direct route selling part of the collateral)
+    ///      | abi.encode(SwapStep[]) (allowlisted aggregator steps selling the rest).
+    bytes1 private constant MODE_HYBRID = 0x03;
 
     /// @dev One batch item: borrower(20) | seizedAssets(16).
     uint256 private constant ITEM_LEN = 36;
@@ -118,6 +127,7 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
     error RouteSpendMismatch(uint256 spent, uint256 seized);
     error BadBatch();
     error NotFunded();
+    error HybridSplit(uint256 spent, uint256 seized);
 
     event ExecutorSet(address executor);
     event OwnershipTransferStarted(address indexed pendingOwner);
@@ -130,9 +140,8 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
         _;
     }
 
-    constructor(IMorpho morpho, address owner_, address executor_, address profitReceiver_) {
+    constructor(IMorpho morpho, address owner_, address executor_, address profitReceiver_) ProfitShares(profitReceiver_) {
         MORPHO = morpho;
-        PROFIT_RECEIVER = profitReceiver_;
         owner = owner_;
         executor = executor_;
         emit OwnerSet(owner_);
@@ -179,8 +188,9 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
     /// @param flashAssets Loan-token amount to flash-borrow: the sum of the repayments (rounded up by
     ///        the caller) plus headroom; unspent headroom ends up in the profit.
     /// @param exit The single exit over all the collateral: MODE_ROUTE ‖ packed hops (direct V3
-    ///        route, must spend exactly the sum seized), or MODE_STEPS ‖ abi.encode(SwapStep[])
-    ///        (allowlisted aggregator targets).
+    ///        route, must spend exactly the sum seized), MODE_STEPS ‖ abi.encode(SwapStep[])
+    ///        (allowlisted aggregator targets), or MODE_HYBRID ‖ nHops(2) ‖ hops ‖
+    ///        abi.encode(SwapStep[]) (a route for part of the collateral, then steps for the rest).
     /// @param minProfit Minimum loan-token gain after the flash loan is repaid; reverts below it.
     /// @param deadlineBlock Reverts if included after this block (stale opportunity).
     function liquidateBatch(
@@ -246,6 +256,7 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
         if (paused) revert IsPaused();
         if (seizedAssets == 0) revert UnsupportedMode();
 
+        operating = true;
         inFlight = true;
         collateralInFlight = marketParams.collateralToken;
         expectedCollateral = seizedAssets;
@@ -261,11 +272,8 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
         profit = _settle(marketParams.loanToken, marketParams.collateralToken, minProfit);
         // A pooled connector (e.g. WETH between collateral and loan pools) can keep a rounding
         // remainder after the share-split sink hops: swept too, so nothing stays at rest.
-        address connector = connectorInFlight;
-        if (connector != address(0) && connector != marketParams.loanToken) {
-            uint256 rest = IERC20Min(connector).balanceOf(address(this));
-            if (rest > 0) _safeTransfer(connector, PROFIT_RECEIVER, rest);
-        }
+        _sweepConnector(marketParams.loanToken);
+        operating = false;
     }
 
     /// @dev Called by Morpho after the collateral has been sent to this contract.
@@ -313,6 +321,7 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
             totalSeized += uint128(bytes16(items[i * ITEM_LEN + 20:i * ITEM_LEN + ITEM_LEN]));
         }
 
+        operating = true;
         inBatch = true;
         collateralInFlight = marketParams.collateralToken;
         expectedCollateral = totalSeized;
@@ -336,10 +345,17 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
         if (inBatch) revert NotFunded();
 
         profit = _settle(marketParams.loanToken, marketParams.collateralToken, minProfit);
+        _sweepConnector(marketParams.loanToken);
+        operating = false;
+    }
+
+    /// @dev A pooled connector (e.g. WETH between collateral and loan pools) can keep a rounding
+    ///      remainder after the share-split sink hops: paid out too, so nothing stays at rest.
+    function _sweepConnector(address loanToken) private {
         address connector = connectorInFlight;
-        if (connector != address(0) && connector != marketParams.loanToken) {
+        if (connector != address(0) && connector != loanToken) {
             uint256 rest = IERC20Min(connector).balanceOf(address(this));
-            if (rest > 0) _safeTransfer(connector, PROFIT_RECEIVER, rest);
+            if (rest > 0) _payout(connector, rest);
         }
     }
 
@@ -390,6 +406,15 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
             if (spent != expectedCollateral) revert RouteSpendMismatch(spent, expectedCollateral);
         } else if (exit[0] == MODE_STEPS) {
             SwapStep[] memory swaps = abi.decode(exit[1:], (SwapStep[]));
+            _runSteps(swaps);
+        } else if (exit[0] == MODE_HYBRID) {
+            // The route sells part of the collateral (some, not all: all is MODE_ROUTE), the
+            // allowlisted steps the rest; whatever is left unsold is swept by _settle.
+            uint256 routeEnd = 3 + uint256(uint16(bytes2(exit[1:3]))) * HOP_LEN;
+            if (routeEnd == 3 || routeEnd >= exit.length) revert BadRoute();
+            uint256 spent = _runRoute(exit[3:routeEnd]);
+            if (spent == 0 || spent >= expectedCollateral) revert HybridSplit(spent, expectedCollateral);
+            SwapStep[] memory swaps = abi.decode(exit[routeEnd:], (SwapStep[]));
             _runSteps(swaps);
         } else {
             revert UnsupportedMode();
@@ -484,6 +509,12 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
         emit TargetAllowed(target, allowed);
     }
 
+    /// @notice The extra profit recipients and their shares in bps (PROFIT_RECEIVER gets the rest);
+    ///         empty arrays = everything to PROFIT_RECEIVER. See ProfitShares.
+    function setShares(address[] calldata to, uint16[] calldata bps) external onlyOwner {
+        _setShares(to, bps);
+    }
+
     /// @notice The executor (hot wallet) or the owner may pause, e.g. an operator stop with the hot
     ///         key at hand (the bot itself never calls it; its kill switch is a file); only owner may
     ///         resume.
@@ -519,16 +550,20 @@ contract MorphoLiquidator is IMorphoLiquidateCallback, IMorphoFlashLoanCallback 
     // ---------------------------------------------------------------- internal
 
     /// @dev The loan-token balance left after Morpho pulled its repayment is the profit (the
-    ///      contract starts every tx empty). Checks it against minProfit, then sends profit and any
-    ///      leftover collateral to profitReceiver.
+    ///      contract starts every tx empty). Checks it against minProfit, then pays out the profit
+    ///      and any leftover collateral by the shares.
     function _settle(address loanToken, address collateralToken, uint256 minProfit) private returns (uint256 profit) {
         profit = IERC20Min(loanToken).balanceOf(address(this));
         if (profit < minProfit) revert InsufficientProfit(profit, minProfit);
 
-        if (profit > 0) _safeTransfer(loanToken, PROFIT_RECEIVER, profit);
+        if (profit > 0) _payout(loanToken, profit);
         // Sweep any collateral the exit did not sell (rounding dust, partial exit or fill).
         uint256 leftover = IERC20Min(collateralToken).balanceOf(address(this));
-        if (leftover > 0) _safeTransfer(collateralToken, PROFIT_RECEIVER, leftover);
+        if (leftover > 0) _payout(collateralToken, leftover);
+    }
+
+    function _operating() internal view override returns (bool) {
+        return operating;
     }
 
     /// @dev Handles tokens that return no bool (USDT-style) and tokens that require a zero allowance first.

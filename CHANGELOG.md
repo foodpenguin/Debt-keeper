@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.6.0 (unreleased)
+
+**Contract change: needs new deployments** (the block-path MorphoLiquidator, the Atlas
+MorphoLiquidator and the AtlasLiquidationSolver; see the operator's deploy notes). Older contracts
+cannot decode the new solverOpData or the hybrid exit: with `[atlas.solver] simulate`, a configured
+`address` or `liquidator` from before v0.6.0 (no `MAX_SHARES()`) stops the start with that message.
+
+- **Profit shares** (`contracts/src/ProfitShares.sol`, inherited by MorphoLiquidator and
+  AtlasLiquidationSolver). Every payout is split on the spot between up to 4 extra recipients at
+  owner-set shares (`setShares(address[], uint16[])`, bps, owner only, validated) and
+  PROFIT_RECEIVER (the rest, rounding included). `ProfitPaid(token, amount)` carries each payout's
+  total; `minProfit` is checked before the split. `distribute(token)` / `distributeEth()` pay a
+  stray balance out by the shares (anyone; refused while an operation runs). A share that cannot be
+  paid (a recipient the token blocks, one that rejects ETH or burns more than `SHARE_ETH_GAS` =
+  50k) goes to PROFIT_RECEIVER instead (`ShareSkipped`), so one bad recipient cannot make every
+  liquidation revert. Each extra recipient costs ~10-30k gas per payout.
+- **Hybrid batch exit** (`MODE_HYBRID` = 0x03: `nHops(2) | hops | abi.encode(SwapStep[])`): a
+  direct route for part of the bundle's collateral, allowlisted aggregator steps for the rest; the
+  route must sell some but not all (`HybridSplit`). The planner prices hybrids on the auction path
+  (`HYBRID_DIRECT_SHARES_BPS` 25/50/75 %: the direct part via `v3router::allocate_units`, the
+  aggregator quoted for the rest) beside the full direct route and the aggregator rungs; the best net
+  wins. Hybrids are only priced for a market whose bonus reaches `[atlas] min_bonus_usd` (three more
+  aggregator quotes each, spent only where an op would be bid on). The two
+  parts are priced on the same state while the direct part trades first, so an aggregator route
+  through the same pools gets less than quoted and may revert at its slippage bound: a winning
+  hybrid also builds the best single exit (`BundleQuote::alt_plan`), and the batch op falls back to
+  it when the hybrid's op does not run (journal: `hybrid_alt`). Journal: `hybrid_net_usd`; a winner's `router` is `hybrid`, `fraction_bps` its direct share.
+- **Solver bid swap straight on the pool**: `solverOpData` is now `(calls, address bidPool,
+  profitToken, minProfit, gasPayWei)`; the solver buys exactly bid + gas pay of WETH on the
+  allowlisted pool (exact output, paid in its swap callback, at most the profit token held; no
+  router, no approvals). Fork measurement: -39.8k gas per op (1 position: 775,191 -> 735,402) and
+  ~3k less calldata gas. Bot: `probe_bid_pools` + `choose_bid_pools` (the deepest pool a deployed
+  solver allowlists); `[atlas.solver] bid_router` / `bid_fee` are no longer used.
+- **PnL**: the ledger reads the liquidator's `ProfitPaid` (the whole payout however it was split),
+  falling back to transfers to PROFIT_RECEIVER for older contracts. Live pre-flight and the solver
+  check refuse a profit share paid to the hot wallet, and log the shares (an older contract's
+  `shares()` reverts: none; an RPC failure stops the start instead of skipping the check).
+
 ## v0.5.0 (2026-11-20)
 
 Atlas valuation: a higher and more accurate value (V) for batch solver ops, and execution labels to

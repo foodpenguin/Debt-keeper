@@ -313,7 +313,6 @@ async fn e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation() {
     };
     const ATLAS: Address = address!("583dcFef0D240DC80753F0F0B26513feE27D9B77"); // Atlas on Base (the stub is injected here)
     const WETH: Address = address!("4200000000000000000000000000000000000006");
-    const UNI_ROUTER: Address = address!("2626664c2603336E57B271c5C0b26F421741e481");
 
     let fork = std::env::var("BASE_FORK_URL").unwrap_or_else(|_| "https://base.gateway.tenderly.co".into());
     let anvil = Anvil::new().fork(fork).chain_id(8453).spawn();
@@ -330,7 +329,7 @@ async fn e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation() {
     liq.add_approval(USDC, sim::discover_allowance_key(&p, USDC, liq.liquidator, MORPHO).await.unwrap());
     let art: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("../contracts/out/AtlasStub.sol/AtlasStub.json").unwrap()).unwrap();
     let stub: Bytes = art["deployedBytecode"]["object"].as_str().unwrap().parse().unwrap();
-    let solver = AtlasSolver::new(ATLAS, None, signer, WETH, UNI_ROUTER, 500, liq, Some(solver_code), stub);
+    let solver = AtlasSolver::new(ATLAS, None, signer, WETH, liq, Some(solver_code), stub).with_bid_pools(std::collections::HashMap::from([(USDC, crate::atlas_venue::BidPool { pool: UNI_WETH_USDC_500, fee: 500 })]));
 
     let seize = U256::from(10u64).pow(U256::from(17)); // 0.1 WETH
     let route = ExitRoute::Packed(hop(UNI_WETH_USDC_500, 1, 10u128.pow(17)).into());
@@ -365,7 +364,6 @@ async fn e2e_atlas_batch_solver_op() {
     };
     const ATLAS: Address = address!("583dcFef0D240DC80753F0F0B26513feE27D9B77");
     const WETH: Address = address!("4200000000000000000000000000000000000006");
-    const UNI_ROUTER: Address = address!("2626664c2603336E57B271c5C0b26F421741e481");
     const XRP_MARKET: B256 = b256!("d4a903dc6d949519060c7707f9604fdc9772c046e05c2e3a8fce0bd7196e4109");
     const PANCAKE_XRP_WETH_500: Address = address!("170b6bFc071426aaB7C81AE12383219facBb6B6A");
     const FORK_BLOCK: u64 = 54148058;
@@ -385,7 +383,7 @@ async fn e2e_atlas_batch_solver_op() {
     liq.add_approval(USDC, sim::discover_allowance_key(&p, USDC, liq.liquidator, MORPHO).await.unwrap());
     let art: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("../contracts/out/AtlasStub.sol/AtlasStub.json").unwrap()).unwrap();
     let stub: Bytes = art["deployedBytecode"]["object"].as_str().unwrap().parse().unwrap();
-    let solver = AtlasSolver::new(ATLAS, None, signer, WETH, UNI_ROUTER, 500, liq, Some(solver_code), stub);
+    let solver = AtlasSolver::new(ATLAS, None, signer, WETH, liq, Some(solver_code), stub).with_bid_pools(std::collections::HashMap::from([(USDC, crate::atlas_venue::BidPool { pool: UNI_WETH_USDC_500, fee: 500 })]));
 
     // Three of the auction's borrowers, each seized at 1/1000 so the direct exit stays executable.
     let items: Vec<(Address, U256)> = [
@@ -400,7 +398,7 @@ async fn e2e_atlas_batch_solver_op() {
     // One 2-hop route (cbXRP -> WETH -> USDC) selling the whole seized amount.
     let route: Vec<u8> = [hop(PANCAKE_XRP_WETH_500, 0, total_seize.to::<u128>()), hop(UNI_WETH_USDC_500, 3, 0)].concat();
     let flash_assets = total_seize * price_after / U256::from(10u64).pow(U256::from(36u64)) + U256::from(1_000_000u64);
-    let plan = BundlePlan { items: items.clone(), total_seize, flash_assets, exit: ExitRoute::Packed(route.into()), router: "direct", gas_est: 1_500_000 };
+    let plan = BundlePlan { items: items.clone(), total_seize, flash_assets, exit: ExitRoute::Packed(route.into()), router: "direct", gas_est: 1_500_000, hybrid: None };
 
     let mut nets = vec![];
     let mut gas0 = 0u64;
@@ -448,7 +446,6 @@ async fn e2e_atlas_op_pays_its_own_gas() {
     alloy::sol! { interface IShortfall { function shortfall() external view returns (uint256 gasLiability, uint256 borrowLiability); } }
     const ATLAS: Address = address!("583dcFef0D240DC80753F0F0B26513feE27D9B77");
     const WETH: Address = address!("4200000000000000000000000000000000000006");
-    const UNI_ROUTER: Address = address!("2626664c2603336E57B271c5C0b26F421741e481");
 
     let fork = std::env::var("BASE_FORK_URL").unwrap_or_else(|_| "https://base.gateway.tenderly.co".into());
     let anvil = Anvil::new().fork(fork).chain_id(8453).spawn();
@@ -465,7 +462,7 @@ async fn e2e_atlas_op_pays_its_own_gas() {
     liq.add_approval(USDC, sim::discover_allowance_key(&p, USDC, liq.liquidator, MORPHO).await.unwrap());
     let art: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("../contracts/out/AtlasStub.sol/AtlasStub.json").unwrap()).unwrap();
     let stub: Bytes = art["deployedBytecode"]["object"].as_str().unwrap().parse().unwrap();
-    let solver = AtlasSolver::new(ATLAS, None, signer, WETH, UNI_ROUTER, 500, liq, Some(solver_code), stub);
+    let solver = AtlasSolver::new(ATLAS, None, signer, WETH, liq, Some(solver_code), stub).with_bid_pools(std::collections::HashMap::from([(USDC, crate::atlas_venue::BidPool { pool: UNI_WETH_USDC_500, fee: 500 })]));
 
     let seize = U256::from(10u64).pow(U256::from(17)); // 0.1 WETH
     let route = ExitRoute::Packed(hop(UNI_WETH_USDC_500, 1, 10u128.pow(17)).into());
@@ -548,22 +545,27 @@ async fn e2e_stuck_tx_is_replaced_by_a_cancel() {
     println!("e2e stuck tx: {} replaced at nonce {n0}", inf.hash);
 }
 
-/// The bid-swap fee-tier probe on a Base fork: USDC's deepest WETH pool is the 500 (0.05%) tier, and
-/// a token with no pool at any tier is absent (the bid swap falls back to the configured bid_fee).
-/// Validates the 2026-11-13 BidSwapFailed fix. Read-only, so it connects to the fork directly.
+/// The bid-pool probe on a Base fork: USDC's WETH pools come deepest first, each a real tier, and a
+/// token with no pool at any tier is absent (its ops get no bid pool). Validates the 2026-11-13
+/// BidSwapFailed fix. Read-only, so it connects to the fork directly.
 #[tokio::test]
 #[ignore = "needs an archive fork; run with --ignored (BASE_FORK_URL)"]
-async fn e2e_bid_fee_probe_picks_the_deepest_pool() {
+async fn e2e_bid_pool_probe_picks_the_deepest_pool() {
     const WETH: Address = address!("4200000000000000000000000000000000000006");
     const UNI_V3_FACTORY: Address = address!("33128a8fC17869897dcE68Ed026d694621f6FDfD");
     let url = std::env::var("BASE_FORK_URL").unwrap_or_else(|_| "https://base.gateway.tenderly.co".into());
     let p = ProviderBuilder::new().connect_http(url.parse().unwrap());
     let nonexistent = Address::repeat_byte(0x7f);
     let tiers = [500u32, 3000, 100, 10000];
-    let fees = crate::atlas_venue::probe_bid_fees(&p, UNI_V3_FACTORY, WETH, &[USDC, WETH, nonexistent], &tiers).await;
-    // USDC maps to the deepest existing WETH-pool tier (which tier is deepest can shift block to
-    // block; the point is it is a real candidate, not the hardcoded default fee).
-    assert!(fees.get(&USDC).is_some_and(|f| tiers.contains(f)), "USDC maps to a real tier, got {:?}", fees.get(&USDC));
-    assert!(!fees.contains_key(&WETH), "a WETH loan needs no bid swap");
-    assert!(!fees.contains_key(&nonexistent), "no pool -> falls back to bid_fee");
+    let pools = crate::atlas_venue::probe_bid_pools(&p, UNI_V3_FACTORY, WETH, &[USDC, WETH, nonexistent], &tiers).await;
+    // USDC's pools, deepest first (which tier is deepest can shift block to block; the point is they
+    // are real pools at real tiers).
+    let usdc = pools.get(&USDC).expect("USDC has WETH pools");
+    assert!(usdc.iter().all(|b| tiers.contains(&b.fee) && !b.pool.is_zero()), "{usdc:?}");
+    assert!(usdc.iter().any(|b| b.pool == UNI_WETH_USDC_500), "the 0.05% pool is among them");
+    assert!(!pools.contains_key(&WETH), "a WETH loan needs no bid swap");
+    assert!(!pools.contains_key(&nonexistent), "no pool at any tier");
+    // An injected solver takes each token's deepest; a deployed one only what it allowlists.
+    let chosen = crate::atlas_venue::choose_bid_pools(&p, None, pools.clone()).await;
+    assert_eq!(chosen.get(&USDC), usdc.first());
 }

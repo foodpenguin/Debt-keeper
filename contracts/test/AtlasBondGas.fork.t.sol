@@ -157,7 +157,7 @@ contract AtlasBondGasForkTest is Test {
         deal(USDC, address(source), 1_000_000e6);
         vm.startPrank(owner);
         solver.setAllowedTarget(address(source), true);
-        solver.setAllowedTarget(UNI_V3_ROUTER, true);
+        solver.setAllowedTarget(0xd0b53D9277642d899DF5C87A3966A349A798F224, true); // Uniswap V3 WETH/USDC 0.05% (bid pool)
         vm.stopPrank();
     }
 
@@ -174,11 +174,8 @@ contract AtlasBondGasForkTest is Test {
     function _opData(uint256 gasPay) internal view returns (bytes memory) {
         SolverCall[] memory calls = new SolverCall[](1);
         calls[0] = SolverCall({target: address(source), data: abi.encodeCall(ProfitSource.pay, (USDC, address(solver), 2_000e6))});
-        ISwapRouter02G.ExactOutputSingleParams memory p = ISwapRouter02G.ExactOutputSingleParams({
-            tokenIn: USDC, tokenOut: WETH, fee: 500, recipient: address(solver), amountOut: BID + gasPay, amountInMaximum: type(uint128).max, sqrtPriceLimitX96: 0
-        });
-        SwapStep memory bidSwap = SwapStep({target: UNI_V3_ROUTER, tokenIn: USDC, amountIn: type(uint256).max, data: abi.encodeCall(ISwapRouter02G.exactOutputSingle, (p))});
-        return abi.encode(calls, bidSwap, USDC, uint256(0), gasPay);
+        // The solver buys exactly BID + gasPay of WETH on the bid pool.
+        return abi.encode(calls, address(0xd0b53D9277642d899DF5C87A3966A349A798F224), USDC, uint256(0), gasPay);
     }
 
     function _ourOp(AUserOp memory u, ADAppOp memory d, uint256 gasPay) internal view returns (ASolverOp memory op) {

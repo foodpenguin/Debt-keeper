@@ -30,17 +30,13 @@ use crate::{
 const SEIZE_FRACTIONS_BPS: [u64; 3] = [10_000, 5_000, 2_500];
 /// Gas a second, third... direct path adds beyond its own swap (pool call + callback + transfer).
 const GAS_PER_EXTRA_PATH: u64 = 60_000;
+/// Hybrid bundle exits (a direct route for part of the collateral, the aggregator for the rest):
+/// the direct route's shares tried, in bps of the bundle (rounded to the direct grid).
+pub const HYBRID_DIRECT_SHARES_BPS: [u64; 3] = [2_500, 5_000, 7_500];
+/// What a hybrid exit adds over its two parts' own swap gas: the aggregator step's exact approval
+/// and its reset, and decoding the steps after the route.
+const HYBRID_EXTRA_GAS: u64 = 40_000;
 
-/// How a direct-router exit is allocated (`Planner::direct_exit`).
-#[derive(Debug, Clone, Copy)]
-enum DirectSale {
-    /// Any amount up to the maximum (a single position may be liquidated in part), route gas at the
-    /// planner's own price.
-    Prefix,
-    /// Exactly the maximum (a bundle's route must spend all it seized), route gas at this price
-    /// (wei; None = the planner's own).
-    Full { gas_price_wei: Option<u128> },
-}
 /// Gas of a bundle valuation (`Planner::quote_bundle`): per liquidated position and for the rest
 /// of the operation besides the swap. The venue that runs bundles knows these (see
 /// `atlas_venue::ATLAS_BUNDLE_GAS`).
@@ -93,6 +89,9 @@ pub struct BundleQuote {
     pub swap_gas: u64,
     pub direct_net_usd: Option<f64>,
     pub kyber_net_usd: Option<f64>,
+    /// The best hybrid exit's net (direct route for part, the aggregator for the rest), if any priced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid_net_usd: Option<f64>,
     /// Each aggregator rung priced for this bundle (empty off the auction path, where gas is not
     /// priced and only the best-output rung is quoted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -107,12 +106,22 @@ pub struct BundleQuote {
     /// built when a 100 %-size exit is available. Not journaled.
     #[serde(skip)]
     pub plan: Option<BundlePlan>,
+    /// When a hybrid won: the best single exit (direct or the aggregator), the fallback if the
+    /// hybrid's op does not run. Its two parts were priced on the same state, and the direct part
+    /// trades first: an aggregator route through the same pools gets less than quoted, past its
+    /// slippage bound it reverts. Not journaled.
+    #[serde(skip)]
+    pub alt_plan: Option<BundlePlan>,
+    /// `alt_plan`'s quoted gross (USD), as `gross_usd` for the plan.
+    #[serde(skip)]
+    pub alt_gross_usd: f64,
 }
 
 /// The executable form of a `BundleQuote`: the positions an Atlas solver op liquidates together in
 /// one flash loan, and the single exit over all their collateral. v1 liquidates each in full and
-/// sells 100 % of the seized amount, so the exit is a full direct route or a Kyber swap over the
-/// total. `quote_bundle` attaches it to the quote (`BundleQuote::plan`).
+/// sells 100 % of the seized amount, so the exit is a full direct route, a Kyber swap over the total,
+/// or a hybrid: a direct route for part (`hybrid`) and Kyber for the rest (`exit`).
+/// `quote_bundle` attaches it to the quote (`BundleQuote::plan`).
 #[derive(Debug, Clone)]
 pub struct BundlePlan {
     /// (borrower, seize) per position, each at its full max_seize.
@@ -120,8 +129,11 @@ pub struct BundlePlan {
     pub total_seize: U256,
     /// Σ repay(max_seize) plus headroom: what the batch flash-borrows.
     pub flash_assets: U256,
-    /// The one exit selling all `total_seize`.
+    /// The one exit selling all `total_seize` — or, with `hybrid`, the aggregator part selling what the
+    /// route does not (`total_seize - route_seize`).
     pub exit: ExitRoute,
+    /// A hybrid exit's direct part: (packed route, route_seize). None = `exit` sells everything.
+    pub hybrid: Option<(Bytes, U256)>,
     /// "direct" or the aggregator's name.
     pub router: &'static str,
     /// Estimated solver-op gas (overhead + per-position + swap), for the bid basis.
@@ -130,6 +142,8 @@ pub struct BundlePlan {
 
 /// One candidate exit for a bundle: (router, fraction_bps, gross, swap gas).
 type BundleExit = (&'static str, u64, f64, u64);
+/// A bundle's built exit: (exit, router, hybrid route part) — see `BundlePlan`.
+type BuiltExit = (ExitRoute, &'static str, Option<(Bytes, U256)>);
 
 /// Total collateral a bundle seizes and the debt it repays (each position at its max seize).
 fn bundle_totals<L: LendingProtocol>(protocol: &L, market: &L::Market, snap: &L::Snapshot, views: &[PositionView<L>]) -> (U256, U256) {
@@ -366,11 +380,38 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         (base_fee_wei + self.cfg.priority_fee_wei.max(self.cfg.planning_priority_fee_wei)) as f64
     }
 
+    /// The direct router's grid quote for selling up to `max_seize` of `pair.collateral` at `block`,
+    /// with what prices its output: (grid, number of direct legs, loan-token USD, loan decimals).
+    #[allow(clippy::too_many_arguments)]
+    async fn direct_grid<P: Provider>(
+        &self,
+        p: &P,
+        meta: &L::Market,
+        pair: Pair,
+        snap: &L::Snapshot,
+        max_seize: U256,
+        eth_usd: f64,
+        base_fee_wei: u128,
+        block: BlockId,
+        overrides: &StateOverride,
+    ) -> Result<(v3router::Grid, usize, f64, u8), String> {
+        let v3 = self.v3.expect("checked by caller");
+        let loan_dec = self.protocol.token_decimals(meta, pair.debt);
+        // Connector grid range: what all seizable collateral is worth in the connector (WETH, 18
+        // decimals) at the oracle price, with 25% headroom for price differences.
+        let loan_usd = self.loan_usd(meta, snap, pair.debt, eth_usd)?;
+        let seize_value_usd = num::units(self.protocol.collateral_value(meta, snap, pair, max_seize), loan_dec) * loan_usd;
+        let max_conn = U256::from((seize_value_usd / eth_usd.max(1.0) * 1.25 * 1e18) as u128);
+        // Quotes priced like the send: pools that read tx.gasprice answer what the tx would get.
+        let fee = SimFee { max_fee_per_gas: base_fee_wei * 2 + self.cfg.priority_fee_wei, max_priority_fee_per_gas: self.cfg.priority_fee_wei };
+        let grid = v3.grid(p, pair, max_seize, max_conn, block, overrides, Some(fee)).await.map_err(|e| format!("grid quote failed: {e}"))?;
+        Ok((grid, v3.routes[&pair].direct.len(), loan_usd, loan_dec))
+    }
+
     /// Best direct-router exit for selling up to `max_seize` of `pair.collateral` at `block`:
-    /// one grid quote, then the allocation that maximises out - repay(seize) - route gas.
-    /// `sale` picks the allocation: a prefix (any size up to `max_seize`, the block path's partial
-    /// liquidation) priced at the planner's own gas price, or a full sale of exactly `max_seize`
-    /// (a bundle) with its route gas at the given price (an Atlas auction's).
+    /// one grid quote, then the allocation (any size up to `max_seize`: a single position may be
+    /// liquidated in part) that maximises out - repay(seize) - route gas at the planner's own price.
+    /// (A bundle sells exactly its total instead: `quote_bundle`.)
     /// Err = the quote failed (or nothing fits the budget), Ok(None) = no profitable allocation.
     #[allow(clippy::too_many_arguments)]
     async fn direct_exit<P: Provider>(
@@ -386,31 +427,11 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         overrides: &StateOverride,
         repay: impl Fn(U256) -> U256,
         gas_budget: Option<u64>,
-        sale: DirectSale,
     ) -> Result<Option<(v3router::Grid, v3router::Allocation)>, String> {
-        let v3 = self.v3.expect("checked by caller");
-        let loan_dec = self.protocol.token_decimals(meta, pair.debt);
-        // Connector grid range: what all seizable collateral is worth in the connector (WETH, 18
-        // decimals) at the oracle price, with 25% headroom for price differences.
-        let loan_usd = self.loan_usd(meta, snap, pair.debt, eth_usd)?;
-        let seize_value_usd = num::units(self.protocol.collateral_value(meta, snap, pair, max_seize), loan_dec) * loan_usd;
-        let max_conn = U256::from((seize_value_usd / eth_usd.max(1.0) * 1.25 * 1e18) as u128);
-        // Quotes priced like the send: pools that read tx.gasprice answer what the tx would get.
-        let fee = SimFee { max_fee_per_gas: base_fee_wei * 2 + self.cfg.priority_fee_wei, max_priority_fee_per_gas: self.cfg.priority_fee_wei };
-        let grid = v3.grid(p, pair, max_seize, max_conn, block, overrides, Some(fee)).await.map_err(|e| format!("grid quote failed: {e}"))?;
-        let n_direct = v3.routes[&pair].direct.len();
-        let to_units = |x| num::units(x, loan_dec);
+        let (grid, n_direct, loan_usd, loan_dec) = self.direct_grid(p, meta, pair, snap, max_seize, eth_usd, base_fee_wei, block, overrides).await?;
         // Route gas is weighed against output in loan-token units.
-        let r = match sale {
-            DirectSale::Prefix => {
-                let gas_price = self.route_gas_price(base_fee_wei);
-                v3router::allocate_within(&grid, n_direct, repay, GAS_PER_EXTRA_PATH, gas_price / 1e18 * eth_usd / loan_usd, to_units, gas_budget)
-            }
-            DirectSale::Full { gas_price_wei } => {
-                let per_gas = gas_price_wei.map_or_else(|| self.route_gas_price(base_fee_wei), |w| w as f64) / 1e18 * eth_usd / loan_usd;
-                v3router::allocate_full(&grid, n_direct, max_seize, repay, GAS_PER_EXTRA_PATH, |gas| gas as f64 * per_gas, to_units, gas_budget)
-            }
-        };
+        let gas_price = self.route_gas_price(base_fee_wei);
+        let r = v3router::allocate_within(&grid, n_direct, repay, GAS_PER_EXTRA_PATH, gas_price / 1e18 * eth_usd / loan_usd, |x| num::units(x, loan_dec), gas_budget);
         match r {
             Ok(a) => Ok(a.map(|a| (grid, a))),
             Err(g) => Err(format!("direct route {g} gas > budget {}", gas_budget.unwrap_or(0))),
@@ -441,6 +462,9 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         swap_gas_budget: u64,
         bundle_gas: BundleGas,
         use_kyber: bool,
+        // Also price hybrid exits (three more aggregator quotes): only for a bundle that would be
+        // bid on, to keep the aggregator's rate limit for the quotes that matter.
+        hybrid: bool,
         flash_headroom_bps: u64,
         // Gas price (wei) to weigh the exits at: the Atlas auction's (max_fee x (1 + surcharge)),
         // where gas dominates; None falls back to the planner's own route gas price.
@@ -476,18 +500,38 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let gross = |out: U256, s: U256| (num::units(out, loan_dec) - num::units(repay(s), loan_dec)) * loan_usd;
         // One exit sells the whole bundle: the direct route is a full-sale allocation of exactly
         // `total_seize` (route mode requires spending exactly the seized amount), its legs weighed
-        // at the auction's gas price; Kyber is quoted at the full size. Each candidate carries what
-        // builds its exit.
+        // at the auction's gas price; Kyber is quoted at the full size. On the auction path a hybrid
+        // is also priced: the direct route for HYBRID_DIRECT_SHARES_BPS of the bundle (exactly that
+        // many grid units, the best split of them net of gas) and Kyber for the rest, quoted at the
+        // rest's size. Each candidate carries what builds its exit.
+        let has_direct = self.v3.is_some_and(|v| v.routes.get(&pair).is_some_and(|r| !r.is_empty()));
+        let route_gas_price = gas_price_wei.map_or_else(|| self.route_gas_price(base_fee_wei), |w| w as f64);
+        let k_grid = self.v3.map_or(0, |v| v.grid_points.max(1));
+        let hybrid_units: Vec<u64> = if hybrid && has_direct && use_kyber && gas_price_wei.is_some() {
+            HYBRID_DIRECT_SHARES_BPS.iter().map(|bps| k_grid * bps / 10_000).filter(|m| *m > 0 && *m < k_grid).collect()
+        } else {
+            vec![]
+        };
         let direct = async {
-            if !self.v3.is_some_and(|v| v.routes.get(&pair).is_some_and(|r| !r.is_empty())) {
+            if !has_direct {
                 return Err("no direct pools for this pair".to_string());
             }
-            let sale = DirectSale::Full { gas_price_wei };
-            match self.direct_exit(p, meta, pair, snap, total_seize, eth_usd, base_fee_wei, BlockId::number(block), overrides, repay, Some(swap_gas_budget), sale).await? {
-                None => Err("no profitable direct allocation".into()),
-                Some((grid, a)) if a.seize == total_seize => Ok((("direct", 10_000u64, gross(a.expected_out, a.seize), a.est_swap_gas), grid, a)),
-                Some(_) => Err("direct route would not sell the whole bundle (route mode needs the exact amount)".into()),
-            }
+            let (grid, n_direct, d_loan_usd, d_dec) = self.direct_grid(p, meta, pair, snap, total_seize, eth_usd, base_fee_wei, BlockId::number(block), overrides).await?;
+            let per_gas = route_gas_price / 1e18 * eth_usd / d_loan_usd;
+            let to_units = |x| num::units(x, d_dec);
+            let full = match v3router::allocate_full(&grid, n_direct, total_seize, repay, GAS_PER_EXTRA_PATH, |g| g as f64 * per_gas, to_units, Some(swap_gas_budget)) {
+                Ok(Some(a)) if a.seize == total_seize => Ok(a),
+                Ok(Some(_)) => Err("direct route would not sell the whole bundle (route mode needs the exact amount)".to_string()),
+                Ok(None) => Err("no profitable direct allocation".to_string()),
+                Err(g) => Err(format!("direct route {g} gas > budget {swap_gas_budget}")),
+            };
+            // A hybrid's direct part: the best `m` units by output net of their gas (the repayment is
+            // the whole bundle's, the same for every split).
+            let parts: Vec<(u64, v3router::Allocation)> = hybrid_units
+                .iter()
+                .filter_map(|m| v3router::allocate_units(&grid, n_direct, *m, |_| U256::ZERO, GAS_PER_EXTRA_PATH, |g| g as f64 * per_gas, to_units, Some(swap_gas_budget)).ok().flatten().map(|a| (*m, a)))
+                .collect();
+            Ok((grid, full, parts))
         };
         let agg_name = self.aggregator.name();
         let kyber = async {
@@ -504,16 +548,24 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             .map_err(|e| e.to_string())?;
             Ok((ks, kt.elapsed().as_millis() as u64))
         };
-        let (direct, kyber) = tokio::join!(direct, kyber);
+        // The aggregator's part of each hybrid: what is left after `m` direct grid units (the grid's
+        // unit is total / k, as `V3Router::grid` cuts it).
+        let unit = if k_grid == 0 { U256::ZERO } else { total_seize / U256::from(k_grid) };
+        let hybrid_kyber = futures::future::join_all(hybrid_units.iter().map(|m| {
+            let rest = total_seize - unit * U256::from(*m);
+            async move { (*m, self.aggregator.quote_within(collateral, loan, rest, swap_gas_budget).await.ok()) }
+        }));
+        let (direct, kyber, hybrid_kyber) = tokio::join!(direct, kyber, hybrid_kyber);
         q.quote_ms = t0.elapsed().as_millis() as u64;
         q.kyber_quote_ms = kyber.as_ref().ok().map(|x| x.1).unwrap_or(0);
         // Route selection weighs the exits at the auction's gas price when given (gas dominates at
         // 15 gwei: a lower-gas exit can beat a higher-output one), else the planner's own.
-        let gas_price = gas_price_wei.map(|w| w as f64).unwrap_or_else(|| self.route_gas_price(base_fee_wei));
+        let gas_price = route_gas_price;
         // The direct route's swap gas is an exact quote; an aggregator's is its own (looser)
         // estimate, so it carries extra safety — a conservative bid, and over-budget routes rejected.
+        // A hybrid's swap gas is priced with that safety already on its aggregator part.
         let gas_units = |e: &BundleExit| {
-            let swap = if e.0 == "direct" { e.3 } else { (e.3 as f64 * bundle_gas.agg_swap_safety) as u64 };
+            let swap = if e.0 == "direct" || e.0 == "hybrid" { e.3 } else { (e.3 as f64 * bundle_gas.agg_swap_safety) as u64 };
             swap + bundle_gas.per_position * views.len() as u64 + bundle_gas.overhead
         };
         let net = |e: &BundleExit| e.2 - gas_units(e) as f64 * gas_price / 1e18 * eth_usd;
@@ -524,18 +576,39 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
             let k = &kyber_quotes[i];
             (agg_name, 10_000u64, gross(self.aggregator.amount_out(k), total_seize), self.aggregator.swap_gas(k).unwrap_or(swap_gas_budget))
         };
-        let de = direct.as_ref().ok().map(|x| &x.0);
+        let de: Option<BundleExit> = direct.as_ref().ok().and_then(|(_, full, _)| full.as_ref().ok()).map(|a| ("direct", 10_000u64, gross(a.expected_out, a.seize), a.est_swap_gas));
         let best_kyber: Option<(usize, f64)> = (0..kyber_quotes.len()).map(|i| (i, net(&kyber_exit(i)))).max_by(|a, b| a.1.total_cmp(&b.1));
-        q.direct_net_usd = de.map(net);
+        // Hybrids: (index into the direct parts, the aggregator quote, the candidate exit).
+        let parts: &[(u64, v3router::Allocation)] = direct.as_ref().map(|(_, _, parts)| parts.as_slice()).unwrap_or(&[]);
+        let hybrids: Vec<(usize, &_, BundleExit)> = parts
+            .iter()
+            .enumerate()
+            .filter_map(|(pi, (m, a))| {
+                let kq = hybrid_kyber.iter().find(|(hm, _)| hm == m)?.1.as_ref()?;
+                let agg_gas = (self.aggregator.swap_gas(kq).unwrap_or(swap_gas_budget) as f64 * bundle_gas.agg_swap_safety) as u64;
+                let swap = a.est_swap_gas + agg_gas + HYBRID_EXTRA_GAS;
+                (swap <= swap_gas_budget).then(|| (pi, kq, ("hybrid", m * 10_000 / k_grid.max(1), gross(a.expected_out + self.aggregator.amount_out(kq), total_seize), swap)))
+            })
+            .collect();
+        let best_hybrid: Option<(usize, f64)> = (0..hybrids.len()).map(|i| (i, net(&hybrids[i].2))).max_by(|a, b| a.1.total_cmp(&b.1));
+        q.direct_net_usd = de.as_ref().map(net);
         q.kyber_net_usd = best_kyber.map(|(_, n)| n);
-        let direct_wins = match (de.map(net), best_kyber.map(|(_, n)| n)) {
-            (Some(d), Some(k)) => d >= k,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => {
-                q.error = Some(format!("direct: {}; {agg_name}: {}", direct.as_ref().err().cloned().unwrap_or_default(), kyber.as_ref().err().cloned().unwrap_or_default()));
-                return q;
-            }
+        q.hybrid_net_usd = best_hybrid.map(|(_, n)| n);
+        #[derive(Clone, Copy)]
+        enum Winner {
+            Direct,
+            Kyber(usize),
+            Hybrid(usize),
+        }
+        let candidates = [q.direct_net_usd.map(|n| (Winner::Direct, n)), best_kyber.map(|(i, n)| (Winner::Kyber(i), n)), best_hybrid.map(|(i, n)| (Winner::Hybrid(i), n))];
+        // Ties keep the earlier (simpler) exit: direct, then the aggregator, then a hybrid.
+        let Some((winner, _)) = candidates.into_iter().flatten().reduce(|best, c| if c.1 > best.1 { c } else { best }) else {
+            let direct_err = match &direct {
+                Ok((_, Err(e), _)) | Err(e) => e.clone(),
+                Ok(_) => String::new(),
+            };
+            q.error = Some(format!("direct: {direct_err}; {agg_name}: {}", kyber.as_ref().err().cloned().unwrap_or_default()));
+            return q;
         };
         // Journal every rung and which one won, so the forcing rung's wins can be measured later.
         q.agg_rungs = (0..kyber_quotes.len())
@@ -546,11 +619,15 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
                     gross_usd: e.2,
                     swap_gas: (e.3 as f64 * bundle_gas.agg_swap_safety) as u64,
                     net_usd: net(&e),
-                    selected: !direct_wins && best_kyber.is_some_and(|(wi, _)| wi == i),
+                    selected: matches!(winner, Winner::Kyber(wi) if wi == i),
                 }
             })
             .collect();
-        let winning_exit: BundleExit = if direct_wins { *de.expect("direct wins") } else { kyber_exit(best_kyber.expect("kyber wins").0) };
+        let winning_exit: BundleExit = match winner {
+            Winner::Direct => de.expect("direct wins"),
+            Winner::Kyber(i) => kyber_exit(i),
+            Winner::Hybrid(i) => hybrids[i].2,
+        };
         let e = &winning_exit;
         (q.router, q.fraction_bps, q.gross_usd, q.swap_gas, q.gas_units) = (e.0.to_string(), e.1, e.2, e.3, gas_units(e));
         q.net_usd = Some(net(e));
@@ -560,32 +637,71 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let headroom = (total_repaid * U256::from(flash_headroom_bps) / U256::from(10_000u64)).max(U256::from(views.len()));
         let flash_assets = total_repaid + headroom;
         let items: Vec<(Address, U256)> = views.iter().map(|v| (v.user, v.max_seize)).collect();
-        let exit = if direct_wins {
-            let (_, grid, a) = direct.as_ref().expect("direct won");
-            Some((ExitRoute::Packed(self.v3.expect("direct needs v3").encode(pair, grid, a)), "direct"))
-        } else {
-            let holder = exit_holder.unwrap_or_else(|| self.venue.swap_recipient());
+        let holder = exit_holder.unwrap_or_else(|| self.venue.swap_recipient());
+        // Builds an aggregator quote for the exit holder (the route the batch op's simulation prices).
+        let build = |kq| async move {
             let bt = Instant::now();
-            let built = self.aggregator.build(&kyber_quotes[best_kyber.expect("kyber won").0], holder, holder, self.cfg.slippage_bps).await;
-            q.kyber_build_ms = bt.elapsed().as_millis() as u64;
-            match built {
-                Ok(b) => {
-                    // A build fallback (e.g. a pool-only re-quote after an RFQ failure) is journaled
-                    // as on the single-position path; the route differs from the quote priced above,
-                    // so the batch op's simulation is what prices it.
-                    if let Some(note) = b.note {
-                        q.router = format!("{} ({note})", q.router);
-                    }
-                    Some((ExitRoute::Call { target: b.target, calldata: b.calldata }, agg_name))
+            let built = self.aggregator.build(kq, holder, holder, self.cfg.slippage_bps).await;
+            (built, bt.elapsed().as_millis() as u64)
+        };
+        // A winner's executable exit: (exit, router, hybrid route part), the aggregator's build note
+        // (e.g. a pool-only re-quote after an RFQ failure: the route differs from the quote priced
+        // above, so the batch op's simulation is what prices it), and the build time.
+        let (direct_ref, hybrids_ref) = (&direct, &hybrids);
+        let make = |w: Winner| async move {
+            let (direct, hybrids) = (direct_ref, hybrids_ref);
+            let call = |b: crate::dex::SwapCall| (ExitRoute::Call { target: b.target, calldata: b.calldata }, b.note);
+            match w {
+                Winner::Direct => {
+                    let (grid, full, _) = direct.as_ref().expect("direct priced");
+                    let exit = ExitRoute::Packed(self.v3.expect("direct needs v3").encode(pair, grid, full.as_ref().expect("direct priced")));
+                    (Ok((exit, "direct", None)), None, 0)
                 }
-                Err(err) => {
-                    q.error = Some(format!("{agg_name} build failed: {err}"));
-                    None
+                Winner::Kyber(i) => {
+                    let (built, ms) = build(&kyber_quotes[i]).await;
+                    match built {
+                        Ok(b) => {
+                            let (exit, note) = call(b);
+                            (Ok((exit, agg_name, None)), note, ms)
+                        }
+                        Err(e) => (Err(e.to_string()), None, ms),
+                    }
+                }
+                Winner::Hybrid(i) => {
+                    let (pi, kq, _) = hybrids[i];
+                    let (grid, _, parts) = direct.as_ref().expect("a hybrid has a direct part");
+                    let (m, a) = &parts[pi];
+                    let route = self.v3.expect("direct needs v3").encode(pair, grid, a);
+                    let (built, ms) = build(kq).await;
+                    match built {
+                        Ok(b) => {
+                            let (exit, note) = call(b);
+                            (Ok((exit, "hybrid", Some((route, unit * U256::from(*m))))), note, ms)
+                        }
+                        Err(e) => (Err(e.to_string()), None, ms),
+                    }
                 }
             }
         };
-        if let Some((exit, router)) = exit {
-            q.plan = Some(BundlePlan { items, total_seize, flash_assets, exit, router, gas_est: q.gas_units });
+        let plan_of = |(exit, router, hybrid): BuiltExit, gas_est: u64| BundlePlan { items: items.clone(), total_seize, flash_assets, exit, router, gas_est, hybrid };
+        let (exit, note, ms): (Result<BuiltExit, String>, _, _) = make(winner).await;
+        q.kyber_build_ms = ms;
+        if let Some(note) = note {
+            q.router = format!("{} ({note})", q.router);
+        }
+        match exit {
+            Ok(x) => q.plan = Some(plan_of(x, q.gas_units)),
+            Err(err) => q.error = Some(format!("{agg_name} build failed: {err}")),
+        }
+        // A hybrid keeps the best single exit as its fallback (see `BundleQuote::alt_plan`).
+        if let Winner::Hybrid(_) = winner {
+            let singles = [de.map(|e| (Winner::Direct, e)), best_kyber.map(|(i, _)| (Winner::Kyber(i), kyber_exit(i)))];
+            if let Some((w, e)) = singles.into_iter().flatten().max_by(|a, b| net(&a.1).total_cmp(&net(&b.1)))
+                && let (Ok(x), _, _) = make(w).await
+            {
+                q.alt_plan = Some(plan_of(x, gas_units(&e)));
+                q.alt_gross_usd = e.2;
+            }
         }
         q
     }
@@ -597,7 +713,7 @@ impl<L: LendingProtocol, V: LiquidationVenue<L>, A: Dex> Planner<'_, L, V, A> {
         let pair = c.view.pair;
         let repay = |s| self.protocol.repay_for_seize(c.meta, c.snap, pair, s);
         let budget = Some(self.cfg.max_gas.saturating_sub(LIQUIDATION_OVERHEAD_GAS));
-        let exit = self.direct_exit(p, c.meta, pair, c.snap, c.view.max_seize, c.eth_usd, c.base_fee_wei, c.block_id(), &c.overrides, repay, budget, DirectSale::Prefix).await;
+        let exit = self.direct_exit(p, c.meta, pair, c.snap, c.view.max_seize, c.eth_usd, c.base_fee_wei, c.block_id(), &c.overrides, repay, budget).await;
         plan.quote_ms = t0.elapsed().as_millis() as u64;
         let (grid, alloc) = match exit {
             Ok(Some(x)) => x,
@@ -834,7 +950,7 @@ mod generic_tests {
         assert_eq!(v.max_seize, U256::from(90u64));
 
         let planner = Planner { protocol: &toy, aggregator: &MockDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000, agg_swap_safety: 1.3 }, false, 5, None, None).await;
+        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 110_000, overhead: 600_000, agg_swap_safety: 1.3 }, false, false, 5, None, None).await;
         assert_eq!(q.positions, 1);
         let err = q.error.unwrap();
         assert!(err.contains("no direct pools") && err.contains("mockdex: off (mockdex quotes"), "{err}");
@@ -886,7 +1002,7 @@ mod generic_tests {
         for (exit_holder, want) in [(Some(holder), holder), (None, LiquidationVenue::<Toy>::target(&venue))] {
             let dex = HolderDex::default();
             let planner = Planner { protocol: &toy, aggregator: &dex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-            let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 }, true, 5, None, exit_holder).await;
+            let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 }, true, false, 5, None, exit_holder).await;
             assert_eq!(q.router, "holderdex", "{:?}", q.error);
             assert!(q.plan.as_ref().is_some_and(|p| matches!(p.exit, ExitRoute::Call { .. })), "{:?}", q.error);
             assert_eq!(*dex.0.lock().unwrap(), vec![(want, want)]);
@@ -925,7 +1041,7 @@ mod generic_tests {
         let m = Mk { key: key(1), name: "alpha".into() };
         let v = view(&toy, 0, user(1), &m, &1.0, &(100, 90));
         let planner = Planner { protocol: &toy, aggregator: &NoteDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "direct" };
-        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 }, true, 5, None, None).await;
+        let q = planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &StateOverride::default(), 0, 2000.0, 1_000_000, BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 }, true, false, 5, None, None).await;
         assert_eq!(q.router, "notedex (fallback)", "{:?}", q.error);
         assert_eq!(q.plan.as_ref().map(|p| p.router), Some("notedex"), "the executable plan keeps the venue name");
     }
@@ -970,7 +1086,7 @@ mod generic_tests {
         let bundle_gas = BundleGas { per_position: 40_000, overhead: 500_000, agg_swap_safety: 1.3 };
         let planner = Planner { protocol: &toy, aggregator: &LadderDex, venue: &venue, cfg: &cfg.exec, v3: None, mode: "aggregator" };
         let ov = StateOverride::default();
-        let run = |gas_price: u128| planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &ov, 0, 2000.0, 10_000_000, bundle_gas, true, 5, Some(gas_price), None);
+        let run = |gas_price: u128| planner.quote_bundle(&provider, &m, &1.0, std::slice::from_ref(&v), 1, &ov, 0, 2000.0, 10_000_000, bundle_gas, true, false, 5, Some(gas_price), None);
 
         // At 15 gwei the ~$144 gas the extra 3.7M units cost dwarfs the $1 of output given up, so the
         // forcing rung wins on net — the opposite of the old "most output" rule. Both rungs journaled.

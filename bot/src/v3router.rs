@@ -465,8 +465,44 @@ pub fn allocate_full(
     to_units: impl Fn(U256) -> f64,
     gas_budget: Option<u64>,
 ) -> Result<Option<Allocation>, u64> {
+    let k_max = grid.sources.first().map_or(0, |c| c.out.len() as u64);
+    allocate_exact(grid, n_direct, total, k_max, repay, gas_per_extra_leg, gas_cost, to_units, gas_budget)
+}
+
+/// The best allocation that sells exactly `units` grid units (`unit x units`): the direct part of a
+/// hybrid exit, an aggregator selling the rest. Same search and budget rules as `allocate_full`;
+/// the value is net of `repay(unit x units)` (pass a zero repay to rank by output net of gas).
+#[allow(clippy::too_many_arguments)]
+pub fn allocate_units(
+    grid: &Grid,
+    n_direct: usize,
+    units: u64,
+    repay: impl Fn(U256) -> U256,
+    gas_per_extra_leg: u64,
+    gas_cost: impl Fn(u64) -> f64,
+    to_units: impl Fn(U256) -> f64,
+    gas_budget: Option<u64>,
+) -> Result<Option<Allocation>, u64> {
+    allocate_exact(grid, n_direct, grid.unit * U256::from(units), units, repay, gas_per_extra_leg, gas_cost, to_units, gas_budget)
+}
+
+/// `allocate_full` / `allocate_units`: every subset search for an allocation placing exactly `units`
+/// grid units, sold as `seize` (>= unit x units; the excess rides on the biggest leg).
+#[allow(clippy::too_many_arguments)]
+fn allocate_exact(
+    grid: &Grid,
+    n_direct: usize,
+    seize: U256,
+    units: u64,
+    repay: impl Fn(U256) -> U256,
+    gas_per_extra_leg: u64,
+    gas_cost: impl Fn(u64) -> f64,
+    to_units: impl Fn(U256) -> f64,
+    gas_budget: Option<u64>,
+) -> Result<Option<Allocation>, u64> {
     let n = grid.sources.len();
-    if n == 0 || grid.unit.is_zero() || total < grid.unit {
+    let k_max = grid.sources.first().map_or(0, |c| c.out.len() as u64);
+    if n == 0 || grid.unit.is_zero() || units == 0 || units > k_max || seize < grid.unit * U256::from(units) {
         return Ok(None);
     }
     let sink = SinkCurve::build(grid);
@@ -480,7 +516,7 @@ pub fn allocate_full(
     }
     let (mut best, mut least_over): (Option<(f64, Allocation)>, Option<u64>) = (None, None);
     for allowed in subsets {
-        let Some(c) = greedy(grid, n_direct, &sink, &allowed, &repay, gas_per_extra_leg, &gas_cost, &to_units, Some(total)) else { continue };
+        let Some(c) = greedy(grid, n_direct, &sink, &allowed, &repay, gas_per_extra_leg, &gas_cost, &to_units, Some((seize, units))) else { continue };
         if c.0 <= 0.0 {
             continue;
         }
@@ -515,8 +551,9 @@ fn for_each_subset(n: usize, size: usize, f: &mut impl FnMut(&[usize])) {
     rec(0, n, size, &mut Vec::with_capacity(size), f);
 }
 
-/// Greedy split by marginal output over the `allowed` source legs. `full` = None: the best prefix
-/// (any size); Some(total): only the allocation that places every grid unit, as a sale of `total`.
+/// Greedy split by marginal output over the `allowed` source legs. `exact` = None: the best prefix
+/// (any size); Some((seize, units)): only the allocation that places `units` grid units, as a sale
+/// of `seize`.
 #[allow(clippy::too_many_arguments)]
 fn greedy(
     grid: &Grid,
@@ -527,7 +564,7 @@ fn greedy(
     gas_per_extra_leg: u64,
     gas_cost: &impl Fn(u64) -> f64,
     to_units: &impl Fn(U256) -> f64,
-    full: Option<U256>,
+    exact: Option<(U256, u64)>,
 ) -> Option<(f64, Allocation)> {
     let n = grid.sources.len();
     let k_max = grid.sources[0].out.len() as u64;
@@ -536,6 +573,9 @@ fn greedy(
     let mut conn_total = U256::ZERO;
     let mut best: Option<(f64, Allocation)> = None;
     for step in 1..=k_max {
+        if exact.is_some_and(|(_, units)| step > units) {
+            break;
+        }
         let v_now = sink.value_at(conn_total, grid.conn_unit);
         let mut pick = None;
         let mut pick_gain = U256::ZERO;
@@ -561,12 +601,12 @@ fn greedy(
         } else {
             conn_total += delta;
         }
-        if full.is_some() && step < k_max {
+        if exact.is_some_and(|(_, units)| step != units) {
             continue;
         }
         let total_out = direct_out + sink.value_at(conn_total, grid.conn_unit);
         let gridded = grid.unit * U256::from(step);
-        let seize = full.unwrap_or(gridded);
+        let seize = exact.map_or(gridded, |(seize, _)| seize);
         let used_sources = units.iter().filter(|u| **u > 0).count() as u64;
         let sink_idx = if conn_total.is_zero() { 0 } else { sink.index_for(conn_total, grid.conn_unit) };
         let swap_gas = units.iter().enumerate().map(|(i, &u)| grid.sources[i].gas_at(u)).sum::<u64>()
@@ -669,6 +709,18 @@ mod tests {
         let a = allocate_full(&g, 3, U256::from(400u64), repay90, 50_000, |gas| gas as f64 / 50_000.0, u, None).unwrap().unwrap();
         assert_eq!(a.source_units[2], 0, "{a:?}");
         assert_eq!(a.source_units.iter().sum::<u64>(), 4);
+    }
+
+    #[test]
+    fn units_sale_places_exactly_that_many_units() {
+        // The direct part of a hybrid: 2 of the 4 units, the best split of them net of leg gas.
+        let g = Grid { unit: U256::from(100u64), sources: vec![curve(&[120, 230, 280, 300]), curve(&[110, 215, 315, 410])], ..Default::default() };
+        let a = allocate_units(&g, 2, 2, |_| U256::ZERO, 60_000, |gas| gas as f64 * 1e-4, u, None).unwrap().unwrap();
+        assert_eq!(a.source_units.iter().sum::<u64>(), 2, "{a:?}");
+        assert_eq!((a.seize, a.remainder), (U256::from(200u64), U256::ZERO));
+        assert_eq!(a.source_units, vec![2, 0], "230 on one leg beats 120 + 110 and a second leg's gas");
+        assert!(allocate_units(&g, 2, 5, |_| U256::ZERO, 0, |_| 0.0, u, None).unwrap().is_none(), "more units than the grid");
+        assert!(allocate_units(&g, 2, 0, |_| U256::ZERO, 0, |_| 0.0, u, None).unwrap().is_none());
     }
 
     #[test]

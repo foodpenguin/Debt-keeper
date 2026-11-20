@@ -1,8 +1,9 @@
 //! Chainlink SVR / Atlas as a liquidation venue, SIMULATION ONLY: a liquidation is not sent as a
 //! transaction but carried by a solver operation that Atlas executes right after the oracle update
 //! it auctions. `AtlasLiquidationSolver.sol` runs the liquidation through a MorphoLiquidator it owns
-//! (executor = profit receiver = the solver), buys the ETH bid with part of the loan token, pays it
-//! to the execution environment and settles with Atlas.
+//! (executor = profit receiver = the solver), buys the ETH bid with part of the loan token (one
+//! exact-output swap on an allowlisted loan/WETH pool, paid in its callback), pays it to the
+//! execution environment and settles with Atlas.
 //!
 //! What is here: encoding the solver call (`atlasSolverCall` + its solverOpData) and simulating it
 //! against `sim/AtlasStub.sol` standing in for the Atlas escrow, so a valuation can see whether the
@@ -37,17 +38,23 @@ use crate::{
 use crate::contracts::{IAtlasSolver, SolverCall, SwapStep};
 
 sol! {
-    struct ExactOutputSingleParams { address tokenIn; address tokenOut; uint24 fee; address recipient; uint256 amountOut; uint256 amountInMaximum; uint160 sqrtPriceLimitX96; }
-    interface IBidRouter { function exactOutputSingle(ExactOutputSingleParams params) external payable returns (uint256 amountIn); }
     interface IV3Factory { function getPool(address a, address b, uint24 fee) external view returns (address); }
     interface IV3Pool { function liquidity() external view returns (uint128); }
+    interface IAllowlist { function allowedTarget(address target) external view returns (bool); }
 }
 
-/// The deepest loan-token/WETH Uniswap-V3 pool's fee tier per loan token, probed at startup so the
-/// bid swap does not fail on a thin or missing pool at one fixed fee (2026-11-13: BidSwapFailed). A
-/// WETH loan needs no swap and is skipped; a token with no pool at any `tiers` is absent (the bid
-/// swap falls back to the configured `bid_fee`).
-pub async fn probe_bid_fees<P: Provider>(p: &P, factory: Address, weth: Address, loan_tokens: &[Address], tiers: &[u32]) -> HashMap<Address, u32> {
+/// A loan-token/WETH pool the bid can be bought on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BidPool {
+    pub pool: Address,
+    /// Its fee tier (hundredths of a bp, e.g. 500 = 0.05%).
+    pub fee: u32,
+}
+
+/// The loan-token/WETH Uniswap-V3 pools per loan token, deepest first, probed at startup so the bid
+/// swap does not go to a thin or missing pool (2026-11-13: BidSwapFailed at one fixed fee). A WETH
+/// loan needs no swap and is skipped; a token with no pool at any `tiers` is absent.
+pub async fn probe_bid_pools<P: Provider>(p: &P, factory: Address, weth: Address, loan_tokens: &[Address], tiers: &[u32]) -> HashMap<Address, Vec<BidPool>> {
     let tokens: Vec<Address> = loan_tokens.iter().copied().filter(|t| *t != weth).collect::<HashSet<_>>().into_iter().collect();
     if tokens.is_empty() || tiers.is_empty() {
         return HashMap::new();
@@ -57,7 +64,7 @@ pub async fn probe_bid_fees<P: Provider>(p: &P, factory: Address, weth: Address,
     let pools: Vec<Option<Address>> = match multicall(p, &pool_calls, BlockId::latest()).await {
         Ok(r) => r.iter().map(|b| b.as_ref().and_then(|b| IV3Factory::getPoolCall::abi_decode_returns(b).ok()).filter(|a| !a.is_zero())).collect(),
         Err(e) => {
-            tracing::warn!(error = %e, "bid-fee probe: getPool failed; bid swap uses the default fee");
+            tracing::warn!(error = %e, "bid-pool probe: getPool failed; no bid pools");
             return HashMap::new();
         }
     };
@@ -71,15 +78,42 @@ pub async fn probe_bid_fees<P: Provider>(p: &P, factory: Address, weth: Address,
     let mut out = HashMap::new();
     for (ti, t) in tokens.iter().enumerate() {
         let base = ti * tiers.len();
-        if let Some((best, _)) = (0..tiers.len()).map(|k| (tiers[k], liquidity[base + k])).filter(|(_, l)| *l > 0).max_by_key(|(_, l)| *l) {
-            out.insert(*t, best);
+        let mut found: Vec<(u128, BidPool)> = (0..tiers.len()).filter_map(|k| pools[base + k].filter(|_| liquidity[base + k] > 0).map(|pool| (liquidity[base + k], BidPool { pool, fee: tiers[k] }))).collect();
+        found.sort_by_key(|x| std::cmp::Reverse(x.0));
+        if !found.is_empty() {
+            out.insert(*t, found.into_iter().map(|(_, b)| b).collect());
+        }
+    }
+    out
+}
+
+/// Per loan token, the deepest of `candidates` the deployed `solver` allowlists (it refuses any other
+/// bid pool); every token's deepest when the solver is injected (`solver` None: the injection
+/// allowlists what it is given).
+pub async fn choose_bid_pools<P: Provider>(p: &P, solver: Option<Address>, candidates: HashMap<Address, Vec<BidPool>>) -> HashMap<Address, BidPool> {
+    let Some(solver) = solver else {
+        return candidates.into_iter().filter_map(|(t, v)| v.first().map(|b| (t, *b))).collect();
+    };
+    let flat: Vec<(Address, BidPool)> = candidates.iter().flat_map(|(t, v)| v.iter().map(move |b| (*t, *b))).collect();
+    let calls: Vec<(Address, Bytes)> = flat.iter().map(|(_, b)| (solver, IAllowlist::allowedTargetCall { target: b.pool }.abi_encode().into())).collect();
+    let allowed: Vec<bool> = match multicall(p, &calls, BlockId::latest()).await {
+        Ok(r) => r.iter().map(|b| b.as_ref().and_then(|b| IAllowlist::allowedTargetCall::abi_decode_returns(b).ok()).unwrap_or(false)).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "bid-pool allowlist read failed; no bid pools");
+            return HashMap::new();
+        }
+    };
+    let mut out = HashMap::new();
+    for ((t, b), ok) in flat.into_iter().zip(allowed) {
+        if ok {
+            out.entry(t).or_insert(b); // candidates are deepest first
         }
     }
     out
 }
 
 /// minProfit inside `atlasSolverCall` calldata: selector + 6 head words, solverOpData's length
-/// word, then its 4th head word (calls offset, bidSwap offset, profitToken, minProfit, gasPayWei).
+/// word, then its 4th head word (calls offset, bidPool, profitToken, minProfit, gasPayWei).
 pub const SOLVER_MIN_PROFIT: MinProfitSlot = MinProfitSlot { offset: 4 + 10 * 32, width: 32 };
 
 /// Metacall gas Atlas counts in a solver's maximum liability besides the solver ops' and userOp's
@@ -154,11 +188,9 @@ pub struct AtlasSolver {
     /// The solver operation signer (`solverOpFrom`).
     pub signer: Address,
     pub weth: Address,
-    pub bid_router: Address,
-    pub bid_fee: u32,
-    /// Per loan-token bid-swap fee tier (the deepest loan/WETH pool), probed at startup; a token not
-    /// here uses `bid_fee`.
-    bid_fees: HashMap<Address, u32>,
+    /// Per loan token, the pool the bid is bought on (`choose_bid_pools`); a token not here has no
+    /// bid pool, so its ops cannot pay a bid (they fail in simulation and are not sent).
+    bid_pools: HashMap<Address, BidPool>,
     /// The MorphoLiquidator the solver liquidates through.
     pub liquidator: Simulator,
     solver_code: Option<LiquidatorCode>,
@@ -167,14 +199,19 @@ pub struct AtlasSolver {
 
 impl AtlasSolver {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(atlas: Address, solver: Option<Address>, signer: Address, weth: Address, bid_router: Address, bid_fee: u32, liquidator: Simulator, solver_code: Option<LiquidatorCode>, stub: Bytes) -> Self {
-        Self { atlas, solver: solver.unwrap_or(SIM_SOLVER), signer, weth, bid_router, bid_fee, bid_fees: HashMap::new(), liquidator, solver_code: if solver.is_some() { None } else { solver_code }, stub }
+    pub fn new(atlas: Address, solver: Option<Address>, signer: Address, weth: Address, liquidator: Simulator, solver_code: Option<LiquidatorCode>, stub: Bytes) -> Self {
+        Self { atlas, solver: solver.unwrap_or(SIM_SOLVER), signer, weth, bid_pools: HashMap::new(), liquidator, solver_code: if solver.is_some() { None } else { solver_code }, stub }
     }
 
-    /// Sets the per-loan-token bid-swap fee tiers from `probe_bid_fees`.
-    pub fn with_bid_fees(mut self, bid_fees: HashMap<Address, u32>) -> Self {
-        self.bid_fees = bid_fees;
+    /// Sets the per-loan-token bid pools (`choose_bid_pools`).
+    pub fn with_bid_pools(mut self, bid_pools: HashMap<Address, BidPool>) -> Self {
+        self.bid_pools = bid_pools;
         self
+    }
+
+    /// The pool the bid is bought on for `loan_token`: zero (no swap) for WETH, or when it has none.
+    pub fn bid_pool(&self, loan_token: Address) -> Address {
+        if loan_token == self.weth { Address::ZERO } else { self.bid_pools.get(&loan_token).map_or(Address::ZERO, |b| b.pool) }
     }
 
     /// `atlasSolverCall` for one liquidation (`inner` = MorphoLiquidator calldata) that repays in
@@ -199,34 +236,15 @@ impl AtlasSolver {
     /// pay, so changing `gas_pay_wei` (at submit, from the simulated gas) rebuilds both together.
     pub fn op_data(&self, loan_token: Address, inner: &Bytes, bid_wei: U256, min_profit: U256, gas_pay_wei: U256) -> Bytes {
         let calls = vec![SolverCall { target: self.liquidator.liquidator, data: inner.clone() }];
-        (calls, self.bid_swap(loan_token, bid_wei + gas_pay_wei), loan_token, min_profit, gas_pay_wei).abi_encode_params().into()
+        // The solver buys exactly the bid + gas pay of WETH on the pool (nothing to buy: no swap).
+        let pool = if (bid_wei + gas_pay_wei).is_zero() { Address::ZERO } else { self.bid_pool(loan_token) };
+        (calls, pool, loan_token, min_profit, gas_pay_wei).abi_encode_params().into()
     }
 
     /// The bid swap's pool fee as a share (e.g. 0.0005), for bids repaid in `loan_token`: what buying
     /// the bid and the gas pay costs on top of their ETH value. 0 when the loan token is WETH.
     pub fn bid_swap_fee(&self, loan_token: Address) -> f64 {
-        if loan_token == self.weth { 0.0 } else { self.bid_fees.get(&loan_token).copied().unwrap_or(self.bid_fee) as f64 / 1e6 }
-    }
-
-    /// The bid swap: buy `eth_wei` (bid + gas pay) of WETH with the loan token (none if the loan is
-    /// WETH, unwrapped by the solver, or nothing to buy).
-    fn bid_swap(&self, loan_token: Address, eth_wei: U256) -> SwapStep {
-        if loan_token == self.weth || eth_wei.is_zero() {
-            return SwapStep { target: Address::ZERO, tokenIn: Address::ZERO, amountIn: U256::ZERO, data: Bytes::new() };
-        }
-        let buy = IBidRouter::exactOutputSingleCall {
-            params: ExactOutputSingleParams {
-                tokenIn: loan_token,
-                tokenOut: self.weth,
-                fee: alloy::primitives::Uint::from(self.bid_fees.get(&loan_token).copied().unwrap_or(self.bid_fee)),
-                recipient: self.solver,
-                amountOut: eth_wei,
-                amountInMaximum: U256::from(u128::MAX),
-                sqrtPriceLimitX96: Default::default(),
-            },
-        };
-        // Exact allowance of the whole balance; the router pulls only what the bid costs.
-        SwapStep { target: self.bid_router, tokenIn: loan_token, amountIn: U256::MAX, data: buy.abi_encode().into() }
+        if loan_token == self.weth { 0.0 } else { self.bid_pools.get(&loan_token).map_or(0.0, |b| b.fee as f64 / 1e6) }
     }
 
     /// The inner MorphoLiquidator batch calldata for `plan` (N positions in one flash loan, a single
@@ -234,7 +252,7 @@ impl AtlasSolver {
     /// exactly like a single-position inner. Its own minProfit is 0 — the solver enforces the op's
     /// minProfit at SOLVER_MIN_PROFIT. `deadline_block` is the auction's.
     pub fn batch_inner(&self, meta: &MarketMeta, plan: &crate::planner::BundlePlan, deadline_block: u64) -> Bytes {
-        let exit = batch_exit_bytes(&plan.exit, meta.params.collateralToken, plan.total_seize);
+        let exit = batch_exit_bytes(&plan.exit, plan.hybrid.as_ref(), meta.params.collateralToken, plan.total_seize);
         self.liquidator.calldata_batch(&meta.params, &plan.items, plan.flash_assets, &exit, U256::ZERO, deadline_block)
     }
 
@@ -245,7 +263,8 @@ impl AtlasSolver {
         let liability = std::iter::once((alloy::primitives::B256::ZERO, alloy::primitives::B256::from(gas_liability_wei))).collect();
         ov.insert(self.atlas, AccountOverride { code: Some(self.stub.clone()), state: Some(liability), ..Default::default() });
         if let Some(code) = &self.solver_code {
-            ov.insert(self.solver, code.account(self.signer, &[self.liquidator.liquidator, self.bid_router]));
+            let allowed: Vec<Address> = std::iter::once(self.liquidator.liquidator).chain(self.bid_pools.values().map(|b| b.pool)).collect();
+            ov.insert(self.solver, code.account(self.signer, &allowed));
         }
         ov
     }
@@ -348,14 +367,28 @@ pub fn fits_solver_gas(gas_used: u64, solver_gas_limit: u64, headroom: f64) -> b
     (gas_used as f64) <= solver_gas_limit as f64 * headroom
 }
 
-/// Exit modes in the batch liquidator's `exit` bytes (match MorphoLiquidator MODE_ROUTE/MODE_STEPS).
+/// Exit modes in the batch liquidator's `exit` bytes (match MorphoLiquidator MODE_ROUTE/MODE_STEPS/
+/// MODE_HYBRID).
 const EXIT_MODE_ROUTE: u8 = 0x01;
 const EXIT_MODE_STEPS: u8 = 0x02;
+const EXIT_MODE_HYBRID: u8 = 0x03;
+/// One packed route hop: pool(20) | flags(1) | amount(16) (MorphoLiquidator HOP_LEN).
+const ROUTE_HOP_LEN: usize = 37;
 
-/// The batch liquidator's `exit`: a mode tag, then the packed route hops (direct) or the
-/// abi-encoded `SwapStep[]` selling all the collateral through an aggregator (route built for
-/// `total_seize`).
-fn batch_exit_bytes(exit: &ExitRoute, collateral: Address, total_seize: U256) -> Vec<u8> {
+/// The batch liquidator's `exit`: a mode tag, then the packed route hops (direct), the abi-encoded
+/// `SwapStep[]` selling all the collateral through an aggregator (route built for `total_seize`), or
+/// — with `hybrid` = (route, route_seize) — the route's hop count and hops selling `route_seize`,
+/// then the aggregator step selling the rest (its route built for `total_seize - route_seize`).
+fn batch_exit_bytes(exit: &ExitRoute, hybrid: Option<&(Bytes, U256)>, collateral: Address, total_seize: U256) -> Vec<u8> {
+    if let (Some((route, route_seize)), ExitRoute::Call { target, calldata }) = (hybrid, exit) {
+        let steps = vec![SwapStep { target: *target, tokenIn: collateral, amountIn: total_seize - *route_seize, data: calldata.clone() }];
+        let mut d = Vec::with_capacity(3 + route.len() + 256);
+        d.push(EXIT_MODE_HYBRID);
+        d.extend_from_slice(&((route.len() / ROUTE_HOP_LEN) as u16).to_be_bytes());
+        d.extend_from_slice(route);
+        d.extend_from_slice(&steps.abi_encode());
+        return d;
+    }
     match exit {
         ExitRoute::Packed(route) => {
             let mut d = Vec::with_capacity(1 + route.len());
@@ -384,7 +417,8 @@ mod tests {
 
     fn solver() -> AtlasSolver {
         let liq = Simulator::new(Some(Address::repeat_byte(0x11)), SIM_SOLVER, None, vec![]);
-        AtlasSolver::new(Address::repeat_byte(0xa7), None, Address::repeat_byte(0x5e), Address::repeat_byte(0x0e), Address::repeat_byte(0x22), 500, liq, None, Bytes::new())
+        AtlasSolver::new(Address::repeat_byte(0xa7), None, Address::repeat_byte(0x5e), Address::repeat_byte(0x0e), liq, None, Bytes::new())
+            .with_bid_pools(HashMap::from([(Address::repeat_byte(0x10), BidPool { pool: Address::repeat_byte(0x22), fee: 500 })]))
     }
 
     fn meta(loan: Address) -> MarketMeta {
@@ -419,8 +453,8 @@ mod tests {
         assert!(!fits_solver_gas(5_950_000, 6_000_000, 0.9));
     }
 
-    /// The solverOpData tuple: (calls, bidSwap, profitToken, minProfit, gasPayWei).
-    type OpData = (Vec<SolverCall>, SwapStep, Address, U256, U256);
+    /// The solverOpData tuple: (calls, bidPool, profitToken, minProfit, gasPayWei).
+    type OpData = (Vec<SolverCall>, Address, Address, U256, U256);
 
     #[test]
     fn wraps_the_liquidation_in_a_solver_call_that_buys_and_pays_the_bid_and_the_gas() {
@@ -432,12 +466,12 @@ mod tests {
         assert_eq!(p.to, SIM_SOLVER);
         let call = IAtlasSolver::atlasSolverCallCall::abi_decode(&p.calldata).unwrap();
         assert_eq!((call.solverOpFrom, call.executionEnvironment, call.bidToken, call.bidAmount), (Address::repeat_byte(0x5e), SIM_EXECUTION_ENVIRONMENT, Address::ZERO, U256::from(5u8)));
-        let (calls, bid_swap, token, min, gas_pay) = <OpData>::abi_decode_params(&call.solverOpData).unwrap();
+        let (calls, bid_pool, token, min, gas_pay) = <OpData>::abi_decode_params(&call.solverOpData).unwrap();
         assert_eq!((calls.len(), calls[0].target), (1, Address::repeat_byte(0x11)), "through the solver's liquidator");
         assert_eq!(calls[0].data[0], 0x00, "the liquidator's packed entry");
-        assert_eq!((bid_swap.target, bid_swap.tokenIn, token, min, gas_pay), (Address::repeat_byte(0x22), usdc, usdc, U256::from(3u8), U256::from(2u8)));
-        let buy = IBidRouter::exactOutputSingleCall::abi_decode(&bid_swap.data).unwrap();
-        assert_eq!((buy.params.tokenOut, buy.params.amountOut, buy.params.recipient), (Address::repeat_byte(0x0e), U256::from(7u8), SIM_SOLVER), "buys the bid plus the gas pay");
+        // The solver itself buys exactly bidAmount + gasPayWei of WETH on the loan token's bid pool.
+        assert_eq!((bid_pool, token, min, gas_pay), (Address::repeat_byte(0x22), usdc, U256::from(3u8), U256::from(2u8)));
+        assert_eq!(s.bid_swap_fee(usdc), 0.0005);
         // minProfit sits at SOLVER_MIN_PROFIT (the gas pay after it is untouched).
         let patched = patch_min_profit(&p.calldata, p.min_profit, U256::from(4242u64)).unwrap();
         let again = <OpData>::abi_decode_params(&IAtlasSolver::atlasSolverCallCall::abi_decode(&patched).unwrap().solverOpData).unwrap();
@@ -445,10 +479,12 @@ mod tests {
         // A WETH loan needs no bid swap (the solver unwraps it); a zero bid still buys the gas pay.
         let weth_loan = s.calldata(Address::repeat_byte(0x0e), &Bytes::new(), U256::from(5u8), U256::ZERO, U256::from(2u8));
         let op = IAtlasSolver::atlasSolverCallCall::abi_decode(&weth_loan).unwrap().solverOpData;
-        assert_eq!(<OpData>::abi_decode_params(&op).unwrap().1.target, Address::ZERO);
+        assert_eq!(<OpData>::abi_decode_params(&op).unwrap().1, Address::ZERO);
         let gas_only = <OpData>::abi_decode_params(&s.op_data(usdc, &Bytes::new(), U256::ZERO, U256::ZERO, U256::from(2u8))).unwrap().1;
-        assert_eq!(IBidRouter::exactOutputSingleCall::abi_decode(&gas_only.data).unwrap().params.amountOut, U256::from(2u8));
-        assert_eq!(<OpData>::abi_decode_params(&s.op_data(usdc, &Bytes::new(), U256::ZERO, U256::ZERO, U256::ZERO)).unwrap().1.target, Address::ZERO, "nothing to buy");
+        assert_eq!(gas_only, Address::repeat_byte(0x22), "a zero bid still buys the gas pay");
+        assert_eq!(<OpData>::abi_decode_params(&s.op_data(usdc, &Bytes::new(), U256::ZERO, U256::ZERO, U256::ZERO)).unwrap().1, Address::ZERO, "nothing to buy");
+        // A loan token without a bid pool gets none (its op fails in simulation, so it is never sent).
+        assert_eq!(s.bid_pool(Address::repeat_byte(0x99)), Address::ZERO);
     }
 
     #[test]
@@ -456,6 +492,7 @@ mod tests {
         let s = solver();
         let ov = s.overrides(&StateOverride::default(), U256::from(12345u64));
         let stub = ov.get(&Address::repeat_byte(0xa7)).expect("stub at the atlas address");
+        assert!(!ov.contains_key(&SIM_SOLVER), "no solver code given here: nothing injected");
         assert_eq!(stub.state.as_ref().unwrap().get(&alloy::primitives::B256::ZERO), Some(&alloy::primitives::B256::from(U256::from(12345u64))), "slot 0 = gasLiability");
     }
 
@@ -486,6 +523,7 @@ mod tests {
         let s = solver();
         let m = meta(Address::repeat_byte(0x10));
         let plan = crate::planner::BundlePlan {
+            hybrid: None,
             items: vec![(Address::repeat_byte(0xB0), U256::from(100u64)), (Address::repeat_byte(0xB1), U256::from(200u64))],
             total_seize: U256::from(300u64),
             flash_assets: U256::from(280u64),
@@ -505,5 +543,15 @@ mod tests {
         assert_eq!(inner2[199], EXIT_MODE_STEPS);
         let steps = <Vec<SwapStep>>::abi_decode(&inner2[200..]).unwrap();
         assert_eq!((steps.len(), steps[0].target, steps[0].tokenIn, steps[0].amountIn), (1, Address::repeat_byte(0x22), m.params.collateralToken, U256::from(300u64)));
+
+        // A hybrid: MODE_HYBRID | nHops | the route selling 120 | the aggregator step selling the 180 left.
+        let hop = |b: u8| [vec![b; 20], vec![1u8], 60u128.to_be_bytes().to_vec()].concat();
+        let route: Bytes = [hop(0xa1), hop(0xa2)].concat().into();
+        let plan3 = crate::planner::BundlePlan { hybrid: Some((route.clone(), U256::from(120u64))), ..plan2.clone() };
+        let inner3 = s.batch_inner(&m, &plan3, 42);
+        assert_eq!((inner3[199], u16::from_be_bytes(inner3[200..202].try_into().unwrap())), (EXIT_MODE_HYBRID, 2));
+        assert_eq!(&inner3[202..202 + 74], route.as_ref());
+        let steps = <Vec<SwapStep>>::abi_decode(&inner3[276..]).unwrap();
+        assert_eq!((steps[0].target, steps[0].amountIn), (Address::repeat_byte(0x22), U256::from(180u64)));
     }
 }

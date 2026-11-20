@@ -105,7 +105,7 @@ contract AtlasBundleGasForkTest is Test {
         liq.approveMorpho(USDC, true);
         liq.setAllowedTarget(address(mockExit), true); // batch mock-exit (steps mode)
         solver.setAllowedTarget(address(liq), true);
-        solver.setAllowedTarget(UNI_V3_ROUTER, true);
+        solver.setAllowedTarget(UNI_WETH_USDC_500, true); // the bid pool
         vm.stopPrank();
         vm.mockCall(mp.oracle, abi.encodeWithSelector(IOracle.price.selector), abi.encode(PRICE_AFTER));
         deal(USDC, receiver, 1e6); // steady state: the receiver already holds USDC
@@ -162,16 +162,8 @@ contract AtlasBundleGasForkTest is Test {
     function _op(uint256 n, uint256 bid) internal view returns (bytes memory) {
         SolverCall[] memory calls = new SolverCall[](n);
         for (uint256 i; i < n; ++i) calls[i] = SolverCall({target: address(liq), data: _packed(i)});
-        SwapStep memory bidSwap = SwapStep({
-            target: UNI_V3_ROUTER,
-            tokenIn: USDC,
-            amountIn: type(uint256).max,
-            data: abi.encodeCall(
-                ISwapRouter02B.exactOutputSingle,
-                (ISwapRouter02B.ExactOutputSingleParams({tokenIn: USDC, tokenOut: WETH, fee: 500, recipient: address(solver), amountOut: bid, amountInMaximum: type(uint128).max, sqrtPriceLimitX96: 0}))
-            )
-        });
-        return abi.encode(calls, bidSwap, USDC, uint256(0), uint256(0));
+        bid; // bought by the solver on the bid pool
+        return abi.encode(calls, UNI_WETH_USDC_500, USDC, uint256(0), uint256(0));
     }
 
     function _measure(uint256 n) internal {
@@ -211,18 +203,6 @@ contract AtlasBundleGasForkTest is Test {
 
     // ---- batch: one solver op, one flash loan, N liquidations, a single exit ----
 
-    function _bidSwap(uint256 bid) internal view returns (SwapStep memory) {
-        return SwapStep({
-            target: UNI_V3_ROUTER,
-            tokenIn: USDC,
-            amountIn: type(uint256).max,
-            data: abi.encodeCall(
-                ISwapRouter02B.exactOutputSingle,
-                (ISwapRouter02B.ExactOutputSingleParams({tokenIn: USDC, tokenOut: WETH, fee: 500, recipient: address(solver), amountOut: bid, amountInMaximum: type(uint128).max, sqrtPriceLimitX96: 0}))
-            )
-        });
-    }
-
     function _batchItems(uint256 n, bool scale) internal view returns (bytes memory items, uint256 total) {
         for (uint256 i; i < n; ++i) {
             uint256 seize = scale ? s[i] / SCALE : s[i];
@@ -256,7 +236,8 @@ contract AtlasBundleGasForkTest is Test {
     function _batchOp(bytes memory packed, uint256 bid) internal view returns (bytes memory) {
         SolverCall[] memory calls = new SolverCall[](1);
         calls[0] = SolverCall({target: address(liq), data: packed});
-        return abi.encode(calls, _bidSwap(bid), USDC, uint256(0), uint256(0));
+        bid; // bought by the solver on the bid pool
+        return abi.encode(calls, UNI_WETH_USDC_500, USDC, uint256(0), uint256(0));
     }
 
     function _runBatch(bytes memory data) internal returns (uint256 used) {
@@ -297,6 +278,22 @@ contract AtlasBundleGasForkTest is Test {
     function test_batch_mock_10() public { _measureBatchMock(10); }
     function test_batch_mock_20() public { _measureBatchMock(20); }
     function test_batch_mock_30() public { _measureBatchMock(30); }
+
+    /// MODE_HYBRID on the fork (v0.6.0): the real 2-hop route sells half of the seized cbXRP, the
+    /// oracle-priced mock exit (allowlisted steps) the rest; the op pays its bid and settles, and the
+    /// solver and its liquidator are left empty.
+    function test_batch_hybrid_05() public {
+        (bytes memory items, uint256 total) = _batchItems(5, true);
+        uint256 half = total / 2;
+        SwapStep[] memory st = new SwapStep[](1);
+        st[0] = SwapStep({target: address(mockExit), tokenIn: mp.collateralToken, amountIn: total - half, data: abi.encodeCall(MockExitRouter.sell, (mp.collateralToken, total - half))});
+        bytes memory exit = abi.encodePacked(bytes1(0x03), uint16(2), _hop(PANCAKE_XRP_WETH_500, 0, half), _hop(UNI_WETH_USDC_500, 3, 0), abi.encode(st));
+        bytes memory data = _batchOp(_batchPacked(items, 5, total, exit), 0.001 ether);
+        emit log_named_uint("batch op gas, hybrid exit (5 positions)", _runBatch(data));
+        assertEq(IERC20B(mp.collateralToken).balanceOf(address(liq)) + IERC20B(USDC).balanceOf(address(liq)), 0, "liquidator empty");
+        assertEq(IERC20B(USDC).balanceOf(address(solver)) + IERC20B(WETH).balanceOf(address(solver)) + address(solver).balance, 0, "solver empty");
+        assertGt(IERC20B(USDC).balanceOf(receiver), 1e6, "profit paid out");
+    }
 
     /// The winner's own sizes, liquidations only (what its 30-position op paid before its RFQ exit).
     function test_bare_30_full_size() public {

@@ -339,6 +339,16 @@ async fn build_atlas_solver<P: Provider>(engine: &MorphoEngine<P>, submitting: b
         return Ok(None);
     }
     let (e, p, morpho) = (&engine.cfg.exec, &engine.provider, engine.protocol.address);
+    // This build encodes the v0.6.0 solverOpData (a bid pool, not a router swap) and hybrid exits: a
+    // deployed solver or liquidator from before cannot decode them, so every op would fail.
+    for (name, addr) in [("atlas.solver.address", c.address), ("atlas.solver.liquidator", c.liquidator)] {
+        if let Some(addr) = addr {
+            anyhow::ensure!(
+                is_v060_contract(p, addr).await?,
+                "{name} {addr} is a contract from before Debt-keeper v0.6.0, which cannot decode this version's solver ops: deploy the v0.6.0 contracts (or run the previous release)"
+            );
+        }
+    }
     let atlas = engine.cfg.atlas.address;
     let signer = c.signer.unwrap_or(e.executor);
     let solver = c.address.unwrap_or(atlas_venue::SIM_SOLVER);
@@ -356,12 +366,19 @@ async fn build_atlas_solver<P: Provider>(engine: &MorphoEngine<P>, submitting: b
     }
     let art: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&c.stub_artifact).with_context(|| format!("reading {} (run `forge build` in contracts/)", c.stub_artifact))?)?;
     let stub: alloy::primitives::Bytes = art["deployedBytecode"]["object"].as_str().context("atlas stub: no deployedBytecode")?.parse()?;
-    // The deepest loan/WETH pool per loan token, so the bid swap does not fail on a thin/missing
-    // pool at one fixed fee (2026-11-13: BidSwapFailed).
+    // The bid pool per loan token: the deepest loan/WETH pool (2026-11-13: BidSwapFailed on a thin
+    // pool at one fixed fee) that a deployed solver allowlists — it refuses any other.
     let loan_tokens: Vec<Address> = engine.metas.iter().map(|m| m.params.loanToken).collect();
-    let bid_fees = atlas_venue::probe_bid_fees(p, c.bid_factory, c.weth, &loan_tokens, &c.bid_fee_tiers).await;
-    info!(%solver, %signer, bid_fee_overrides = bid_fees.len(), "{}", atlas_solver_log(submitting));
-    Ok(Some(atlas_venue::AtlasSolver::new(atlas, c.address, signer, c.weth, c.bid_router, c.bid_fee, liq, solver_code, stub).with_bid_fees(bid_fees)))
+    let candidates = atlas_venue::probe_bid_pools(p, c.bid_factory, c.weth, &loan_tokens, &c.bid_fee_tiers).await;
+    let bid_pools = atlas_venue::choose_bid_pools(p, c.address, candidates).await;
+    for t in loan_tokens.iter().filter(|t| **t != c.weth).collect::<std::collections::BTreeSet<_>>() {
+        match bid_pools.get(t) {
+            Some(b) => info!(loan = %t, pool = %b.pool, fee = b.fee, "atlas: bid pool"),
+            None => warn!(loan = %t, "atlas: no bid pool for this loan token (none found, or none the solver allowlists): its ops cannot pay a bid"),
+        }
+    }
+    info!(%solver, %signer, "{}", atlas_solver_log(submitting));
+    Ok(Some(atlas_venue::AtlasSolver::new(atlas, c.address, signer, c.weth, liq, solver_code, stub).with_bid_pools(bid_pools)))
 }
 
 /// FlashLiquidator over Morpho: the repayment is flash-borrowed (exec.flash_funding) and Morpho's
@@ -566,10 +583,46 @@ sol! {
         function allowedProtocol(address) external view returns (bool);
         function MORPHO() external view returns (address);
         function POOL_MANAGER() external view returns (address);
+        function shares() external view returns (address[] memory to, uint16[] memory bps);
+        function MAX_SHARES() external view returns (uint256);
     }
     interface IAtlasRates {
         function getAtlasSurchargeRate() external view returns (uint256);
     }
+}
+
+/// Whether `addr` is a v0.6.0 liquidator or solver (it has `ProfitShares::MAX_SHARES`; an older
+/// contract reverts). A transport failure is an error.
+async fn is_v060_contract<P: Provider>(p: &P, addr: Address) -> Result<bool> {
+    use alloy::sol_types::SolCall;
+    let tx = alloy::rpc::types::TransactionRequest::default().to(addr).input(alloy::primitives::Bytes::from(ILiquidatorView::MAX_SHARESCall {}.abi_encode()).into());
+    match p.call(tx).await {
+        Ok(out) => Ok(ILiquidatorView::MAX_SHARESCall::abi_decode_returns(&out).is_ok()),
+        Err(e) if e.as_error_resp().is_some() => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("{addr} MAX_SHARES(): {e}")),
+    }
+}
+
+/// The extra profit recipients of a deployed liquidator or solver (`ProfitShares::shares`), checked
+/// against the hot wallet: profit must never be paid to a key that lives on the bot host. A contract
+/// from before v0.6.0 has no `shares()` (everything goes to PROFIT_RECEIVER): the call reverts, empty.
+/// A transport failure is an error (the check did not run).
+async fn checked_shares<P: Provider>(p: &P, contract: Address, hot: Address) -> Result<Vec<(Address, u16)>> {
+    use alloy::sol_types::SolCall;
+    let tx = alloy::rpc::types::TransactionRequest::default().to(contract).input(alloy::primitives::Bytes::from(ILiquidatorView::sharesCall {}.abi_encode()).into());
+    let shares: Vec<(Address, u16)> = match p.call(tx).await {
+        Ok(out) => {
+            let r = ILiquidatorView::sharesCall::abi_decode_returns(&out).context("shares()")?;
+            r.to.into_iter().zip(r.bps).collect()
+        }
+        // A revert (an error response): a contract from before v0.6.0, which has no shares().
+        Err(e) if e.as_error_resp().is_some() => vec![],
+        // No answer at all: the check could not run, so do not start as if it passed.
+        Err(e) => return Err(anyhow::anyhow!("{contract} shares(): {e}")),
+    };
+    anyhow::ensure!(shares.iter().all(|(to, _)| *to != hot), "{contract} pays a profit share to the hot wallet {hot}: profit must go to cold addresses only");
+    info!(%contract, shares = ?shares.iter().map(|(to, bps)| format!("{to}:{bps}bps")).collect::<Vec<_>>(), "profit shares (the rest to PROFIT_RECEIVER)");
+    Ok(shares)
 }
 
 /// `[atlas.solver] submit` in live mode: the solver operations' signer and the bond band, after
@@ -587,6 +640,7 @@ async fn build_submitter<P: Provider>(engine: &MorphoEngine<P>, signer: Option<&
     anyhow::ensure!(run_by == signer.address(), "solver {solver} is run by {run_by}, not the hot wallet {}", signer.address());
     let receiver = ILiquidatorView::PROFIT_RECEIVERCall::abi_decode_returns(&read(ILiquidatorView::PROFIT_RECEIVERCall {}.abi_encode()).await.context("solver PROFIT_RECEIVER()")?)?;
     anyhow::ensure!(receiver != signer.address(), "the solver's PROFIT_RECEIVER must be a cold wallet, not the hot signer");
+    checked_shares(p, solver, signer.address()).await?;
     // Config::validate requires both with submit.
     let (min, max) = (c.bond_min_eth.context("atlas.solver.bond_min_eth")?, c.bond_max_eth.context("atlas.solver.bond_max_eth")?);
     let band = BondBand { min_wei: eth_wei(min), max_wei: eth_wei(max), auto_withdraw: c.bond_auto_withdraw, receiver };
@@ -627,8 +681,8 @@ async fn read_dapp_gas<P: Provider>(engine: &MorphoEngine<P>, live_submit: bool)
 }
 
 /// Live pre-flight: refuses to send unless the deployed contract, the hot wallet and the
-/// standing Morpho allowances are all consistent. Returns the contract's profit receiver.
-async fn preflight_live<P: Provider>(engine: &MorphoEngine<P>, signer_addr: Address) -> Result<Address> {
+/// standing Morpho allowances are all consistent. Returns the contract and its profit receiver.
+async fn preflight_live<P: Provider>(engine: &MorphoEngine<P>, signer_addr: Address) -> Result<(Address, Address)> {
     let cfg = &engine.cfg.exec;
     anyhow::ensure!(cfg.mode == "live", "exec.mode is {:?}, not \"live\"", cfg.mode);
     let flash = cfg.venue == "flash";
@@ -649,6 +703,7 @@ async fn preflight_live<P: Provider>(engine: &MorphoEngine<P>, signer_addr: Addr
     anyhow::ensure!(!paused, "liquidator is paused (owner must unpause)");
     let receiver = ILiquidatorView::PROFIT_RECEIVERCall::abi_decode_returns(&engine.provider.call(call(ILiquidatorView::PROFIT_RECEIVERCall {}.abi_encode())).await?)?;
     anyhow::ensure!(receiver != signer_addr, "PROFIT_RECEIVER must be a cold wallet, not the hot executor");
+    checked_shares(&engine.provider, liq, signer_addr).await?;
     if flash {
         // FlashLiquidator calls Morpho's liquidate itself: Morpho must be an allowed protocol, and
         // the funding source the config picks must be the one the contract was deployed with.
@@ -676,7 +731,7 @@ async fn preflight_live<P: Provider>(engine: &MorphoEngine<P>, signer_addr: Addr
     // At least one tx at its worst case, else every send would be refused (`[exec] max_tx_cost_eth`).
     anyhow::ensure!(math::units(bal, 18) >= cfg.max_tx_cost_eth, "hot wallet balance {} ETH < exec.max_tx_cost_eth {}: no tx could be sent", math::units(bal, 18), cfg.max_tx_cost_eth);
     info!(%liq, executor = %signer_addr, %receiver, balance_eth = math::units(bal, 18), "LIVE pre-flight passed");
-    Ok(receiver)
+    Ok((liq, receiver))
 }
 
 /// Planner inputs, shared with background tasks (Atlas auction valuations).
@@ -1585,7 +1640,16 @@ async fn batch_solver_op<P: Provider>(
     if let Some(b) = bundle
         && let Some(plan) = &b.plan
     {
-        let (row, cand) = batch_op(provider, parts, mi, m, b, plan, solver, overrides, block, sim_time, deadline, solver_gas_limit, gas_headroom, cost, eth_usd).await;
+        let (row, cand) = batch_op(provider, parts, mi, m, b.gross_usd, plan, solver, overrides, block, sim_time, deadline, solver_gas_limit, gas_headroom, cost, eth_usd).await;
+        // A hybrid whose op did not run (its aggregator part through pools the direct part had just
+        // moved, past its slippage bound): the best single exit instead, the hybrid journaled beside it.
+        if cand.is_none()
+            && let Some(alt) = &b.alt_plan
+        {
+            let (mut alt_row, alt_cand) = batch_op(provider, parts, mi, m, b.alt_gross_usd, alt, solver, overrides, block, sim_time, deadline, solver_gas_limit, gas_headroom, cost, eth_usd).await;
+            alt_row["hybrid_alt"] = row;
+            return BatchOutcome::Row(alt_row, alt_cand.map(Box::new));
+        }
         return BatchOutcome::Row(row, cand.map(Box::new));
     }
     BatchOutcome::NeedSingle
@@ -1626,7 +1690,7 @@ async fn batch_op<P: Provider>(
     parts: &PlannerParts,
     mi: usize,
     m: &AuctionMarket,
-    bundle: &planner::BundleQuote,
+    quoted_gross_usd: f64,
     plan: &planner::BundlePlan,
     solver: &atlas_venue::AtlasSolver,
     overrides: &StateOverride,
@@ -1638,7 +1702,7 @@ async fn batch_op<P: Provider>(
     cost: OpCost,
     eth_usd: f64,
 ) -> (serde_json::Value, Option<OpCandidate>) {
-    let op = SolverOp { inner: solver.batch_inner(&m.meta, plan, deadline), positions: plan.items.len(), gas_est: plan.gas_est, quoted_gross_usd: bundle.gross_usd, label: "batch" };
+    let op = SolverOp { inner: solver.batch_inner(&m.meta, plan, deadline), positions: plan.items.len(), gas_est: plan.gas_est, quoted_gross_usd, label: "batch" };
     let row = json!({ "positions": plan.items.len(), "router": plan.router, "est_gas": plan.gas_est });
     sim_bid_op(provider, parts, mi, m, solver, op, row, overrides, block, sim_time, solver_gas_limit, gas_headroom, cost, eth_usd).await
 }
@@ -1938,9 +2002,12 @@ async fn valuation<P: Provider>(
         // One solver op holds only so many liquidations: bundle the largest that fit (liq is sorted
         // by bonus) instead of pricing an op that cannot exist.
         let fit = &m.liq[..m.liq.len().min(atlas_venue::bundle_capacity(solver_gas, atlas.max_bundle_positions))];
+        // Hybrid exits cost three more aggregator quotes: only where the op would be bid on (the
+        // market's bonus at least min_bonus_usd, as batch_solver_op requires).
+        let hybrid = live && m.liq.iter().map(|v| v.bonus).sum::<f64>() >= atlas.min_bonus_usd;
         let bundle = match fit.is_empty() {
             true => None,
-            false => Some(planner.quote_bundle(provider, &m.meta, &m.snap, fit, head.number, &overrides, head.base_fee, eth_usd, atlas_venue::bundle_swap_budget(solver_gas, fit.len()), atlas_venue::ATLAS_BUNDLE_GAS, live, atlas.flash_headroom_bps, Some(auction_gas_wei), exit_holder).await),
+            false => Some(planner.quote_bundle(provider, &m.meta, &m.snap, fit, head.number, &overrides, head.base_fee, eth_usd, atlas_venue::bundle_swap_budget(solver_gas, fit.len()), atlas_venue::ATLAS_BUNDLE_GAS, live, hybrid, atlas.flash_headroom_bps, Some(auction_gas_wei), exit_holder).await),
         };
         let bundle_ms = a.seen.elapsed().as_millis() as u64;
         let ctxs: Vec<PlanCtx<Morpho>> = m
@@ -2397,26 +2464,35 @@ fn on_bond_tx_settled(ledger: &mut Ledger, tx: crate::ledger::BondTx, success: b
     }
 }
 
-/// USD paid to `receiver` in the receipt of `hash`: ERC20 Transfers of the tracked markets' loan
-/// tokens (`loan_tokens`: token -> decimals), priced by the loan-token model. Other tokens (a
-/// connector leftover) are logged and not counted.
-async fn paid_to<P: Provider>(p: &P, chain_id: u64, hash: alloy::primitives::B256, receiver: Address, loan_tokens: &HashMap<Address, u8>, eth_usd: f64) -> Result<f64> {
-    alloy::sol! { event Transfer(address indexed from, address indexed to, uint256 value); }
-    use alloy::sol_types::SolEvent;
+/// USD the liquidator `payer` paid out in the receipt of `hash`, in the tracked markets' loan tokens
+/// (`loan_tokens`: token -> decimals), priced by the loan-token model: its `ProfitPaid` events (v0.6.0
+/// contracts: the whole payout, however it was split between the profit shares), else — a contract
+/// from before — the ERC20 Transfers to `receiver`. Other tokens (a connector leftover) are logged
+/// and not counted.
+async fn paid_to<P: Provider>(p: &P, chain_id: u64, hash: alloy::primitives::B256, payer: Address, receiver: Address, loan_tokens: &HashMap<Address, u8>, eth_usd: f64) -> Result<f64> {
     let r = p.get_transaction_receipt(hash).await?.with_context(|| format!("no receipt for {hash}"))?;
-    let mut usd = 0.0;
-    for log in r.inner.logs() {
-        let Ok(t) = Transfer::decode_log(&log.inner) else { continue };
-        if t.to != receiver {
-            continue;
-        }
-        let token = log.address();
-        match (loan_tokens.get(&token), morpho::loan_usd_model(chain_id, token, eth_usd)) {
-            (Some(decimals), Some(px)) => usd += math::units(t.value, *decimals) * px,
-            _ => info!(%token, value = %t.value, %hash, "profit paid in a token without a price model; not counted in the PnL"),
-        }
+    Ok(paid_in_logs(r.inner.logs().iter().map(|l| &l.inner), chain_id, hash, payer, receiver, loan_tokens, eth_usd))
+}
+
+/// `paid_to` on a receipt's logs.
+fn paid_in_logs<'a>(logs: impl Iterator<Item = &'a alloy::primitives::Log> + Clone, chain_id: u64, hash: alloy::primitives::B256, payer: Address, receiver: Address, loan_tokens: &HashMap<Address, u8>, eth_usd: f64) -> f64 {
+    alloy::sol! {
+        event Transfer(address indexed from, address indexed to, uint256 value);
+        event ProfitPaid(address indexed token, uint256 amount);
     }
-    Ok(usd)
+    use alloy::sol_types::SolEvent;
+    let price = |token: Address, value: U256| match (loan_tokens.get(&token), morpho::loan_usd_model(chain_id, token, eth_usd)) {
+        (Some(decimals), Some(px)) => math::units(value, *decimals) * px,
+        _ => {
+            info!(%token, %value, %hash, "profit paid in a token without a price model; not counted in the PnL");
+            0.0
+        }
+    };
+    let paid: Vec<(Address, U256)> = logs.clone().filter(|l| l.address == payer).filter_map(|l| ProfitPaid::decode_log(l).ok()).map(|e| (e.token, e.amount)).collect();
+    if !paid.is_empty() {
+        return paid.into_iter().map(|(token, amount)| price(token, amount)).sum();
+    }
+    logs.filter_map(|l| Transfer::decode_log(l).ok().filter(|t| t.to == receiver).map(|t| (t.address, t.value))).map(|(token, value)| price(token, value)).sum()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2934,10 +3010,10 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
         }
 
         // Live money (ledger.rs): the settled txs' PnL, the Atlas bond, and the daily loss stop.
-        if let Some(receiver) = profit_receiver {
+        if let Some((payer, receiver)) = profit_receiver {
             let mut changed = !included_txs.is_empty();
             for (hash, cost) in included_txs {
-                let income = match paid_to(&engine.provider, engine.cfg.chain_id, hash, receiver, &loan_decimals, eth_usd).await {
+                let income = match paid_to(&engine.provider, engine.cfg.chain_id, hash, payer, receiver, &loan_decimals, eth_usd).await {
                     Ok(usd) => usd,
                     Err(e) => {
                         warn!(%hash, error = %e, "receipt lookup for the PnL failed; income counted as 0");
@@ -3127,6 +3203,30 @@ fn price_human(price: U256, meta: &MarketMeta) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PnL of a settled tx: a v0.6.0 liquidator's ProfitPaid carries the whole payout however it
+    /// was split; an older contract's profit is what it transferred to PROFIT_RECEIVER.
+    #[test]
+    fn the_pnl_reads_profit_paid_or_falls_back_to_the_receivers_transfers() {
+        use alloy::{primitives::LogData, sol_types::SolEvent};
+        alloy::sol! {
+            event Transfer(address indexed from, address indexed to, uint256 value);
+            event ProfitPaid(address indexed token, uint256 amount);
+        }
+        let usdc: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse().unwrap();
+        let (liq, receiver, share, other) = (Address::repeat_byte(1), Address::repeat_byte(2), Address::repeat_byte(3), Address::repeat_byte(4));
+        let log = |address: Address, data: LogData| alloy::primitives::Log { address, data };
+        let transfer = |to: Address, v: u64| log(usdc, Transfer { from: liq, to, value: U256::from(v) }.encode_log_data());
+        let paid = |from: Address, v: u64| log(from, ProfitPaid { token: usdc, amount: U256::from(v) }.encode_log_data());
+        let decimals = HashMap::from([(usdc, 6u8)]);
+        let pnl = |logs: Vec<alloy::primitives::Log>| paid_in_logs(logs.iter(), 8453, Default::default(), liq, receiver, &decimals, 3000.0);
+        // Split 25/75: the receiver got 75, the whole payout was 100.
+        assert_eq!(pnl(vec![transfer(share, 25_000_000), transfer(receiver, 75_000_000), paid(liq, 100_000_000)]), 100.0);
+        // An old contract: no ProfitPaid, its transfers to the receiver.
+        assert_eq!(pnl(vec![transfer(receiver, 40_000_000)]), 40.0);
+        // Another contract's ProfitPaid is not ours.
+        assert_eq!(pnl(vec![paid(other, 9_000_000), transfer(receiver, 1_000_000)]), 1.0);
+    }
 
     #[test]
     fn an_execution_label_waits_for_its_own_feeds_metacall_until_past_the_deadline() {

@@ -248,15 +248,16 @@ pub struct SolverConfig {
     pub signer: Option<Address>,
     #[serde(default = "default_weth")]
     pub weth: Address,
-    /// Uniswap V3-style router (exactOutputSingle) that buys the ETH bid with the loan token.
+    /// Unused since v0.6.0 (the solver buys the bid on the pool itself, paid in its callback); kept
+    /// so configs that set it still load.
     #[serde(default = "default_bid_router")]
     pub bid_router: Address,
-    /// Fee tier of the bid swap pool (loan token / WETH): the fallback when no `bid_fee_tiers` pool
-    /// exists for a loan token.
+    /// Unused since v0.6.0 (the bid pool comes from `bid_fee_tiers`); kept so configs still load.
     #[serde(default = "default_bid_fee")]
     pub bid_fee: u32,
-    /// Uniswap V3 factory used to find the deepest loan-token/WETH pool for the bid swap at startup,
-    /// so it does not fail on a thin or missing pool at a single fixed fee (2026-11-13 BidSwapFailed).
+    /// Uniswap V3 factory used to find the loan-token/WETH bid pools at startup (the deepest one the
+    /// deployed solver allowlists), so the bid swap does not fail on a thin or missing pool at a
+    /// single fixed fee (2026-11-13 BidSwapFailed).
     #[serde(default = "default_bid_factory")]
     pub bid_factory: Address,
     /// Candidate bid-swap fee tiers probed for the deepest loan-token/WETH pool at startup.

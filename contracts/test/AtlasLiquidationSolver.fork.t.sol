@@ -52,6 +52,8 @@ contract AtlasLiquidationSolverForkTest is Test {
     address constant WETH = 0x4200000000000000000000000000000000000006;
     address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address constant UNI_V3_ROUTER = 0x2626664c2603336E57B271c5C0b26F421741e481;
+    /// Uniswap V3 WETH/USDC 0.05%: the bid pool (allowlisted on the solver).
+    address constant BID_POOL = 0xd0b53D9277642d899DF5C87A3966A349A798F224;
     Id constant MARKET = Id.wrap(0x8793cf302b8ffd655ab97bd1c695dbd967807e8367a65cb2f4edaf1380ba1bda);
     address constant BORROWER = 0x33B5a89294e778d14e8Ce4b0828889B6b81b6488;
 
@@ -79,7 +81,7 @@ contract AtlasLiquidationSolverForkTest is Test {
         liq.approveMorpho(USDC, true);
         liq.setAllowedTarget(UNI_V3_ROUTER, true);
         solver.setAllowedTarget(address(liq), true);
-        solver.setAllowedTarget(UNI_V3_ROUTER, true);
+        solver.setAllowedTarget(BID_POOL, true);
         vm.stopPrank();
         uint256 p = IOracle(mp.oracle).price();
         vm.mockCall(mp.oracle, abi.encodeWithSelector(IOracle.price.selector), abi.encode(p * 9_000 / 10_000));
@@ -99,23 +101,11 @@ contract AtlasLiquidationSolverForkTest is Test {
         return SolverCall({target: address(liq), data: abi.encodeCall(MorphoLiquidator.liquidate, (mp, BORROWER, seize, 0, exit, 0, block.number))});
     }
 
-    /// Buys exactly `bid` WETH with at most all the USDC the solver holds.
-    function _bidSwap(uint256 bid) internal view returns (SwapStep memory) {
-        return SwapStep({
-            target: UNI_V3_ROUTER,
-            tokenIn: USDC,
-            amountIn: type(uint256).max,
-            data: abi.encodeCall(
-                ISwapRouter02A.exactOutputSingle,
-                (ISwapRouter02A.ExactOutputSingleParams({tokenIn: USDC, tokenOut: WETH, fee: 500, recipient: address(solver), amountOut: bid, amountInMaximum: type(uint128).max, sqrtPriceLimitX96: 0}))
-            )
-        });
-    }
-
     function _op(uint256 bid, uint256 minProfit) internal view returns (bytes memory) {
         SolverCall[] memory calls = new SolverCall[](1);
         calls[0] = _liquidation(1 ether);
-        return abi.encode(calls, _bidSwap(bid), USDC, minProfit, uint256(0));
+        bid; // bought by the solver itself: exactly the bid (plus gasPayWei) of WETH on BID_POOL
+        return abi.encode(calls, BID_POOL, USDC, minProfit, uint256(0));
     }
 
     function test_solverLiquidatesPaysTheEthBidAndKeepsTheRest() public {
@@ -162,5 +152,5 @@ contract AtlasLiquidationSolverForkTest is Test {
         calls[0] = _liquidation(1 ether);
     }
 
-    function _noSwap() internal pure returns (SwapStep memory s) {}
+    function _noSwap() internal pure returns (address) {}
 }

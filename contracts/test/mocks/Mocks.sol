@@ -14,6 +14,13 @@ contract MockERC20 {
         feeBps = bps;
     }
 
+    /// Addresses the token refuses to send to (a blacklist, like USDC's).
+    mapping(address => bool) public blocked;
+
+    function setBlocked(address who, bool b) external {
+        blocked[who] = b;
+    }
+
     function mint(address to, uint256 amount) external {
         balanceOf[to] += amount;
     }
@@ -38,6 +45,7 @@ contract MockERC20 {
 
     function _move(address from, address to, uint256 amount) private {
         require(balanceOf[from] >= amount, "balance");
+        require(!blocked[to], "blocked");
         balanceOf[from] -= amount;
         uint256 fee = amount * feeBps / 10_000;
         balanceOf[to] += amount - fee;

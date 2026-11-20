@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {IMorpho, MarketParams} from "../src/interfaces/IMorpho.sol";
 import {MorphoLiquidator, SwapStep} from "../src/MorphoLiquidator.sol";
+import {ProfitShares} from "../src/ProfitShares.sol";
 import {
     MockERC20,
     MockMorpho,
@@ -15,6 +16,13 @@ import {
     MockV3Pool,
     TokenSwitchingPool
 } from "./mocks/Mocks.sol";
+
+/// An allowlisted swap target that tries to pay out the liquidator's in-flight balance.
+contract DistributingRouter {
+    function swap(MockERC20, MockERC20, uint256) external {
+        ProfitShares(msg.sender).distribute(address(0));
+    }
+}
 
 /// Attack and misuse scenarios against the liquidator, using mocks (no fork, fast).
 contract MorphoLiquidatorSecurityTest is Test {
@@ -503,6 +511,119 @@ contract MorphoLiquidatorSecurityTest is Test {
         vm.prank(executor);
         vm.expectRevert(abi.encodeWithSelector(MorphoLiquidator.RouteSpendMismatch.selector, total / 2, total));
         liq.liquidateBatch(mp, items, total, exit, 0, block.number);
+    }
+
+    // ------------------------------------------------------------- hybrid exit (route + steps)
+
+    /// MODE_HYBRID: a route selling `routeAmount`, then steps selling `stepsAmount`.
+    function _hybridExit(MockV3Pool pool, uint256 routeAmount, address target, uint256 stepsAmount) internal returns (bytes memory) {
+        pool.setMode(0);
+        SwapStep[] memory st = new SwapStep[](1);
+        st[0] = SwapStep({target: target, tokenIn: address(coll), amountIn: stepsAmount, data: abi.encodeCall(MockRouter.swap, (coll, loan, stepsAmount))});
+        return abi.encodePacked(bytes1(0x03), uint16(1), abi.encodePacked(address(pool), uint8(1), uint128(routeAmount)), abi.encode(st));
+    }
+
+    function test_batch_hybrid_routeThenSteps() public {
+        MockV3Pool pool = new MockV3Pool(coll, loan);
+        loan.mint(address(pool), 1_000_000e18);
+        (bytes memory items, uint256 total) = _items(3);
+        uint256 p = _batchRun(items, _hybridExit(pool, total / 3, address(router), total - total / 3), total, 1);
+        assertEq(p, total / 10, "both parts sold 1:1");
+        assertEq(loan.balanceOf(receiver), p);
+        assertEq(coll.balanceOf(address(liq)) + loan.balanceOf(address(liq)), 0, "nothing at rest");
+        assertEq(coll.allowance(address(liq), address(router)), 0, "steps allowance reset");
+    }
+
+    /// The route must sell some but not all of the collateral (all = MODE_ROUTE), and the steps stay
+    /// allowlisted.
+    function test_batch_hybrid_splitAndAllowlistEnforced() public {
+        MockV3Pool pool = new MockV3Pool(coll, loan);
+        loan.mint(address(pool), 1_000_000e18);
+        (bytes memory items, uint256 total) = _items(2);
+        MockRouter other = new MockRouter();
+        // Built first: building an exit calls the pool (setMode), which expectRevert would catch.
+        bytes memory all = _hybridExit(pool, total, address(router), 1);
+        bytes memory none = _hybridExit(pool, 0, address(router), total);
+        bytes memory foreign = _hybridExit(pool, total / 2, address(other), total / 2);
+        vm.startPrank(executor);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLiquidator.HybridSplit.selector, total, total));
+        liq.liquidateBatch(mp, items, total, all, 0, block.number);
+        // A zero-amount route hop already fails as a swap with no output (BadRoute), before the split check.
+        vm.expectRevert(MorphoLiquidator.BadRoute.selector);
+        liq.liquidateBatch(mp, items, total, none, 0, block.number);
+        // No hops at all, or hops but no steps after them.
+        vm.expectRevert(MorphoLiquidator.BadRoute.selector);
+        liq.liquidateBatch(mp, items, total, abi.encodePacked(bytes1(0x03), uint16(0), abi.encode(new SwapStep[](0))), 0, block.number);
+        vm.expectRevert(MorphoLiquidator.BadRoute.selector);
+        liq.liquidateBatch(mp, items, total, abi.encodePacked(bytes1(0x03), uint16(1), abi.encodePacked(address(pool), uint8(1), uint128(total / 2))), 0, block.number);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLiquidator.TargetNotAllowed.selector, address(other)));
+        liq.liquidateBatch(mp, items, total, foreign, 0, block.number);
+        vm.stopPrank();
+    }
+
+    // ------------------------------------------------------------- profit shares
+
+    function _setShares(uint16 aBps, uint16 bBps) internal returns (address a, address b) {
+        (a, b) = (makeAddr("shareA"), makeAddr("shareB"));
+        address[] memory to = new address[](2);
+        uint16[] memory bps = new uint16[](2);
+        (to[0], to[1], bps[0], bps[1]) = (a, b, aBps, bBps);
+        vm.prank(owner);
+        liq.setShares(to, bps);
+    }
+
+    /// The profit and the unsold collateral are split on the spot; minProfit is checked on the whole
+    /// profit; ProfitPaid carries each payout's total.
+    function test_shares_profitAndLeftoverAreSplit() public {
+        (address a, address b) = _setShares(3_000, 1_000);
+        // Sell 900 of the 1000 seized: profit 0 (900 out - 900 repaid) is below a minProfit of 1.
+        SwapStep[] memory part = _step(address(router), SEIZE * 9 / 10);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLiquidator.InsufficientProfit.selector, 0, 1));
+        _run(part, 1);
+        SwapStep[] memory whole = _step(address(router), SEIZE);
+        vm.expectEmit(true, false, false, true, address(liq));
+        emit ProfitShares.ProfitPaid(address(loan), SEIZE / 10);
+        uint256 p = _run(whole, SEIZE / 10);
+        assertEq(p, SEIZE / 10, "reported before the split");
+        assertEq(loan.balanceOf(a), p * 3 / 10);
+        assertEq(loan.balanceOf(b), p / 10);
+        assertEq(loan.balanceOf(receiver), p - p * 3 / 10 - p / 10);
+        _run(_step(address(router), SEIZE * 99 / 100), 0);
+        assertEq(coll.balanceOf(a), SEIZE / 100 * 3 / 10, "unsold collateral split too");
+        assertEq(coll.balanceOf(address(liq)) + loan.balanceOf(address(liq)), 0, "nothing at rest");
+    }
+
+    function test_shares_ownerOnlyAndValidated() public {
+        address[] memory to = new address[](1);
+        uint16[] memory bps = new uint16[](1);
+        (to[0], bps[0]) = (attacker, 9_000);
+        vm.prank(attacker);
+        vm.expectRevert(MorphoLiquidator.Unauthorized.selector);
+        liq.setShares(to, bps);
+        vm.prank(executor);
+        vm.expectRevert(MorphoLiquidator.Unauthorized.selector);
+        liq.setShares(to, bps);
+        bps[0] = 10_001;
+        vm.prank(owner);
+        vm.expectRevert(ProfitShares.BadShares.selector);
+        liq.setShares(to, bps);
+    }
+
+    /// A swap target cannot reenter and pay out what is in flight; outside an operation anyone can
+    /// pay a stray balance out, to the configured recipients only.
+    function test_shares_distributeRefusedInFlightOpenOtherwise() public {
+        DistributingRouter d = new DistributingRouter();
+        _allow(address(d));
+        vm.prank(executor);
+        vm.expectRevert(abi.encodeWithSelector(MorphoLiquidator.SwapFailed.selector, 0, abi.encodeWithSelector(ProfitShares.Busy.selector)));
+        liq.liquidate(mp, address(0xB0B), SEIZE, 0, _step(address(d), SEIZE), 0, block.number);
+
+        (address a,) = _setShares(5_000, 0 + 1);
+        loan.mint(address(liq), 1_000);
+        vm.prank(attacker);
+        liq.distribute(address(loan));
+        assertEq(loan.balanceOf(a), 500);
+        assertEq(loan.balanceOf(attacker), 0);
     }
 
     function test_batch_expiredAndPaused() public {

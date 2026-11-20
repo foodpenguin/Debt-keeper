@@ -178,10 +178,10 @@ simulate = false
 # address = "0x..."            # deployed AtlasLiquidationSolver; unset = injected bytecode
 # liquidator = "0x..."         # deployed MorphoLiquidator owned by the solver (executor = receiver = solver)
 # signer = "0x..."             # the solver operation signer; default: exec.executor
-# bid_router = "0x2626664c2603336E57B271c5C0b26F421741e481"   # Uniswap V3 SwapRouter02 (exactOutputSingle) for the ETH bid
-# bid_fee = 500                # fallback fee tier of the loan token / WETH pool the bid is bought in
-# bid_factory = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"   # Uni V3 factory: probed for the deepest bid pool per loan token
-# bid_fee_tiers = [500, 3000, 100, 10000]   # candidate bid-pool fee tiers probed at startup (deepest wins)
+# bid_factory = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"   # Uni V3 factory: the loan-token/WETH bid pools
+# bid_fee_tiers = [500, 3000, 100, 10000]   # candidate bid-pool fee tiers probed at startup (the deepest the
+#                                           # deployed solver allowlists wins: owner setAllowedTarget(pool, true))
+# (bid_router / bid_fee: unused since v0.6.0, the solver buys the bid on the pool itself)
 # The op pays its own gas in ETH out of its proceeds; Atlas credits the bond with any excess over the
 # real charge and takes any shortfall from it. Before running an op Atlas needs the bonded atlETH to
 # cover its maximum liability (op gas + userOp gas + dappGasLimit + ~0.5M, at the max fee + surcharge):

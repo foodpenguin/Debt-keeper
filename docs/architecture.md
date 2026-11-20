@@ -127,7 +127,17 @@ Turns one liquidatable position (or a bundle of positions in one market) into a 
   every grid unit placed, the grid's rounding remainder on the leg with the most units, and its legs
   weighed at the auction's gas price (before v0.5.0 they were priced at the block path's gas price
   and the allocation had to land exactly on the seized amount, so the direct route was missing for
-  ~80 % of bundles). The exits are weighed at the auction's gas price, where gas dominates. Each aggregator rung (the gas
+  ~80 % of bundles). The exits are weighed at the auction's gas price, where gas dominates. On the
+  auction path a hybrid is priced too (v0.6.0): the direct route for `HYBRID_DIRECT_SHARES_BPS`
+  (25/50/75 %) of the bundle — exactly that many grid units (`v3router::allocate_units`), the best
+  split of them net of gas — and the aggregator for the rest, quoted at the rest's size (three more
+  aggregator quotes, in parallel; only for a market whose bonus reaches `[atlas] min_bonus_usd`),
+  plus `HYBRID_EXTRA_GAS`. The best of direct, the aggregator rungs
+  and the hybrids wins (`hybrid_net_usd` is journaled); a winning hybrid builds its aggregator part
+  and becomes a `MODE_HYBRID` exit (`BundlePlan::hybrid`). Its parts are priced on the same state
+  but the direct part trades first, so an aggregator route through the same pools gets less than
+  quoted (past its slippage bound it reverts): a winning hybrid also builds the best single exit
+  (`alt_plan`), which the batch op takes when the hybrid's op does not run (`hybrid_alt`). Each aggregator rung (the gas
   ladder's two quotes) is scored by value *net of gas* at that price, alongside the direct route, so
   a forcing rung (less output, far less gas) can win when gas is dear; the rungs and which one was
   selected are journaled (`agg_rungs`). The bid, however, is NOT sent on the quote or the estimate:
@@ -263,14 +273,28 @@ trait names no protocol or vendor.
 - `liquidateBatch(params, items, flashAssets, exit, minProfit, deadlineBlock)` (ABI entry and a
   packed `fallback` tag `0x01`), for an Atlas solver op: one Morpho `flashLoan` funds N `liquidate`
   calls on the same market (empty callback data, so Morpho pulls each repayment through the standing
-  allowance), then a single `exit` (a direct route that must spend exactly the sum seized, or
-  allowlisted aggregator steps) sells all the collateral. `onMorphoFlashLoan` runs only inside our
+  allowance), then a single `exit` (a direct route that must spend exactly the sum seized,
+  allowlisted aggregator steps, or — v0.6.0 `MODE_HYBRID` — a direct route for part of it, then
+  allowlisted aggregator steps for the rest; the route must sell some but not all, `HybridSplit`)
+  sells all the collateral. `onMorphoFlashLoan` runs only inside our
   own batch (an `inBatch` transient flag, the Morpho sender, once; `NotFunded` otherwise), and the
   collateral received must equal the sum seized.
-- After the callback the contract checks the loan-token gain is at least `minProfit`, sends profit
-  to the immutable `PROFIT_RECEIVER` and holds nothing at rest.
-- Admin: `setExecutor`, `setAllowedTarget`, `approveMorpho`, `pause` (owner or executor) /
-  `unpause` (owner), two-step `transferOwnership` / `acceptOwnership`, `rescue`.
+- After the callback the contract checks the loan-token gain is at least `minProfit`, pays the
+  profit out and holds nothing at rest.
+- **Profit shares** (`ProfitShares.sol`, v0.6.0; the liquidator and the solver inherit it): every
+  payout (profit, unsold collateral, a connector remainder; the solver's WETH and ETH too) is split
+  on the spot between up to `MAX_SHARES` (4) extra recipients, each at its owner-set share in bps
+  (`setShares`, owner only; distinct non-zero addresses, total <= 10000; empty = none), and the
+  immutable `PROFIT_RECEIVER`, which gets the rest including rounding. Each payout emits
+  `ProfitPaid(token, amount)` with the whole amount — the bot's PnL reads it, however it was split.
+  `minProfit` is checked on the whole profit before the split. `distribute(token)` /
+  `distributeEth()` pay a stray balance out by the shares; anyone may call them (the funds only go to
+  the recipients), never while the contract's own operation runs (`Busy`). A share that cannot be
+  paid (blocked by the token, ETH rejected, or more than `SHARE_ETH_GAS` used) goes to
+  PROFIT_RECEIVER (`ShareSkipped`): one bad recipient cannot make every liquidation revert. Each
+  extra recipient costs one more transfer per payout (~10-30k gas).
+- Admin: `setExecutor`, `setAllowedTarget`, `approveMorpho`, `setShares`, `pause` (owner or
+  executor) / `unpause` (owner), two-step `transferOwnership` / `acceptOwnership`, `rescue`.
 
 ### Security model
 
@@ -285,7 +309,9 @@ trait names no protocol or vendor.
 | Not enough profit | `minProfit` on the loan-token balance delta (fuzzed) | `test_minProfitEnforced`, `testFuzz_profitAtLeastMin` |
 | Fake pool in a direct route | pools are only called for `swap`/`token0`/`token1` and paid inside their own callback, at most the hop input, in the input token read before the swap (source legs: the collateral); nothing is held at rest. Within that a fake pool can still keep the profit above `minProfit`, so route pools come from configured factories (`getPool`) | `test_route_poolAskingMoreThanInputGetsNothing`, `test_route_doubleCallbackRejected`, `test_swapCallbackFromStrangerRejected`, `test_route_poolCannotSwitchItsPaymentToken`, `test_route_sourceLegMustSellCollateral` |
 | Route not spending all seized collateral | explicit source legs must sum exactly to `seizedAssets` (`RouteSpendMismatch`); collateral a pool did not take (out of liquidity) is swept | `test_route_mustSpendExactlySeized`, `test_route_partialFillLeftoverIsSwept` |
-| Connector left in the contract | the pooled connector's remainder is swept to `PROFIT_RECEIVER` | `test_route_pooledConnectorRemainderIsSwept` |
+| Connector left in the contract | the pooled connector's remainder is paid out (by the shares) | `test_route_pooledConnectorRemainderIsSwept` |
+| Hybrid exit selling all or nothing by route, or a foreign step | the route must sell some but not all (`HybridSplit`; a zero hop is `BadRoute`); the steps stay allowlisted | `test_batch_hybrid_routeThenSteps`, `test_batch_hybrid_splitAndAllowlistEnforced` |
+| Profit shares changed or paid out by others | `setShares` owner-only and validated; `distribute` only reaches the recipients and is refused in flight (`Busy`) | `test_shares_ownerOnlyAndValidated`, `test_shares_distributeRefusedInFlightOpenOtherwise`, `test_shares_profitAndLeftoverAreSplit` |
 | Pool reporting positive output | every hop's output must be a negative delta (`BadRoute`) | `test_route_positiveOutputRejected` |
 | Malformed packed calldata | strict decoding, no selector collision with the ABI entries | `test_packed_malformedRejected`, `test_packed_noSelectorCollision`, `test_packedEntry_equalsAbiEntry` |
 | Emergency | the executor (hot wallet) or the owner may `pause` (an operator stop; the bot itself never calls it, its kill switch is a file), only the owner may resume | `test_pauseKillSwitch` |
@@ -361,15 +387,19 @@ protocol's liquidation target (`setAllowedProtocol`) and the aggregator router(s
 A solver contract for Chainlink SVR auctions run by Fastlane Atlas, written against the Atlas
 solver interface (`atlasSolverCall`), not derived from Atlas's own code. In the auction winner's
 slot Atlas calls `atlasSolverCall(solverOpFrom, executionEnvironment, bidToken, bidAmount,
-solverOpData, extraReturnData)`; `solverOpData` = `(SolverCall[] calls, SwapStep bidSwap, address
-profitToken, uint256 minProfit)`. The solver runs the calls (liquidations through a
-MorphoLiquidator deployed with the solver as executor and profit receiver), runs the bid swap
-(loan token -> WETH, `target = address(0)` = none), unwraps WETH as needed (keeping aside any ETH
+solverOpData, extraReturnData)`; `solverOpData` = `(SolverCall[] calls, address bidPool, address
+profitToken, uint256 minProfit, uint256 gasPayWei)` (v0.6.0: `bidPool` replaced the router
+`SwapStep bidSwap`). The solver runs the calls (liquidations through a MorphoLiquidator deployed
+with the solver as executor and profit receiver), buys exactly the bid plus `gasPayWei` of WETH on
+`bidPool` (an owner-allowlisted loan-token/WETH V3-style pool, exact output, paid inside its own
+swap callback: only the pool swapping, once, in the profit token, at most the profit token held;
+no allowance; `BidSwapShort` if it delivers less; `address(0)` = none; ~40k gas less than the
+router and its approvals), unwraps WETH as needed (keeping aside any ETH
 Atlas lent, so the bid never spends it) and pays the ETH bid to the execution environment, settles
 with Atlas (repays that loan and approves the gas liability read at the end through `reconcile`),
 checks `minProfit` on the profit token this call added AFTER the bid (a balance change: leftover
-collateral its liquidator sent it earlier never counts), sends the whole profit-token balance and
-any leftover WETH or ETH to `PROFIT_RECEIVER`, and returns the net profit. Constructor: `(atlas, weth, owner, executor,
+collateral its liquidator sent it earlier never counts), pays the whole profit-token balance and
+any leftover WETH or ETH out by the profit shares (see MorphoLiquidator), and returns the net profit. Constructor: `(atlas, weth, owner, executor,
 profitReceiver)`; `executor` is the solver operation signer.
 
 | Threat | Defence | Tests (`AtlasLiquidationSolver.security.t.sol`) |
@@ -377,7 +407,9 @@ profitReceiver)`; `executor` is the solver operation signer.
 | Someone other than Atlas calls it, or an op signed by someone else | `msg.sender == ATLAS` (`InvalidEntry`) and `solverOpFrom == executor` (`InvalidCaller`) | `test_onlyAtlasForTheSignersOperation` |
 | Non-ETH bids; emergency | ETH bids only (`UnsupportedBidToken`); the executor (signer) or the owner may `pause`, only the owner may `unpause` | `test_ethBidsOnlyAndPauseStopsIt` |
 | ETH that Atlas lent spent on the bid | the borrow liability (up to `msg.value`) is kept aside: WETH is unwrapped for bid + repayment, and the loan goes back through `reconcile` | `test_borrowedEthIsRepaidEvenWhenTheBidNeedsEth` |
-| Poisoned calls or bid swap | every call target and the bid-swap router must be owner-allowlisted; exact allowance reset | `test_callAndBidSwapTargetsMustBeAllowlisted` |
+| Poisoned calls or bid swap | every call target and the bid pool must be owner-allowlisted | `test_callAndBidSwapTargetsMustBeAllowlisted` |
+| Bid pool taking more, delivering less, or a stranger calling the swap callback | paid only inside its own swap, by the active pool, once, at most the profit token held; exact output checked (`BidSwapShort`); `minProfit` bounds what it may take | `test_onlyTheActiveBidPoolIsPaid`, `test_aShortBidSwapReverts`, `test_aGreedyBidPoolIsBoundedByMinProfit`, `test_theBidSwapFollowsThePoolsTokenOrder` |
+| Profit shares | as MorphoLiquidator: owner-only, validated, split on the spot (rounding to `PROFIT_RECEIVER`), `distribute` refused in flight | `test_theProfitIsSplitByTheShares`, `test_shareRoundingGoesToTheReceiver`, `test_onlyTheOwnerSetsValidShares`, `test_anyoneCanDistributeAStrayBalanceToTheRecipients`, `test_distributeIsRefusedDuringAnOperation` |
 | Bid larger than what the op earns | the bid must be bought and paid, and `minProfit` holds after it | `test_aBidTheSwapCannotFundReverts`, `test_minProfitIsCheckedAfterTheBid` |
 | Tokens already in the solver counted as this op's profit | `minProfit` is checked on the profit-token balance change of this call; the old balance is swept with it | `test_tokensAlreadyHereDoNotCountAsProfit` |
 | Admin by others | owner-only admin | `test_adminIsOwnerOnly` |
@@ -574,7 +606,9 @@ some pools (Aero) tax the priority fee.
   `submit`): below the min no op is submitted; each op must also have its maximum liability covered
   by the bond (see "The bond" below). Read every `BOND_CHECK_HEADS` heads and after an accepted op.
 - **Daily loss** (`[exec] daily_loss_limit_usd`): realized PnL = what settled block-path txs paid
-  `PROFIT_RECEIVER` (their receipts' ERC20 transfers of the tracked loan tokens) minus their gas,
+  out (their liquidator's `ProfitPaid` events, v0.6.0 — the whole payout however the profit shares
+  split it; a contract from before: their receipts' ERC20 transfers of the tracked loan tokens to
+  `PROFIT_RECEIVER`) minus their gas,
   minus the bond's net debits (failed ops' gas, won ops that paid less gas than charged; the bot's
   own unbonding is not a loss). Atlas income is not counted (an op's profit goes to
   `PROFIT_RECEIVER` from inside someone else's metacall), so the PnL is a lower bound and the stop
@@ -666,8 +700,12 @@ liquidator's address), and nothing when `exec.venue = "flash"`. It is the fallba
 no executable bundle, and (v0.5.0) also runs beside a one-position bundle, whose batch carries a flash
 loan and fixed gas the single op does not: the higher bid goes, the other is journaled as
 `batch_alt` / `single_alt`. `AtlasSolver::calldata` builds the
-call (the bid plus the gas pay are bought with one `exactOutputSingle` on `bid_router` unless the
-loan token is WETH; minProfit at `SOLVER_MIN_PROFIT`); `AtlasBid { solver, bid_wei, gas_pay_wei,
+call (the bid plus the gas pay are bought by the solver itself on the loan token's bid pool unless
+the loan token is WETH; minProfit at `SOLVER_MIN_PROFIT`). The bid pools (v0.6.0) come from
+`probe_bid_pools` (the loan-token/WETH pools of `bid_factory` at `bid_fee_tiers`, deepest first)
+and `choose_bid_pools` (a deployed solver: the deepest it allowlists — it refuses any other; an
+injected one: the deepest, allowlisted by the injection); a loan token with none is warned at start
+and its ops cannot pay a bid; `AtlasBid { solver, bid_wei, gas_pay_wei,
 gas_liability_wei }` implements
 `LiquidationVenue<Morpho>` with `swap_recipient()` = the solver's MorphoLiquidator, so the planner can
 also plan through it, aggregator routes included (they are built to deliver to that liquidator). `e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation`

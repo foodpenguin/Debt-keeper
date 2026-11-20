@@ -65,7 +65,7 @@
 - **以 fee 計價的模擬**：每個計畫的模擬（以及 direct 路由的每次 grid 報價）都帶上不加價送出時的 fee：`Planner::sim_fee` = max fee 為 2 × base fee + `priority_fee_wei`、priority 為 `priority_fee_wei`。會讀 `tx.gasprice` 的 venue（priority fee 稅、動態手續費）回應的就是實際交易會拿到的結果。
 - **以 USD 記帳**：`Plan::sim_profit` 是借款代幣單位；`profit_usd` = 它 × `loan_usd`；`gas_cost_usd` = 以規劃 priority 計的 L2 gas + L1 data fee（`l1_fee_usd` 單獨列出）；`net_usd` = `profit_usd - gas_cost_usd`。沒有借款代幣價格的市場會成為計畫錯誤。
 - 對模擬結果做**合理性檢查**（利潤和報價的差距、節點實際模擬的區塊）。
-- `quote_bundle` 把一個市場在同一個組合上的所有可清算倉位當成一次出場來估值（Atlas 估值用；一個 batch solver op 會清算全部）；`gross_usd` 以 USD 計，`gas_units` 是整個操作的估計 gas（清算 + swap + 固定開銷，來自呼叫者傳入的 `BundleGas`：Atlas solver op 用 `atlas_venue::ATLAS_BUNDLE_GAS`）。它同時產出一份可執行的 `BundlePlan`（部位全額 seize、flash loan 金額，以及單一的全額出場），由 `atlas_venue::AtlasSolver::batch_inner` 轉成 solver op 內層的 `liquidateBatch` 呼叫。v1 每個部位都全額清算、賣 100%，所以 direct 路線是一個「全額賣出」的配置（`v3router::allocate_full`，route 模式要剛好花掉 seize 的量）：所有格點單位都要分配出去，格點的捨入餘數加在單位最多的那條 leg 上，leg 的 gas 用拍賣的 gas 價格計算（v0.5.0 之前用的是區塊路徑的 gas 價格，而且配置必須剛好落在 seize 的量上，所以大約 80% 的 bundle 沒有 direct 路線）。出場路線用拍賣的 gas 價格比較（gas 在這裡是主導因素）。聚合器的每個 rung（gas 階梯的兩次報價）都和 direct 一起用**淨值（扣掉 gas）**評分，所以在 gas 貴的時候，低產出但 gas 省很多的強制收斂 rung 也可能勝出；哪些 rung、選了哪個都寫進 journal（`agg_rungs`）。但出價**不是用報價或估計值送出**：`batch_op` 先用**零出價**模擬一次（v0.5.0；gas pay 用估計值），量出出場實際拿回多少和真實 gas。出價基礎（`bid_basis_sim_usd`）是這個模擬出來的 gross（`gross_sim_usd`：profit 加上它買的 gas pay）減去整筆 metacall 的 gas（含 `METACALL_FIXED_GAS`，用「模擬 gas × `SIM_GAS_SAFETY`」計算），再扣掉 bid swap 的池子手續費。policy 依這個基礎出的價，在送出前會**再模擬一次**（第一次模擬沒有替出價本身的 bid swap 定價）；如果跑不過，就依序用出價的 99%、97% 重試（`RETRY_BID_SHARES`，`retries`）。單一倉位的 op 也用同樣的方式出價（`sim_bid_op`），用它自己模擬出來的 gas，而不是區塊路徑計畫的 gas。報價／估計值的基礎（`bid_basis_est_usd`、gas 下限）以及報價和模擬 gross 的差距（`quote_gap_bps`）都寫進 journal；預算和 bond 的 gas 責任仍然用保守的估計值。不論如何，鏈上的 `minProfit` 都保護扣掉出價和 gas 後的真實淨利。gas 以 `contracts/test/AtlasBundleGas.fork.t.sol` 校正（30 個部位的 batch 扣掉出場 swap 約 1.5M gas，每多一個約 34k）。
+- `quote_bundle` 把一個市場在同一個組合上的所有可清算倉位當成一次出場來估值（Atlas 估值用；一個 batch solver op 會清算全部）；`gross_usd` 以 USD 計，`gas_units` 是整個操作的估計 gas（清算 + swap + 固定開銷，來自呼叫者傳入的 `BundleGas`：Atlas solver op 用 `atlas_venue::ATLAS_BUNDLE_GAS`）。它同時產出一份可執行的 `BundlePlan`（部位全額 seize、flash loan 金額，以及單一的全額出場），由 `atlas_venue::AtlasSolver::batch_inner` 轉成 solver op 內層的 `liquidateBatch` 呼叫。v1 每個部位都全額清算、賣 100%，所以 direct 路線是一個「全額賣出」的配置（`v3router::allocate_full`，route 模式要剛好花掉 seize 的量）：所有格點單位都要分配出去，格點的捨入餘數加在單位最多的那條 leg 上，leg 的 gas 用拍賣的 gas 價格計算（v0.5.0 之前用的是區塊路徑的 gas 價格，而且配置必須剛好落在 seize 的量上，所以大約 80% 的 bundle 沒有 direct 路線）。出場路線用拍賣的 gas 價格比較（gas 在這裡是主導因素）。拍賣路徑上也會評估混合出場（v0.6.0）：direct 路線賣整包的 `HYBRID_DIRECT_SHARES_BPS`（25/50/75%），剛好那麼多個格點單位（`v3router::allocate_units`），取扣掉 gas 後最好的拆法；剩下的交給聚合器，用剩下的量另外報價（多 3 次聚合器報價，平行進行；只有 bonus 達到 `[atlas] min_bonus_usd` 的市場才做），再加上 `HYBRID_EXTRA_GAS`。direct、各個聚合器 rung 和各個混合出場中，淨值最高的勝出（`hybrid_net_usd` 會寫進 journal）；混合出場勝出時，build 它的聚合器部分，編碼成 `MODE_HYBRID` 出場（`BundlePlan::hybrid`）。兩部分是在同一個狀態下報價的，但執行時 direct 那部分先交易；聚合器的路線如果經過同樣的池子，拿到的會比報價少，超過滑點上限就 revert。所以混合出場勝出時，也會 build 最好的單一出場（`alt_plan`）；混合出場的 op 跑不過時，batch op 改用它（journal 記為 `hybrid_alt`）。聚合器的每個 rung（gas 階梯的兩次報價）都和 direct 一起用**淨值（扣掉 gas）**評分，所以在 gas 貴的時候，低產出但 gas 省很多的強制收斂 rung 也可能勝出；哪些 rung、選了哪個都寫進 journal（`agg_rungs`）。但出價**不是用報價或估計值送出**：`batch_op` 先用**零出價**模擬一次（v0.5.0；gas pay 用估計值），量出出場實際拿回多少和真實 gas。出價基礎（`bid_basis_sim_usd`）是這個模擬出來的 gross（`gross_sim_usd`：profit 加上它買的 gas pay）減去整筆 metacall 的 gas（含 `METACALL_FIXED_GAS`，用「模擬 gas × `SIM_GAS_SAFETY`」計算），再扣掉 bid swap 的池子手續費。policy 依這個基礎出的價，在送出前會**再模擬一次**（第一次模擬沒有替出價本身的 bid swap 定價）；如果跑不過，就依序用出價的 99%、97% 重試（`RETRY_BID_SHARES`，`retries`）。單一倉位的 op 也用同樣的方式出價（`sim_bid_op`），用它自己模擬出來的 gas，而不是區塊路徑計畫的 gas。報價／估計值的基礎（`bid_basis_est_usd`、gas 下限）以及報價和模擬 gross 的差距（`quote_gap_bps`）都寫進 journal；預算和 bond 的 gas 責任仍然用保守的估計值。不論如何，鏈上的 `minProfit` 都保護扣掉出價和 gas 後的真實淨利。gas 以 `contracts/test/AtlasBundleGas.fork.t.sol` 校正（30 個部位的 batch 扣掉出場 swap 約 1.5M gas，每多一個約 34k）。
 
 ### `LiquidationVenue<L>`（`bot/src/venue.rs`）
 
@@ -105,9 +105,17 @@
 
 - `liquidate(params, borrower, seizedAssets, repaidShares, swaps, minProfit, deadlineBlock)`（ABI 入口，聚合器 swap）、`liquidateRoute` 和 packed `fallback`（direct 路線，精簡 calldata）。只有 `executor` 能呼叫。
 - Morpho 先轉出抵押品，再呼叫 `onMorphoLiquidate(repaidAssets, data)`，swap 在這裡執行；之後 Morpho 收回還款（由 `approveMorpho` 設定的常設授權）。
-- `liquidateBatch(params, items, flashAssets, exit, minProfit, deadlineBlock)`（ABI 入口和 packed `fallback` tag `0x01`），給 Atlas solver op 用：一次 Morpho `flashLoan` 資助同一個市場的 N 筆 `liquidate`（callback data 是空的，所以 Morpho 透過常設授權收回每一筆還款），最後一次 `exit`（direct 路線必須剛好賣掉全部 seize，或走白名單的聚合器步驟）把所有抵押品賣掉。`onMorphoFlashLoan` 只在我們自己的 batch 執行中有效（`inBatch` transient flag、Morpho 是 sender、只執行一次，否則 `NotFunded`），而且收到的抵押品必須等於 seize 的總和。
-- callback 結束後，合約檢查借款代幣的增加量 ≥ `minProfit`，把利潤送到 immutable 的 `PROFIT_RECEIVER`，平常不留存任何資金。
-- 管理功能：`setExecutor`、`setAllowedTarget`、`approveMorpho`、`pause`（owner 或 executor）/ `unpause`（owner）、兩步驟的 `transferOwnership` / `acceptOwnership`、`rescue`。
+- `liquidateBatch(params, items, flashAssets, exit, minProfit, deadlineBlock)`（ABI 入口和 packed `fallback` tag `0x01`），給 Atlas solver op 用：一次 Morpho `flashLoan` 資助同一個市場的 N 筆 `liquidate`（callback data 是空的，所以 Morpho 透過常設授權收回每一筆還款），最後一次 `exit` 把所有抵押品賣掉：direct 路線必須剛好賣掉全部 seize；或走白名單的聚合器步驟；或（v0.6.0 `MODE_HYBRID`）direct 路線賣一部分、白名單的聚合器步驟賣剩下的（路線必須賣一些但不能全部，否則 `HybridSplit`）。`onMorphoFlashLoan` 只在我們自己的 batch 執行中有效（`inBatch` transient flag、Morpho 是 sender、只執行一次，否則 `NotFunded`），而且收到的抵押品必須等於 seize 的總和。
+- callback 結束後，合約檢查借款代幣的增加量 ≥ `minProfit`，把利潤付出去，平常不留存任何資金。
+- **利潤分潤**（`ProfitShares.sol`，v0.6.0；liquidator 和 solver 都繼承它）：
+  - 每一筆付款當下就分：利潤、沒賣掉的抵押品、connector 零頭，solver 的 WETH 和 ETH 也一樣。
+  - 收款者：最多 `MAX_SHARES`（4）個額外收款者，各自的 bps 由 owner 用 `setShares` 設定（只限 owner；地址不能是零、不能重複，總和 ≤ 10000；空陣列 = 不分）。剩下的部分，包含捨入差額，給 immutable 的 `PROFIT_RECEIVER`。
+  - 每筆付款發出一次 `ProfitPaid(token, amount)`，金額是總額，不論怎麼分。bot 的損益就是讀這個事件。
+  - `minProfit` 在分之前，用利潤總額檢查。
+  - `distribute(token)` / `distributeEth()`：把誤留在合約裡的餘額照比例分出去。任何人都能呼叫，因為錢只會去設定好的收款者；但合約自己的交易執行中不行（`Busy`）。
+  - 付不出去的分潤，改給 `PROFIT_RECEIVER`，並發出 `ShareSkipped`。例如代幣封鎖了收款者、收款者拒收 ETH，或收 ETH 用掉超過 `SHARE_ETH_GAS`（5 萬）。這樣一個有問題的收款者，不會讓每一筆清算都 revert。
+  - 成本：每多一個收款者，每筆付款多一次轉帳，約 1～3 萬 gas。
+- 管理功能：`setExecutor`、`setAllowedTarget`、`approveMorpho`、`setShares`、`pause`（owner 或 executor）/ `unpause`（owner）、兩步驟的 `transferOwnership` / `acceptOwnership`、`rescue`。
 
 ### 安全模型
 
@@ -122,7 +130,9 @@
 | 利潤不足 | `minProfit` 檢查借款代幣的餘額差（含 fuzz） | `test_minProfitEnforced`、`testFuzz_profitAtLeastMin` |
 | direct 路線裡的假池子 | 只呼叫池子的 `swap`/`token0`/`token1`，只在它自己的 callback 裡付款、最多付該跳輸入，付的是 swap 前讀好的輸入代幣（來源 leg 為抵押品）；平常不留存資金。在這些限制內，假池子仍可拿走 `minProfit` 以上的利潤，所以路線池子必須來自設定的 factory（`getPool`） | `test_route_poolAskingMoreThanInputGetsNothing`、`test_route_doubleCallbackRejected`、`test_swapCallbackFromStrangerRejected`、`test_route_poolCannotSwitchItsPaymentToken`、`test_route_sourceLegMustSellCollateral` |
 | 路線沒用完沒收的抵押品 | 明確金額的來源 leg 加總必須剛好等於 `seizedAssets`（`RouteSpendMismatch`）；池子沒吃下的抵押品（流動性用完）會被清走 | `test_route_mustSpendExactlySeized`、`test_route_partialFillLeftoverIsSwept` |
-| connector 留在合約裡 | 共用 connector 的餘額會清到 `PROFIT_RECEIVER` | `test_route_pooledConnectorRemainderIsSwept` |
+| connector 留在合約裡 | 共用 connector 的餘額會照分潤付出去 | `test_route_pooledConnectorRemainderIsSwept` |
+| 混合出場的路線全賣或全不賣，或混進白名單外的步驟 | 路線必須賣一些但不能全部（`HybridSplit`；零量的跳會先被 `BadRoute` 擋下）；步驟仍要在白名單內 | `test_batch_hybrid_routeThenSteps`、`test_batch_hybrid_splitAndAllowlistEnforced` |
+| 分潤被別人修改或提領 | `setShares` 只限 owner 而且會驗證；`distribute` 只會付給收款者，執行中會被拒絕（`Busy`） | `test_shares_ownerOnlyAndValidated`、`test_shares_distributeRefusedInFlightOpenOtherwise`、`test_shares_profitAndLeftoverAreSplit` |
 | 池子回報正的產出 | 每一跳的產出必須是負的 delta（`BadRoute`） | `test_route_positiveOutputRejected` |
 | 格式錯誤的 packed calldata | 嚴格解碼，不和 ABI 入口的 selector 衝突 | `test_packed_malformedRejected`、`test_packed_noSelectorCollision`、`test_packedEntry_equalsAbiEntry` |
 | 緊急狀況 | executor（熱錢包）或 owner 可以 `pause`（給操作者手動停用；bot 本身從不呼叫，它的緊急停止是一個檔案），只有 owner 能恢復 | `test_pauseKillSwitch` |
@@ -164,14 +174,16 @@ gas 基準測試在 `contracts/test/MorphoLiquidator.gas.fork.t.sol`（`forge te
 
 ## 鏈上：`contracts/src/AtlasLiquidationSolver.sol`（只模擬）
 
-給 Fastlane Atlas 舉辦的 Chainlink SVR 拍賣用的 solver 合約，依 Atlas 的 solver 介面（`atlasSolverCall`）自行撰寫，不是從 Atlas 的程式碼改來的。在得標者的時段裡，Atlas 會呼叫 `atlasSolverCall(solverOpFrom, executionEnvironment, bidToken, bidAmount, solverOpData, extraReturnData)`；`solverOpData` = `(SolverCall[] calls, SwapStep bidSwap, address profitToken, uint256 minProfit)`。solver 依序執行 calls（透過一個以 solver 為 executor 和利潤接收者的 MorphoLiquidator 清算）、執行出價用的 swap（借款代幣 -> WETH；`target = address(0)` 表示不需要）、視需要把 WETH 換回 ETH（Atlas 借出的 ETH 會先保留，出價不會動用）並把 ETH 出價付給 execution environment、和 Atlas 結算（透過 `reconcile` 還清借款，並核准最後讀到的 gas 負債）、檢查**扣掉出價後**這次呼叫增加的利潤代幣 ≥ `minProfit`（以餘額差計算：清算合約之前送進來的剩餘抵押品不算）、把利潤代幣的全部餘額和剩餘的 WETH 或 ETH 送到 `PROFIT_RECEIVER`，並回傳淨利潤。constructor：`(atlas, weth, owner, executor, profitReceiver)`；`executor` 是 solver operation 的簽名者。
+給 Fastlane Atlas 舉辦的 Chainlink SVR 拍賣用的 solver 合約，依 Atlas 的 solver 介面（`atlasSolverCall`）自行撰寫，不是從 Atlas 的程式碼改來的。在得標者的時段裡，Atlas 會呼叫 `atlasSolverCall(solverOpFrom, executionEnvironment, bidToken, bidAmount, solverOpData, extraReturnData)`；`solverOpData` = `(SolverCall[] calls, address bidPool, address profitToken, uint256 minProfit, uint256 gasPayWei)`（v0.6.0：`bidPool` 取代了原本走 router 的 `SwapStep bidSwap`）。solver 依序執行 calls（透過一個以 solver 為 executor 和利潤接收者的 MorphoLiquidator 清算）、在 `bidPool` 上剛好買進出價加 `gasPayWei` 的 WETH（owner 白名單裡的借款代幣/WETH V3 類池子，exact output，在它自己的 swap callback 裡付款：只有正在 swap 的池子、只付一次、只用利潤代幣付、最多付當下持有的量；不給授權；給得比要求少就 `BidSwapShort`；`address(0)` 表示不需要；比走 router 加授權少約 4 萬 gas）、視需要把 WETH 換回 ETH（Atlas 借出的 ETH 會先保留，出價不會動用）並把 ETH 出價付給 execution environment、和 Atlas 結算（透過 `reconcile` 還清借款，並核准最後讀到的 gas 負債）、檢查**扣掉出價後**這次呼叫增加的利潤代幣 ≥ `minProfit`（以餘額差計算：清算合約之前送進來的剩餘抵押品不算）、把利潤代幣的全部餘額和剩餘的 WETH 或 ETH 照分潤付出去（見 MorphoLiquidator），並回傳淨利潤。constructor：`(atlas, weth, owner, executor, profitReceiver)`；`executor` 是 solver operation 的簽名者。
 
 | 威脅 | 防護 | 測試（`AtlasLiquidationSolver.security.t.sol`） |
 |---|---|---|
 | Atlas 以外的人呼叫，或別人簽的 op | `msg.sender == ATLAS`（`InvalidEntry`）且 `solverOpFrom == executor`（`InvalidCaller`） | `test_onlyAtlasForTheSignersOperation` |
 | 非 ETH 出價；緊急狀況 | 只接受 ETH 出價（`UnsupportedBidToken`）；executor（簽名者）或 owner 可以 `pause`，只有 owner 能 `unpause` | `test_ethBidsOnlyAndPauseStopsIt` |
 | Atlas 借出的 ETH 被拿去付出價 | 借款負債（最多到 `msg.value`）會先保留：WETH 換回足夠付出價加還款的 ETH，借款再透過 `reconcile` 還回 | `test_borrowedEthIsRepaidEvenWhenTheBidNeedsEth` |
-| 被汙染的呼叫或出價 swap | 每個呼叫目標和出價 swap 的 router 都必須在 owner 白名單裡；授權用完歸零 | `test_callAndBidSwapTargetsMustBeAllowlisted` |
+| 被汙染的呼叫或出價 swap | 每個呼叫目標和出價用的池子都必須在 owner 白名單裡 | `test_callAndBidSwapTargetsMustBeAllowlisted` |
+| 出價池子多拿、少給，或陌生人呼叫 swap callback | 只在它自己的 swap 裡、由正在 swap 的池子付款、只付一次、最多付當下持有的利潤代幣；檢查 exact output（`BidSwapShort`）；`minProfit` 限制它能拿多少 | `test_onlyTheActiveBidPoolIsPaid`、`test_aShortBidSwapReverts`、`test_aGreedyBidPoolIsBoundedByMinProfit`、`test_theBidSwapFollowsThePoolsTokenOrder` |
+| 利潤分潤 | 和 MorphoLiquidator 相同：只限 owner、會驗證、當下就分（捨入給 `PROFIT_RECEIVER`）、執行中拒絕 `distribute` | `test_theProfitIsSplitByTheShares`、`test_shareRoundingGoesToTheReceiver`、`test_onlyTheOwnerSetsValidShares`、`test_anyoneCanDistributeAStrayBalanceToTheRecipients`、`test_distributeIsRefusedDuringAnOperation` |
 | 出價超過這個 op 賺到的 | 出價必須買得到、付得出，而且扣掉後仍要 ≥ `minProfit` | `test_aBidTheSwapCannotFundReverts`、`test_minProfitIsCheckedAfterTheBid` |
 | solver 裡原有的代幣被算成這個 op 的利潤 | `minProfit` 檢查這次呼叫的利潤代幣餘額差；原有餘額一起清走 | `test_tokensAlreadyHereDoNotCountAsProfit` |
 | 別人做管理操作 | 管理功能只限 owner | `test_adminIsOwnerOnly` |
@@ -258,7 +270,7 @@ priority fee 依鏈上看到的競爭來決定。追蹤市場裡的每一筆清�
 - **單筆**（`[exec] max_tx_cost_eth`，預設 0.002）：區塊路徑交易的最壞成本 `gas_limit × (2 × base fee + priority) + L1 fee` 必須放得進去。出價會被截到放得進；截完低於基本 priority，或不高於預測的對手出價，就不送（送了也是輸）。只在 `send_approved` 檢查一次，在 policy 之後。
 - **每個 UTC 日的失敗 gas**（`[exec] daily_gas_budget_usd`）：在飛的交易先預留最壞成本，revert 時扣實際成本。
 - **Atlas bond 的上下限**（`[atlas.solver] bond_min_eth` / `bond_max_eth`，沒有預設值，`submit` 時必填）：低於下限就不送 op；每個 op 的最大責任也必須由 bond 蓋住（見下方「bond」一節）。每 `BOND_CHECK_HEADS` 個 head 讀一次，op 被接受後也讀。
-- **每日虧損**（`[exec] daily_loss_limit_usd`）：已實現損益 = 結算的區塊路徑交易付給 `PROFIT_RECEIVER` 的金額（receipt 裡追蹤市場借款代幣的 ERC20 轉帳）減去 gas，再減去 bond 的淨扣除（失敗 op 的 gas、得標 op 付得比實際 gas 費少的部分；bot 自己的 unbond 不算虧損）。Atlas 的收入不計入（op 的利潤從別人的 metacall 裡付給 `PROFIT_RECEIVER`），所以損益只是下限，停機只會提早、不會延遲。超過上限就寫入 kill switch 檔案，要由人刪掉檔案才會恢復送單。
+- **每日虧損**（`[exec] daily_loss_limit_usd`）：已實現損益 = 結算的區塊路徑交易付出的利潤減去 gas。付出的利潤這樣算：v0.6.0 的合約讀 liquidator 的 `ProfitPaid` 事件，金額是總額，不論分潤怎麼分；更早的合約則讀 receipt 裡轉給 `PROFIT_RECEIVER` 的追蹤市場借款代幣 ERC20 轉帳。損益另外再減去 bond 的淨扣除（失敗 op 的 gas、得標 op 付得比實際 gas 費少的部分；bot 自己的 unbond 不算虧損）。Atlas 的收入不計入（op 的利潤從別人的 metacall 裡付給 `PROFIT_RECEIVER`），所以損益只是下限，停機只會提早、不會延遲。超過上限就寫入 kill switch 檔案，要由人刪掉檔案才會恢復送單。
 
 被這些上限擋下的送單會寫進 journal（`kind: "refused"`、`reason`、`worst_eth`、`cap_eth`）。實跑時，當天的失敗 gas、Atlas 當日帳（見下方）、最後一次 bond 讀數、已從 bond 取出但還沒轉出的 ETH，以及損益，存在帳本檔（第一行 `v1`，第二行 JSON；`[exec] ledger_file`，預設和共用的 nonce 檔放在一起），啟動時讀回；讀不懂的檔案會讓實跑拒絕啟動（v0.4.0 以前的帳本照樣讀得懂，Atlas 當日帳從零開始）。
 
@@ -285,7 +297,12 @@ Atlas 拍賣用拍賣的 median 估值：`PriceModel::preview` 換掉一個 aggr
 
 **執行標籤（`[atlas] resim`，預設開啟）。**拍賣是在它的 head 估值，但要等 metacall 上鏈（約晚 18 個區塊）才執行；小幣下跌時，出場的池子在這段時間可能變動很大。每個會賺錢的 solver op 都會被保留下來（`PendingResim`），等到同一個 aggregator 的 SVR secondary 上鏈（`OracleLogEvent::Secondary`，在 head 之後、deadline + `RESIM_GRACE_BLOCKS` 之前）。然後模擬三次：在 head 和 metacall 前一個區塊各用零出價模擬一次（兩次都是扣掉 gas 後的價值，差額就是漂移），再在前一個區塊用實際出價模擬一次（看它會不會成功）。每個 op 一列 `atlas_resim` journal：`value_head_usd`、`value_exec_usd`、`drift_usd`、`bid_ok`、`bid_profit_usd`，加上 `bonus_usd`、`bid_usd`、`router` 和錯誤訊息；拍賣始終沒有執行的 op 記為 `outcome: "not_executed"`。標籤一次只模擬一個（`resim_permits`），用的是 op 實際送出時的 gas pay。依市場的漂移打折就是用這些標籤校準。
 
-**Solver venue（`bot/src/atlas_venue.rs`，只模擬）。**設定 `[atlas.solver] simulate = true` 時，每場被估值的拍賣裡，每個市場在 journal 裡會多一個 `solver` 欄位（`runner.rs` 的 `solver_op`）：把最大倉位的直接路由計畫包進 `atlasSolverCall`，出價方式和 batch op 相同（`sim_bid_op`，v0.5.0：依模擬出來的所得減去整筆 metacall 的 gas，gas 用它自己模擬出來的值，再用這個出價驗證一次；之前是用計畫的 `profit_usd` 和區塊路徑比較輕的 gas），並像 Atlas 那樣呼叫來模擬。Atlas 地址上注入 `AtlasStub.sol`（在 storage slot 0 回報 bot 為這個 op 算出的 gas 責任），solver 和它的 MorphoLiquidator 沒部署時也會注入；結果包含這次呼叫的 L1 fee。op 用賣出所得以 ETH 付自己的 gas（`gasPayWei`，見「bond」一節），所以 journal 裡扣掉出價後的淨利（`net_after_bid`、`net_after_bid_usd`）也已經扣掉 gas（`gas_pay_eth`）。`solver_op` 只包直接路由的計畫（既有計畫的聚合器 calldata 是為直接清算合約的地址產生的）；`exec.venue = "flash"` 時整個跳過。市場沒有可執行的 bundle 時，它是後備；（v0.5.0）bundle 只有一個倉位時也會一起跑，因為 batch 多了 flash loan 和固定 gas，單一 op 沒有這些成本：出價較高的那個送出，另一個以 `batch_alt` / `single_alt` 記進 journal。`AtlasSolver::calldata` 產生呼叫（借款代幣不是 WETH 時，在 `bid_router` 上用一次 `exactOutputSingle` 買出價加 gas 要用的 WETH；minProfit 在 `SOLVER_MIN_PROFIT`）；`AtlasBid { solver, bid_wei, gas_pay_wei, gas_liability_wei }` 實作 `LiquidationVenue<Morpho>`，其 `swap_recipient()` 是 solver 的 MorphoLiquidator，所以 planner 也能直接透過它規劃，包含聚合器路線（路線會送到那個清算合約）。`e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation` 在 anvil fork 上驗證它。
+**Solver venue（`bot/src/atlas_venue.rs`，只模擬）。**設定 `[atlas.solver] simulate = true` 時，每場被估值的拍賣裡，每個市場在 journal 裡會多一個 `solver` 欄位（`runner.rs` 的 `solver_op`）：把最大倉位的直接路由計畫包進 `atlasSolverCall`，出價方式和 batch op 相同（`sim_bid_op`，v0.5.0：依模擬出來的所得減去整筆 metacall 的 gas，gas 用它自己模擬出來的值，再用這個出價驗證一次；之前是用計畫的 `profit_usd` 和區塊路徑比較輕的 gas），並像 Atlas 那樣呼叫來模擬。Atlas 地址上注入 `AtlasStub.sol`（在 storage slot 0 回報 bot 為這個 op 算出的 gas 責任），solver 和它的 MorphoLiquidator 沒部署時也會注入；結果包含這次呼叫的 L1 fee。op 用賣出所得以 ETH 付自己的 gas（`gasPayWei`，見「bond」一節），所以 journal 裡扣掉出價後的淨利（`net_after_bid`、`net_after_bid_usd`）也已經扣掉 gas（`gas_pay_eth`）。`solver_op` 只包直接路由的計畫（既有計畫的聚合器 calldata 是為直接清算合約的地址產生的）；`exec.venue = "flash"` 時整個跳過。市場沒有可執行的 bundle 時，它是後備；（v0.5.0）bundle 只有一個倉位時也會一起跑，因為 batch 多了 flash loan 和固定 gas，單一 op 沒有這些成本：出價較高的那個送出，另一個以 `batch_alt` / `single_alt` 記進 journal。`AtlasSolver::calldata` 產生呼叫。借款代幣不是 WETH 時，由 solver 自己在該借款代幣的出價池上買出價加 gas 要用的 WETH；minProfit 在 `SOLVER_MIN_PROFIT`。出價池（v0.6.0）的來源：
+- `probe_bid_pools`：在 `bid_factory` 的 `bid_fee_tiers` 各費率裡，找借款代幣/WETH 的池子，最深的排前面。
+- `choose_bid_pools`：已部署的 solver 選它白名單裡最深的那個，因為白名單外的池子會被它拒絕；注入的 solver 直接選最深的，並由注入程式加進白名單。
+- 找不到池子的借款代幣：啟動時發出警告，它的 op 付不了出價。
+
+此外，`AtlasBid { solver, bid_wei, gas_pay_wei, gas_liability_wei }` 實作 `LiquidationVenue<Morpho>`，其 `swap_recipient()` 是 solver 的 MorphoLiquidator，所以 planner 也能直接透過它規劃，包含聚合器路線（路線會送到那個清算合約）。`e2e_atlas_solver_op_pays_its_bid_out_of_the_liquidation` 在 anvil fork 上驗證它。
 
 **送出 solver operation（`bot/src/atlas_submit.rs`）。**在實跑模式下設定 `[atlas.solver] submit = true` 時，扣掉出價後模擬仍有利潤的 solver op 會被組出、簽名並送到拍賣（`runner.rs` 的 `submit_solver_op`）：
 
