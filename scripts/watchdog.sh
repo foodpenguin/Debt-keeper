@@ -11,6 +11,9 @@
 #   - bot process gone (re-mailed every DOWN_REALERT_HOURS while still down; the instruction depends
 #     on MODE: shadow = systemd restarts it, live = restart by hand), or no block for STALE_SECS
 #   - LIVE tx SENT / LIVE tx outcome / LIVE send failed / HALTED / "sending paused" / "cannot cover worst-case gas" / atlETH bond above bond_max_eth or an auto-withdraw step
+#   - Atlas: solver op SUBMITTED / submission failed (refused, unreachable) / refused after its
+#     submission timed out / an endpoint error matched to no request / bid socket not connected at
+#     start / bid socket down (lost or failing to connect) for BID_DOWN_SECS, and again once it is back
 #   - hot wallet below MIN_HOT_ETH (checked hourly)
 #   - blocks reaching the bot late: median head_age_ms above HEAD_LAG_MS for LAG_CHECKS checks in a
 #     row (re-measure the baseline on each host; about +680 ms on the old WSL host)
@@ -56,6 +59,9 @@ CRASH_LIQS="${CRASH_LIQS:-20}"
 # "oracle logs missed an update" lines happen occasionally; only mail when more than this many land
 # in one clock hour (the design target is < 1/hour on average).
 MISSED_PER_HOUR="${MISSED_PER_HOUR:-3}"
+# Atlas bid socket: mail when it stays down (lost, or connects failing) this long; a reconnect within
+# it is normal (an endpoint restart or a dropped idle connection).
+BID_DOWN_SECS="${BID_DOWN_SECS:-120}"
 SUMMARY_HOUR="${SUMMARY_HOUR:-09}"
 WATCH_TZ="${WATCH_TZ:-UTC}"   # time zone of SUMMARY_HOUR and of the timestamps in mails
 MAX_MAILS_PER_HOUR="${MAX_MAILS_PER_HOUR:-6}"
@@ -170,7 +176,7 @@ check() {
   fi
   if [[ -n "$new" ]]; then
     local ev
-    ev=$(grep -E 'LIVE tx SENT|LIVE tx outcome|LIVE send failed|HALTED|sending paused|cannot cover worst-case gas|balance check failed|fell behind|kill switch written|atlas_dropped|ATLAS solver op SUBMITTED|above atlas.solver.bond_max_eth|bond auto-withdraw' <<<"$new" | cut -c1-400 || true)
+    ev=$(grep -E 'LIVE tx SENT|LIVE tx outcome|LIVE send failed|HALTED|sending paused|cannot cover worst-case gas|balance check failed|fell behind|kill switch written|atlas_dropped|ATLAS solver op SUBMITTED|ATLAS solver op submission failed|ATLAS solver op refused after|ATLAS bid endpoint error not matched|ATLAS bid socket not connected|above atlas.solver.bond_max_eth|bond auto-withdraw' <<<"$new" | cut -c1-400 || true)
     [[ -n "$ev" ]] && alerts+=("log events:"$'\n'"$ev")
     # counters for the daily summary
     put n_blocks $(( $(get n_blocks 0) + $(grep -c 'runner: block ' <<<"$new" || true) ))
@@ -194,6 +200,14 @@ check() {
       alerts+=("$(get hr_missed 0) 'oracle logs missed an update' this hour (> ${MISSED_PER_HOUR}): oracle log stream dropping events, or the SVR cutoff is wrong")
       put missed_alerted 1
     fi
+    # Atlas bid socket state: the last of connected / lost / connect failed in these lines.
+    local bid; bid=$(grep -oE 'atlas bid socket (connected|lost|connect failed)' <<<"$new" | tail -1 || true)
+    if [[ "$bid" == *connected ]]; then
+      [[ "$(get bid_alerted 0)" == 1 ]] && alerts+=("Atlas bid socket connected again")
+      put bid_down_at 0; put bid_alerted 0
+    elif [[ -n "$bid" && "$(get bid_down_at 0)" == 0 ]]; then
+      put bid_down_at "$t"
+    fi
     put n_liq $(( $(get n_liq 0) + $(grep -c 'LIQUIDATION observed' <<<"$new" || true) ))
     grep 'LIQUIDATION observed' <<<"$new" | cut -c1-300 >> "$STATE/liq_today" || true
     # head latency: median head_age_ms of this check's blocks
@@ -216,6 +230,11 @@ check() {
 
   # 3. stale: no block processed recently (only meaningful while the process runs)
   if bot_running; then
+    local bid_down; bid_down=$(get bid_down_at 0)
+    if (( bid_down > 0 && t - bid_down >= BID_DOWN_SECS )) && [[ "$(get bid_alerted 0)" == 0 ]]; then
+      alerts+=("Atlas bid socket down for $(( t - bid_down ))s (lost / connect failing, see 'atlas bid socket' lines): no solver op can be submitted until it reconnects")
+      put bid_alerted 1
+    fi
     local last ts age
     last=$(tac "$LOG" 2>/dev/null | strip_ansi | grep -m1 'runner: block ' | cut -c1-19)
     if [[ -n "$last" ]]; then

@@ -266,6 +266,9 @@ pub struct SolverConfig {
     /// the signer = the hot wallet, and at least `bond_min_eth` atlETH bonded by it.
     #[serde(default)]
     pub submit: bool,
+    /// The bid endpoint's WebSocket (`ws://` / `wss://`): the SVR gateway takes
+    /// `solver_submitSolverOperation` only over its solver WebSocket (its HTTP root answers
+    /// "Method not found"), so an `http(s)://` endpoint is refused by `validate` with `submit`.
     #[serde(default = "default_bid_endpoint")]
     pub endpoint: String,
     /// atlETH bonded by the signer below which no solver op is submitted (and an alert is logged):
@@ -525,6 +528,10 @@ mod tests {
         assert!(cfg.validate().unwrap_err().to_string().contains("0 < bond_min_eth < bond_max_eth"));
         cfg.atlas.solver.bond_max_eth = Some(3.0);
         assert!(cfg.validate().is_ok());
+        assert!(cfg.atlas.solver.endpoint.starts_with("wss://"), "the default bid endpoint is the WebSocket");
+        cfg.atlas.solver.endpoint = "https://svr-bid-endpoint.chain.link/".into();
+        assert!(cfg.validate().unwrap_err().to_string().contains("must be the bid endpoint's WebSocket"));
+        cfg.atlas.solver.endpoint = default_bid_endpoint();
         cfg.atlas.solver.submit = false;
         cfg.atlas.solver.bond_min_eth = None;
         assert!(cfg.validate().is_ok(), "not submitting: no band needed");
@@ -980,6 +987,11 @@ impl Config {
                 anyhow::bail!("[atlas.solver] submit = true needs bond_min_eth and bond_max_eth (the bond band; no defaults)");
             };
             anyhow::ensure!(min > 0.0 && max > min, "[atlas.solver] bond_min_eth = {min} and bond_max_eth = {max}: need 0 < bond_min_eth < bond_max_eth");
+            anyhow::ensure!(
+                s.endpoint.starts_with("wss://") || s.endpoint.starts_with("ws://"),
+                "[atlas.solver] endpoint = {:?}: must be the bid endpoint's WebSocket (ws:// or wss://); its HTTP JSON-RPC does not take solver_submitSolverOperation",
+                s.endpoint
+            );
         }
         Ok(())
     }

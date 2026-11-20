@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+Atlas bids are now submitted over the bid endpoint's WebSocket. **Fix for live bidding:** the first
+live submissions were refused with -32601 "Method not found", because the SVR gateway's HTTP root
+does not have `solver_submitSolverOperation`; only its solver WebSocket does.
+
+- `[atlas.solver] endpoint` now defaults to `wss://svr-bid-endpoint.chain.link/ws/solver`, and an
+  `http(s)://` endpoint is refused at config load when `submit = true`. A config that set the old
+  HTTP endpoint explicitly must drop it or change it to the WebSocket.
+- `atlas_submit::BidSocket`: one standing socket for submissions (separate from the auction feed),
+  connected at start, pinged while idle and reconnected in the background; answers matched by
+  JSON-RPC id (number or numeric string; an error with `"id": null` goes to the only request in
+  flight). Each submission waits at most `SUBMIT_TIMEOUT` (1 s). Accepted = `"result": null` (or
+  `"null"`); an `error` = refused; never written = not submitted; written but unanswered (no answer
+  in time, or the socket lost after the write) = treated as submitted (journal
+  `answer: "unanswered: <why>"`, slot and liability kept, Atlas result tracked). A late answer is
+  logged (`ATLAS solver op refused after its submission timed out`).
+- Dead-socket detection: a written request unanswered for 3 s, 15 s of silence (pings every 5 s),
+  or a write not done in 1 s reconnects. Backoff (250 ms doubling to 10 s) is reset only by a
+  connection that lasted 30 s, so an endpoint that accepts and closes is not hammered.
+- An auction's remaining ops are not tried once one failed with the socket down (each would wait
+  out the timeout).
+- Start: `ATLAS bid socket not connected after 10 s` is logged loudly if the socket cannot connect
+  (not fatal; it keeps reconnecting).
+- Watchdog: mails `ATLAS solver op submission failed`, a late refusal, an unmatched endpoint error,
+  `ATLAS bid socket not connected`, and the bid socket down for `BID_DOWN_SECS` (default 120 s) then
+  back; before, refused submissions only showed up as "liquidations and none of our txs".
+- Tests: mock-socket unit tests (answer, refusal, string/null ids, silence, late answer, drop after
+  the write + reconnect, half-open reconnect, accept-then-close backoff, unreachable) and an
+  `--ignored` network test that sends an op signed by a random unbonded key for an unknown auction
+  to the real endpoint and requires "Auction not found" (parsed), not a method/format error.
+
 ## v0.4.2 (2026-11-19)
 
 Atlas exit-gas optimisation: the batch solver op now chooses its exit by value net of gas and bids

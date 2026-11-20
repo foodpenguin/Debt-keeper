@@ -596,7 +596,13 @@ async fn build_submitter<P: Provider>(engine: &MorphoEngine<P>, signer: Option<&
     let domain = atlas_submit::read_domain(p, atlas).await?;
     let gas_limit = atlas_submit::solver_gas_limit(p, control).await?;
     warn!(%solver, signer = %signer.address(), bonded_eth, bond_min_eth = min, bond_max_eth = max, auto_withdraw = c.bond_auto_withdraw, gas_limit, version = ?domain.version, "ATLAS LIVE: profitable solver operations WILL be signed and submitted");
-    Ok(Some((atlas_submit::Submitter::new(signer.clone(), domain, atlas, control, c.endpoint.clone(), engine.http.clone(), gas_limit), band)))
+    // Config::validate requires a ws(s):// endpoint with submit. Not reaching it at start is not
+    // fatal (the socket keeps reconnecting), but it is said loudly: no op can be submitted until it is.
+    let socket = atlas_submit::BidSocket::spawn(c.endpoint.clone());
+    if !socket.wait_connected(std::time::Duration::from_secs(10)).await {
+        warn!("ATLAS bid socket not connected after 10 s: solver operations cannot be submitted until it is (it keeps reconnecting)");
+    }
+    Ok(Some((atlas_submit::Submitter::new(signer.clone(), domain, atlas, control, socket, gas_limit), band)))
 }
 
 /// `eth` ETH in wei.
@@ -1679,15 +1685,21 @@ async fn submit_solver_op(sub: &atlas_submit::Submitter, parts: &PlannerParts, s
             return refused(err.to_string());
         }
     };
-    match atlas_submit::submit(&sub.http, &sub.endpoint, &a.id, &signed).await {
-        Ok(r) => {
-            // Whether Atlas ran it is seen later, in its SolverTxResult logs (the bond check).
+    match sub.submit(&a.id, &signed).await {
+        Ok(done) => {
+            // Whether Atlas ran it is seen later, in its SolverTxResult logs (the bond check). An
+            // unanswered op was written (no answer in time, or the socket lost after the write), so
+            // it may be in the auction: it is kept as submitted (slot, liability).
+            let answer = match done {
+                atlas_submit::Submitted::Accepted(r) => r,
+                atlas_submit::Submitted::Unanswered(why) => json!(format!("unanswered: {why}")),
+            };
             parts.bond_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
             parts.submitted_ops.lock().unwrap().push(SubmittedOp { deadline: a.deadline, bid_wei: c.bid_wei, gas_pay_wei: gas_pay });
-            warn!(auction = %a.id, market = %m.meta.name, bid_eth = math::units(c.bid_wei, 18), gas_pay_eth = math::units(gas_pay, 18), gas, "ATLAS solver op SUBMITTED");
+            warn!(auction = %a.id, market = %m.meta.name, bid_eth = math::units(c.bid_wei, 18), gas_pay_eth = math::units(gas_pay, 18), gas, %answer, "ATLAS solver op SUBMITTED");
             (
                 true,
-                json!({ "ok": true, "bid_wei": c.bid_wei.to_string(), "gas": gas, "gas_pay_wei": gas_pay.to_string(), "liability_eth": math::units(liability, 18), "bonded_eth": bonded.map(|b| math::units(b, 18)), "min_profit": min_profit.to_string(), "answer": r }),
+                json!({ "ok": true, "bid_wei": c.bid_wei.to_string(), "gas": gas, "gas_pay_wei": gas_pay.to_string(), "liability_eth": math::units(liability, 18), "bonded_eth": bonded.map(|b| math::units(b, 18)), "min_profit": min_profit.to_string(), "answer": answer }),
             )
         }
         Err(err) => {
@@ -1782,18 +1794,23 @@ async fn valuation<P: Provider>(
     let valued = valued_rest;
     // Atlas takes one op per block from an EOA: the auction's candidates are tried most profitable
     // first (live + `submit`), regardless of which market's simulation finished first, until one
-    // is accepted; a refused one (budget, endpoint) leaves the slot to the next.
+    // is accepted; a refused one (budget, endpoint) leaves the slot to the next. Once one fails
+    // while the bid socket is down, the rest are not tried: each would wait out SUBMIT_TIMEOUT for
+    // nothing.
     if let (Some(sub), Some(solver)) = (&parts.submitter, &parts.solver) {
         let mut order: Vec<&OpCandidate> = cands.iter().flatten().collect();
         order.sort_by(|x, y| y.profit_usd.total_cmp(&x.profit_usd));
-        let mut accepted: Option<&str> = None;
+        let (mut accepted, mut socket_down): (Option<&str>, bool) = (None, false);
         for c in order {
             let submitted = match accepted {
                 Some(name) => json!({ "ok": false, "error": format!("the op of {name} was submitted for this auction (one op per block per EOA)") }),
+                None if socket_down => json!({ "ok": false, "error": "bid socket not connected (op not sent)" }),
                 None => {
                     let (ok, row) = submit_solver_op(sub, parts, solver, a, &markets[c.market], c, eth_usd).await;
                     if ok {
                         accepted = Some(&markets[c.market].meta.name);
+                    } else {
+                        socket_down = !sub.socket.is_connected();
                     }
                     row
                 }

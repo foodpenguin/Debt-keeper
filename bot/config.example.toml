@@ -171,6 +171,7 @@ paper_deadline_ms = 2000       # a valuation later than this after the auction c
 # the op is also signed and sent to the SVR bid endpoint (needs the deployed solver and a bond).
 [atlas.solver]
 simulate = false
+# endpoint = "wss://svr-bid-endpoint.chain.link/ws/solver"   # bid endpoint: must be its WebSocket (the HTTP root has no submit method)
 # submit = false
 # address = "0x..."            # deployed AtlasLiquidationSolver; unset = injected bytecode
 # liquidator = "0x..."         # deployed MorphoLiquidator owned by the solver (executor = receiver = solver)

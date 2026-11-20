@@ -660,8 +660,34 @@ submitted to the auction (`submit_solver_op` in `runner.rs`):
   atlas-sdk-go signs. The digest is checked equal to `AtlasVerification.getSolverPayload(op)` on
   Base (a recorded value in a unit test, a random op in `e2e_solver_op_digest_matches_atlas_verification`);
 - the submission: JSON-RPC `solver_submitSolverOperation` with `[{ auction_id, auction_solution }]`
-  to `[atlas.solver] endpoint` (default the Chainlink SVR bid endpoint), the op in the SDK's
-  `SolverOperationRaw` form (hex quantities). Tested against a local mock endpoint;
+  over the bid endpoint's **WebSocket** (`[atlas.solver] endpoint`, default the Chainlink SVR
+  solver socket `wss://svr-bid-endpoint.chain.link/ws/solver`), the op in the SDK's
+  `SolverOperationRaw` form (hex quantities). The gateway's HTTP root does not have this method
+  (-32601 "Method not found": the first live submissions were refused that way), so an
+  `http(s)://` endpoint is refused at config load. One standing socket (`atlas_submit::BidSocket`),
+  separate from the auction feed's, is connected at start, pinged while idle (tungstenite answers
+  the endpoint's pings itself) and reconnected in the background. Answers are matched to requests
+  by JSON-RPC id (a number or the same number as a string); an error with no usable id
+  (`"id": null`) goes to the only request in flight, or is logged (`ATLAS bid endpoint error not
+  matched to a request`); other frames are ignored. A submission waits at most `SUBMIT_TIMEOUT`
+  (1 s, a reconnect included): accepted = `"result": null` (also the string `"null"`), an `error` =
+  refused; never written = not submitted (slot given back); **written but unanswered** (no answer in
+  time, or the socket lost or a write failing after it was written) = treated as submitted (journal
+  `answer: "unanswered: <why>"`): it may be in the auction, so its slot and liability are kept and
+  its Atlas result is looked for. An answer that comes after its caller gave up is still logged
+  (`ATLAS solver op refused after its submission timed out`, or accepted). The socket is taken as
+  dead and reconnected when a written request has no answer after 3 s (a half-open connection takes
+  writes and answers nothing), when nothing arrives for 15 s (pings every 5 s), or when a write does
+  not complete in 1 s. Reconnects: the first after a connection that lasted 30 s is immediate,
+  otherwise backoff 250 ms doubling to 10 s, so an endpoint that accepts and then closes is not
+  hammered. Once one op of an auction fails while the socket is down, its other ops are not tried
+  (`bid socket not connected (op not sent)`) instead of each waiting out the timeout. Tested against a
+  local mock socket (answer, refusal, string and null ids, silence, a late answer, drop after the
+  write and reconnect, half-open reconnect, accept-then-close backoff, unreachable), and with
+  `--ignored` against the real endpoint: an op signed by a random unbonded key for an unknown
+  auction must be parsed and refused with "Auction not found", not for its method or format. The
+  watchdog mails `ATLAS solver op submission failed`, a late refusal, an unmatched error, and the bid
+  socket staying down (lost or failing to connect) for `BID_DOWN_SECS` (120 s), then once it is back;
 - the rules: one op per block per EOA (Atlas keeps only one; a second auction for the same block
   needs another EOA), so an auction's ops are tried most profitable first (profit after the bid)
   until the endpoint accepts one; a refused op gives the block's slot back to the next, and the

@@ -288,7 +288,20 @@ Atlas 拍賣用拍賣的 median 估值：`PriceModel::preview` 換掉一個 aggr
 
 - op 本身：`from` = 熱錢包（必須是 solver 的 `executor`）、`to` = Atlas、`gas` = 模擬 gas × `gas_limit_buffer`，不超過 DappControl 的 `getSolverGasLimit()`、`maxFeePerGas` 和 `deadline` = 拍賣的值、`solver` = 已部署的 AtlasLiquidationSolver、`control` = DappControl、`userOpHash` = 拍賣的值、`bidToken` = ETH（`address(0)`）、`bidAmount` = 出價、`data` = solver 的 `solverOpData`（`AtlasSolver::op_data`），送單時重建：`gasPayWei` 用模擬 gas 重算（不乘 `gas_limit_buffer`，見「bond」一節），和出價一起買；比模擬時多出來的 gas 從利潤扣掉，minProfit = 這個淨利 × `min_profit_keep`；
 - 簽名：對 `SolverOperation(address from,address to,uint256 value,uint256 gas,uint256 maxFeePerGas,uint256 deadline,address solver,address control,bytes32 userOpHash,address bidToken,uint256 bidAmount,bytes data)` 做 EIP-712 簽名，domain 在啟動時從已部署的 AtlasVerification 讀取（`Atlas.VERIFICATION()`、`eip712Domain()`：name `AtlasVerification`、它的 version、chain id、verifying contract）；格式是原始的 `r || s || v`，v = 27 / 28，和 Fastlane 的 atlas-sdk-go 簽法相同。digest 會和 Base 上 `AtlasVerification.getSolverPayload(op)` 的結果核對（單元測試用一個記錄下來的值，`e2e_solver_op_digest_matches_atlas_verification` 用隨機的 op）；
-- 送出：以 JSON-RPC `solver_submitSolverOperation` 把 `[{ auction_id, auction_solution }]` 送到 `[atlas.solver] endpoint`（預設是 Chainlink SVR 的出價端點），op 用 SDK 的 `SolverOperationRaw` 格式（hex 數值）。在本地的 mock 端點上測試；
+- 送出：以 JSON-RPC `solver_submitSolverOperation` 把 `[{ auction_id, auction_solution }]` 透過出價端點的 **WebSocket** 送出（`[atlas.solver] endpoint`，預設是 Chainlink SVR 的 solver socket `wss://svr-bid-endpoint.chain.link/ws/solver`），op 用 SDK 的 `SolverOperationRaw` 格式（hex 數值）。
+  - 閘道的 HTTP 根網址沒有這個 method，會回 -32601 "Method not found"，第一批 live 送單就是這樣被拒絕的。所以 `http(s)://` 的 endpoint 在載入設定時就會被擋下。
+  - 用一條常駐的 socket（`atlas_submit::BidSocket`），和拍賣 feed 的連線分開：啟動時連上，閒置時定時 ping（端點的 ping 由 tungstenite 自動回應），斷線在背景重連。
+  - 回應用 JSON-RPC id 對應到請求（數字，或同一個數字的字串）。沒有可用 id 的錯誤（`"id": null`）交給唯一一筆還在等回應的請求，否則記一行 `ATLAS bid endpoint error not matched to a request`。其他訊息忽略。
+  - 每次送出最多等 `SUBMIT_TIMEOUT`（1 秒，含重連）：
+    - `"result": null`（或字串 `"null"`）= 接受；有 `error` = 拒絕；
+    - 根本沒寫出去 = 沒送出，歸還這個區塊的名額；
+    - **已寫出去但沒有回應**（時間內沒回應，或寫出去之後 socket 斷線、寫入失敗）= 當作已送出（journal 記 `answer: "unanswered: <原因>"`）：它可能已經在拍賣裡，所以保留名額和責任，並追蹤它在 Atlas 的結果。
+    - 呼叫端放棄之後才到的回應仍會記 log（`ATLAS solver op refused after its submission timed out`，或接受）。
+  - 判定 socket 已死並重連的條件：已寫出的請求 3 秒沒有回應（半開的連線收得下寫入、但什麼都不回）、15 秒什麼都沒收到（每 5 秒 ping 一次）、或一次寫入 1 秒內沒完成。
+  - 重連：連線維持超過 30 秒後斷線，第一次重連立即進行；否則退避 250 ms，每次加倍到 10 秒，避免對「接受後立刻關閉」的端點狂連。
+  - 同一場拍賣只要有一個 op 在 socket 斷線時失敗，其餘的 op 就不再嘗試（`bid socket not connected (op not sent)`），不必每個都等到逾時。
+  - 在本地的 mock socket 上測試（接受、拒絕、字串和 null 的 id、不回應、遲到的回應、寫出後斷線並重連、半開連線重連、接受後關閉的退避、連不上）。另外有一個 `--ignored` 測試打真實端點：用隨機、沒有 bond 的金鑰簽一個 op，送到不存在的 auction，必須被解析並以 "Auction not found" 拒絕，而不是因為 method 或格式被拒絕。
+  - watchdog 會寄信的情況：`ATLAS solver op submission failed`、遲到的拒絕、對不上請求的錯誤，以及 bid socket 斷線（lost 或一直連不上）持續 `BID_DOWN_SECS`（120 秒），恢復時再寄一次；
 - 規則：每個 EOA 每個區塊一個 op（Atlas 只保留一個；同一個區塊的第二場拍賣需要另一個 EOA），所以一場拍賣的 op 依扣掉出價後的利潤由高到低嘗試，直到端點接受其中一個；被拒絕的 op 會把這個區塊的名額讓給下一個，其餘的在 journal 記下實際送出的是哪一個；緊急停止檔案會停止送出；op 只有在 bond 不低於 `bond_min_eth`，而且蓋得住這個 op 的最大責任時才送出（否則記 `skipped: "bond_insufficient"`，附上責任和 bonded）。journal 的 `solver` 欄位記錄送出了什麼（`submitted`：gas、gas pay、責任、bonded）。
 
 啟動時（`build_submitter`），以下條件沒有全部成立，bot 就拒絕送出：solver 和它的清算合約已部署（`[atlas.solver] address`、`liquidator`）、solver 的 `executor()` 是熱錢包而 `PROFIT_RECEIVER()` 不是、熱錢包至少 bond 了 `bond_min_eth` 的 atlETH（`Atlas.balanceOfBonded`）、讀得到 Atlas 的 domain 和 DappControl 的 gas 參數（solver 和 dApp 的 gas 上限、bundler 附加費）。
