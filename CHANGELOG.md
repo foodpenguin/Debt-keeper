@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.3 (2026-11-20)
 
 Atlas bids are now submitted over the bid endpoint's WebSocket. **Fix for live bidding:** the first
 live submissions were refused with -32601 "Method not found", because the SVR gateway's HTTP root
