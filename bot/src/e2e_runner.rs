@@ -350,7 +350,9 @@ async fn e2e_runner_block_path_bids_against_the_seeded_competition() {
         })
         .collect();
     std::fs::write(h.dir.join("journal.jsonl"), rows_text).unwrap();
-    let cfg = h.config(false, "bid_min_samples = 3", "");
+    // outbid_skip_ratio = 0: the seeded winners (~35 gwei for this plan) are far above the 1 gwei cap,
+    // so the default ratio would skip the plan as a sure loss; this test is about the bid using them.
+    let cfg = h.config(false, "bid_min_samples = 3\noutbid_skip_ratio = 0", "");
     // The fork drops a request now and then (a plan that errors is retried next block).
     let journal = h.run(&cfg, false, 120, |j| j.contains("\"action\":\"send\"")).await;
     let plans = rows(&journal, "plan");

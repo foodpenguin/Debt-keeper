@@ -213,13 +213,19 @@ pub struct AtlasConfig {
     /// every solver op's maximum liability, which the bond must cover.
     #[serde(default = "default_user_op_gas")]
     pub user_op_gas: u64,
+    /// Execution labels: once an auction's metacall lands (the feed's SVR secondary), every solver
+    /// op valued for it is simulated again on the block before — at no bid and as it was bid — and
+    /// journaled (`atlas_resim`) next to its value at the auction's head. That is how much the
+    /// value moves between bidding and execution, per market. Three simulations per op.
+    #[serde(default = "default_true")]
+    pub resim: bool,
     #[serde(default)]
     pub solver: SolverConfig,
 }
 
 impl Default for AtlasConfig {
     fn default() -> Self {
-        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, bundle_gas_headroom: default_bundle_gas_headroom(), eager_hedge_max_in_flight: default_eager_hedge_max(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), user_op_gas: default_user_op_gas(), solver: SolverConfig::default() }
+        Self { observe: false, ws: default_atlas_ws(), address: default_fb_atlas(), svr_cutoff_secs: default_svr_cutoff(), rpc: vec![], logs_ws: String::new(), control: default_atlas_control(), margin: default_atlas_margin(), max_plans: default_atlas_plans(), solver_gas_limit: default_solver_gas(), max_bundle_positions: default_max_bundle(), flash_headroom_bps: default_atlas_flash_headroom(), min_bonus_usd: 0.0, bundle_gas_headroom: default_bundle_gas_headroom(), eager_hedge_max_in_flight: default_eager_hedge_max(), max_concurrent: default_atlas_concurrent(), paper_margins: default_paper_margins(), paper_deadline_ms: default_paper_deadline(), gas_surcharge: default_atlas_surcharge(), user_op_gas: default_user_op_gas(), resim: true, solver: SolverConfig::default() }
     }
 }
 
@@ -315,6 +321,9 @@ fn default_bid_endpoint() -> String {
 }
 fn default_user_op_gas() -> u64 {
     500_000
+}
+fn default_true() -> bool {
+    true
 }
 fn default_atlas_surcharge() -> f64 {
     0.1
@@ -767,6 +776,12 @@ pub struct ExecConfig {
     // ---- risk gate (risk.rs)
     #[serde(default = "default_min_net")]
     pub min_net_usd: f64,
+    /// Skip a send whose bid cannot come near the predicted competitor: when the competitor's
+    /// priority fee (from the observed winners) is more than this many times ours — capped by
+    /// `max_priority_fee_wei` or by what the profit affords — the tx would only pay gas to revert
+    /// behind the winner. 0 = off. Without observations there is no prediction, so it still sends.
+    #[serde(default = "default_outbid_skip_ratio")]
+    pub outbid_skip_ratio: f64,
     #[serde(default = "default_max_prio")]
     pub max_priority_fee_wei: u128,
     /// Share of the expected net profit a bid may use (on top of priority_fee_wei; see risk.rs).
@@ -869,6 +884,9 @@ fn default_quote_gap() -> f64 {
 }
 fn default_min_net() -> f64 {
     0.5
+}
+fn default_outbid_skip_ratio() -> f64 {
+    4.0
 }
 fn default_max_prio() -> u128 {
     1_000_000_000 // 1 gwei

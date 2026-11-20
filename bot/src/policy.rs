@@ -11,9 +11,33 @@ use crate::{
 /// What to bid in a Chainlink SVR / Atlas auction.
 pub trait AuctionBidPolicy: Send + Sync + 'static {
     /// The bid in USD for an auction worth `net_usd` to us after the op's gas. `market` is the
-    /// market of a single-position solver op, None for the whole auction's bundle (the journaled
-    /// valuation). None = do not bid.
+    /// market of a solver op, None for the whole auction's bundle (the journaled valuation).
+    /// None = do not bid.
     fn bid_usd(&self, market: Option<&str>, net_usd: f64, eth_usd: f64) -> Option<f64>;
+
+    /// The bid with the whole context of the op (what the runner calls). The default ignores all but
+    /// `bid_usd`'s inputs; a policy that discounts the value for what can change before the op
+    /// executes (by market, size or the price move) overrides this.
+    fn bid(&self, ctx: &AuctionBidCtx<'_>) -> Option<f64> {
+        self.bid_usd(ctx.market, ctx.net_usd, ctx.eth_usd)
+    }
+}
+
+/// What an auction bid is decided on (`AuctionBidPolicy::bid`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AuctionBidCtx<'a> {
+    /// The market of the solver op; None for the whole auction's bundle (the journaled valuation).
+    pub market: Option<&'a str>,
+    /// What the op nets us after its gas (USD), valued on the state the auction arrived at: the bid
+    /// basis.
+    pub net_usd: f64,
+    /// The liquidation bonus the op takes (USD at the auction price).
+    pub bonus_usd: f64,
+    /// Positions the op liquidates.
+    pub positions: usize,
+    /// The auction's move of the market's oracle price (new / old - 1; negative = the collateral fell).
+    pub price_move: f64,
+    pub eth_usd: f64,
 }
 
 /// The block path's priority fee.
@@ -57,6 +81,13 @@ mod tests {
         let p = DefaultAuctionBid { margin: 0.1 };
         assert_eq!(p.bid_usd(None, 100.0, 2400.0), Some(90.0));
         assert_eq!(p.bid_usd(Some("WETH/USDC"), 0.0, 2400.0), Some(0.0));
+    }
+
+    #[test]
+    fn the_default_context_bid_is_bid_usd() {
+        let p = DefaultAuctionBid { margin: 0.1 };
+        let ctx = AuctionBidCtx { market: Some("WETH/USDC"), net_usd: 100.0, bonus_usd: 120.0, positions: 3, price_move: -0.01, eth_usd: 2400.0 };
+        assert_eq!(p.bid(&ctx), p.bid_usd(Some("WETH/USDC"), 100.0, 2400.0));
     }
 
     #[test]

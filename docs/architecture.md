@@ -122,19 +122,25 @@ Turns one liquidatable position (or a bundle of positions in one market) into a 
   `BundleGas` the caller passes: `atlas_venue::ATLAS_BUNDLE_GAS` for Atlas solver ops). It also
   produces an executable `BundlePlan` (the positions at full seize, the flash-loan size and the one
   full-size exit) that `atlas_venue::AtlasSolver::batch_inner` turns into the solver op's inner
-  `liquidateBatch` call. v1 liquidates each position in full and sells 100 %, so a direct route is a
-  candidate only when its allocation is full-size (route mode spends exactly the seized amount); the
-  exits are weighed at the auction's gas price, where gas dominates. Each aggregator rung (the gas
+  `liquidateBatch` call. v1 liquidates each position in full and sells 100 %, so the direct route is
+  a full-sale allocation (`v3router::allocate_full`, route mode spends exactly the seized amount):
+  every grid unit placed, the grid's rounding remainder on the leg with the most units, and its legs
+  weighed at the auction's gas price (before v0.5.0 they were priced at the block path's gas price
+  and the allocation had to land exactly on the seized amount, so the direct route was missing for
+  ~80 % of bundles). The exits are weighed at the auction's gas price, where gas dominates. Each aggregator rung (the gas
   ladder's two quotes) is scored by value *net of gas* at that price, alongside the direct route, so
   a forcing rung (less output, far less gas) can win when gas is dear; the rungs and which one was
-  selected are journaled (`agg_rungs`). The bid, however, is NOT sent on the estimate: `batch_op`
-  simulates the op once at the estimate bid (`batch_est`: gross minus the whole metacall gas
-  including `METACALL_FIXED_GAS`) to measure the real gas, then reprices the bid on that simulated
-  gas × `SIM_GAS_SAFETY` (the estimate runs ~1.4× the real gas, so this frees gas to bid; when the
-  sim ran dearer it lowers the bid instead) and simulates the repriced op again before it can be
-  sent — raising the bid enlarges the bid swap, which the first simulation did not price. Both bases
-  (`bid_basis_est_usd`, `bid_basis_sim_usd`) and which was used (`batch_est`/`batch_sim`) are
-  journaled; the conservative estimate still backs the swap budget and the bond's gas liability.
+  selected are journaled (`agg_rungs`). The bid, however, is NOT sent on the quote or the estimate:
+  `batch_op` simulates the op first at **no bid** (v0.5.0; gas pay at the estimate), which measures
+  what the exit really returns and the real gas. The bid basis (`bid_basis_sim_usd`) is that
+  simulated gross (`gross_sim_usd`: the profit plus the gas pay it bought) minus the whole metacall
+  gas (with `METACALL_FIXED_GAS`) at the simulated gas × `SIM_GAS_SAFETY`, net of the bid swap's pool
+  fee. The op at the policy's bid on it is simulated again before it can be sent (the first
+  simulation priced no bid swap for the bid); if it does not run, it is retried at 99 % and then
+  97 % of the bid (`RETRY_BID_SHARES`, `retries`). The single-position op is bid the same way
+  (`sim_bid_op`), on its own simulated gas rather than the block-path plan's. The quote/estimate basis (`bid_basis_est_usd`,
+  the gas floor) and the gap between quoted and simulated gross (`quote_gap_bps`) are journaled; the
+  conservative estimate still backs the swap budget and the bond's gas liability.
   `minProfit` guards the real net after the bid and the gas on-chain regardless. Gas is calibrated on
   `contracts/test/AtlasBundleGas.fork.t.sol` (a 30-position batch ≈ 1.5M gas before its exit swap,
   ~34k per extra position).
@@ -235,7 +241,11 @@ trait names no protocol or vendor.
 - **Allocation:** greedy on marginal output over a concave combined curve (a shared connector sink
   is not double-counted), compared against single-leg solutions because each extra leg costs gas;
   `allocate_within` enforces a gas budget. Leg gas is priced at `planning_priority_fee_wei` and
-  converted to loan-token units with `loan_usd`.
+  converted to loan-token units with `loan_usd`. A bundle (Atlas) uses `allocate_full` instead: it
+  sells exactly the amount asked for, searches the greedy split of all legs and every subset of up to
+  `FULL_SALE_MAX_LEGS` (3) source legs, values each net of its route gas at the caller's price (the
+  auction's) and keeps the best within the gas budget — at 15 gwei one or two deep pools usually beat
+  a many-leg split.
 - **Execution:** the packed route calls pools directly; pools are paid inside their own swap
   callback (only the pool currently swapping, once, at most its input, in the hop's input token
   read before the swap; source legs must sell the collateral). A pooled connector token split by
@@ -504,7 +514,10 @@ binary can run the same loop with its own policies:
 
 - `AuctionBidPolicy::bid_usd(market, net_usd, eth_usd)`: the bid in an SVR auction (default
   `DefaultAuctionBid`: net x (1 - `[atlas] margin`)); used for the journaled valuation and the
-  submitted op alike;
+  submitted op alike. The runner calls `AuctionBidPolicy::bid(&AuctionBidCtx)`, whose default is
+  `bid_usd`; the context also carries the op's liquidation bonus, its position count and the
+  auction's oracle move, so a policy can discount the value for what changes before execution (see
+  the `atlas_resim` labels);
 - `PriorityBidPolicy::bid(market, plan, competition, eth_usd)`: the block path's priority fee
   (default `DefaultPriorityBid`: the `[exec]` bid curve below).
 
@@ -542,6 +555,9 @@ are left out. For a plan, `BidCurve::priority`:
   may bid most of its profit); never above `max_priority_fee_wei`, never below `priority_fee_wei`.
 
 Without enough observations it bids the affordable share, like a plain share-of-profit bidder.
+When the prediction is more than `outbid_skip_ratio` (default 4, 0 = off) times the bid the cap or
+the profit allows, the risk gate skips the plan (`outbid: ...`): such a tx only pays gas to revert
+behind the winner (2026-11-20: seven cbXRP txs at 0.4-1 gwei against winners at 50-136 gwei).
 The decision journals the competitor priority it bid against (`competitor_wei`). A bid above the
 base priority is then simulated again at its own priority before it is sent (see Simulation):
 some pools (Aero) tax the priority fee.
@@ -621,18 +637,35 @@ keep after Atlas charges it for gas: per market `atlas_net_usd` = the bundle's `
 `gas_units` at the auction's `maxFeePerGas` x (1 + surcharge), summed into `bundle_net_usd`; the
 journaled bid is the auction policy's on that net (default x (1 - `atlas.margin`)). The surcharge is read from the escrow at start
 (`getAtlasSurchargeRate`, scale 1e4); `[atlas] gas_surcharge` (default 0.1) is the fallback.
+`value-auction --max-fee-gwei` sets the replayed auction's gas price (default 0, gas free).
+
+**Execution labels (`[atlas] resim`, default on).** An auction is valued at its head but executes
+when its metacall lands, ~18 blocks later; on a falling alt-coin the exit pools can move a lot in
+between. Every solver op that would pay is kept (`PendingResim`) until the feed's SVR secondary of
+its aggregator lands (`OracleLogEvent::Secondary`, after the head, by the deadline +
+`RESIM_GRACE_BLOCKS`). It is then simulated three times: at no bid on the head and on the block
+before the metacall (its value net of gas on each; the difference is the drift), and as bid on the
+block before (would it have run). One `atlas_resim` journal row per op: `value_head_usd`,
+`value_exec_usd`, `drift_usd`, `bid_ok`, `bid_profit_usd`, with `bonus_usd`, `bid_usd`, `router`
+and the errors; an op whose auction never executed is journaled with `outcome: "not_executed"`.
+Labels simulate one at a time (`resim_permits`), with the gas pay the op is sent with. These are
+the labels a drift haircut per market is calibrated from.
 
 **Solver venue (`bot/src/atlas_venue.rs`, simulation only).** With `[atlas.solver] simulate = true`,
 each market of a valued auction also gets a `solver` field in the journal (`solver_op` in
-`runner.rs`): the top position's direct-router plan is wrapped into `atlasSolverCall` with a bid of
-(`profit_usd` minus the op's gas at the Atlas rate above) x (1 - `atlas.margin`), and simulated as
-Atlas would call it, against `AtlasStub.sol` injected at the Atlas address (reporting, in its
+`runner.rs`): the top position's direct-router plan is wrapped into `atlasSolverCall` and bid like a
+batch op (`sim_bid_op`, v0.5.0: on its simulated proceeds minus the whole metacall gas at its own
+simulated gas, then proven at the bid; before, on the plan's `profit_usd` and the block path's
+lighter gas), and simulated as Atlas would call it, against `AtlasStub.sol` injected at the Atlas address (reporting, in its
 storage slot 0, the gas liability the bot computes for the op), with the solver and its
 MorphoLiquidator injected unless deployed; the result includes the L1 fee of the call. The op pays
 its gas in ETH out of the proceeds (`gasPayWei`, see "The bond"), so the journal's net after the bid
 (`net_after_bid`, `net_after_bid_usd`) is also net of the gas (`gas_pay_eth`). `solver_op`
 wraps only direct-router plans (an existing plan's aggregator calldata was built for the direct
-liquidator's address), and nothing when `exec.venue = "flash"`. `AtlasSolver::calldata` builds the
+liquidator's address), and nothing when `exec.venue = "flash"`. It is the fallback when a market has
+no executable bundle, and (v0.5.0) also runs beside a one-position bundle, whose batch carries a flash
+loan and fixed gas the single op does not: the higher bid goes, the other is journaled as
+`batch_alt` / `single_alt`. `AtlasSolver::calldata` builds the
 call (the bid plus the gas pay are bought with one `exactOutputSingle` on `bid_router` unless the
 loan token is WETH; minProfit at `SOLVER_MIN_PROFIT`); `AtlasBid { solver, bid_wei, gas_pay_wei,
 gas_liability_wei }` implements

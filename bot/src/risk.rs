@@ -66,7 +66,18 @@ pub fn decide(cfg: &ExecConfig, plan: &Plan, eth_usd: f64, base_fee_wei: u128, k
     if est_cost_usd >= profit {
         return skip(&format!("cost {est_cost_usd:.4} >= profit {profit:.4}"));
     }
+    if let Some(why) = outbid(cfg, priority_fee_wei, bid.competitor_wei) {
+        return skip(&why);
+    }
     Decision::Send { priority_fee_wei, est_cost_usd, competitor_wei: bid.competitor_wei }
+}
+
+/// Why a send at `priority_wei` would only pay gas to revert behind the predicted winner: its
+/// priority fee is more than `outbid_skip_ratio` times ours (held down by the cap, the profit, or a
+/// later fallback to the base priority). None = send (no prediction, or the rule is off).
+pub fn outbid(cfg: &ExecConfig, priority_wei: u128, competitor_wei: Option<u128>) -> Option<String> {
+    let c = competitor_wei?;
+    (cfg.outbid_skip_ratio > 0.0 && c as f64 > priority_wei as f64 * cfg.outbid_skip_ratio).then(|| format!("outbid: expected competitor {c} wei > {}x our {priority_wei} wei", cfg.outbid_skip_ratio))
 }
 
 #[cfg(test)]
@@ -170,7 +181,35 @@ mod tests {
         assert_eq!(competitor, Some(10_001_000));
         assert_eq!(bid, 10_001_000 + 500_050 + 1);
         assert!(bid < share_bid, "winning needs less than the share would pay");
-        // A competition this profit cannot beat: it bids what it affords (the share), no more.
-        assert_eq!(send(Some(1e9)).0, share_bid);
+        // A competition the bid can come near (within outbid_skip_ratio) but not beat: it bids what
+        // it affords (the share), no more.
+        assert_eq!(send(Some(2e7)).0, share_bid.min(c.max_priority_fee_wei));
+    }
+
+    #[test]
+    fn a_bid_far_below_the_predicted_winner_is_not_sent() {
+        // Winners pay ~1e9 wei per gas per USD of gross: ~100 gwei for this $100 plan, 100x the
+        // 1 gwei cap. Sending would only pay gas to revert behind them (11-20: 7 such cbXRP txs).
+        let mut c = cfg();
+        match decide_default(&c, &plan(100.0, 500_000), 2400.0, 5_000_000, false, Some(1e9)) {
+            Decision::Skip { reason } => assert!(reason.starts_with("outbid"), "{reason}"),
+            d => panic!("{d:?}"),
+        }
+        // Within the ratio (2x the cap): still sent, at the cap.
+        assert!(matches!(decide_default(&c, &plan(100.0, 500_000), 2400.0, 5_000_000, false, Some(2e7)), Decision::Send { .. }));
+        // No observations: no prediction, still sent. Off (0): sent whatever the competition.
+        assert!(matches!(decide_default(&c, &plan(100.0, 500_000), 2400.0, 5_000_000, false, None), Decision::Send { .. }));
+        c.outbid_skip_ratio = 0.0;
+        assert!(matches!(decide_default(&c, &plan(100.0, 500_000), 2400.0, 5_000_000, false, Some(1e9)), Decision::Send { .. }));
+    }
+
+    #[test]
+    fn the_rule_holds_for_the_priority_actually_sent() {
+        // Approved at the 1 gwei cap against a 2 gwei winner (within 4x); if the send falls back to the
+        // 0.001 gwei base priority (the bid did not pay at its own priority), it would be 2000x below.
+        let c = cfg();
+        assert_eq!(outbid(&c, 1_000_000_000, Some(2_000_000_000)), None);
+        assert!(outbid(&c, 1_000_000, Some(2_000_000_000)).is_some_and(|w| w.starts_with("outbid")));
+        assert_eq!(outbid(&c, 1_000_000, None), None, "no prediction: send");
     }
 }

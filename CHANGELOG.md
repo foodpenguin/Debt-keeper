@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.5.0 (2026-11-20)
+
+Atlas valuation: a higher and more accurate value (V) for batch solver ops, and execution labels to
+measure how far V moves before an op executes. No contract change and no redeploy; one additive
+trait method.
+
+- **Direct exit for bundles fixed** (`v3router::allocate_full`). A bundle's direct route must spend
+  exactly what its liquidations seized, but the allocation was a grid prefix (`unit × k`, rounded
+  down) and was rejected unless it landed on the exact amount, so ~80 % of bundles had no direct
+  route ("direct route would not sell the whole bundle"; 257 of 320 liquidatable valuations in the
+  live journal) and fell back to the aggregator or to nothing. The full-sale allocation places every
+  grid unit and puts the rounding remainder on the leg with the most units.
+- **Direct legs weighed at the auction's gas price.** The bundle's direct allocation priced leg gas
+  at the block path's gas price (~0.01 gwei) and was only then netted at the auction's (~16.5 gwei),
+  so it picked many-leg, gas-heavy splits. It now prices route gas at the auction's price and
+  searches the greedy split of all legs plus every subset of up to `FULL_SALE_MAX_LEGS` (3) source
+  legs, keeping the best net value within the swap gas budget.
+- **Bid on the simulated proceeds, not the quote** (`sim_bid_op`, batch and single ops alike). Sim #1
+  runs the op at no bid; the bid basis is the simulated gross minus the whole metacall gas at the
+  simulated gas, net of the bid swap's pool fee; sim #2 proves the op at the bid, retried at 99 % and
+  then 97 % (`RETRY_BID_SHARES`) if it does not run. The estimate-bid fallback op is gone. Journal:
+  `gross_sim_usd`, `quote_gap_bps`, `retries`; `bid_basis` = `batch_sim` / `single_sim`.
+- **Single-position op bid on its own simulated gas.** It was bid on the block-path plan's gas (the
+  liquidation alone, ~170k lighter than the solver op), so submission, which sets the gas pay from
+  the simulated gas, found no profit left and refused it (replay: $5.7 more gas pay than a $2.0
+  profit). It now goes through `sim_bid_op` like a batch op.
+- **One-position bundles also try the single op.** A bundle of one position carries the batch's
+  flash loan and fixed gas; the single-position op is now valued too and the higher bid goes (the
+  other is journaled as `batch_alt` / `single_alt`).
+- **`AuctionBidPolicy::bid(&AuctionBidCtx)`**: the runner now calls this; the default forwards to
+  `bid_usd`. The context adds the op's liquidation bonus, its position count and the auction's oracle
+  move, so a policy can discount V per market (e.g. for drift before execution).
+- **Execution labels** (`[atlas] resim`, default on): every op that would pay is simulated again
+  once its auction's metacall lands (the feed's SVR secondary): at no bid on the head and on the
+  block before the metacall, and as bid on that block. Journal `atlas_resim` (`value_head_usd`,
+  `value_exec_usd`, `drift_usd`, `bid_ok`, ...); `outcome: "not_executed"` when no metacall came by
+  the deadline + 25 blocks. Three simulations per op on the `[atlas] rpc` endpoints, one label at a
+  time (a semaphore: a crash burst executes many auctions while new ones are being valued); the
+  as-bid simulation uses the gas pay the op is sent with.
+- **Block path: no sends to lose** (`[exec] outbid_skip_ratio`, default 4, 0 = off). When the
+  predicted competitor priority fee is more than this many times our bid (held down by
+  `max_priority_fee_wei` or the profit), the risk gate skips the plan. On 2026-11-20 seven cbXRP
+  txs went out at 0.4-1 gwei against winners at 50-136 gwei and all reverted, using most of the
+  daily failed-gas budget. Without observations it still sends. The same check applies to the priority
+  actually sent (a fallback to the base priority, or a cut to fit `max_tx_cost_eth`): refused
+  `outbid: ...`.
+- Dashboard: the batch-sim success / gas-ratio stats count `batch_sim` rows too (from v0.5.0 every
+  simulated batch op is one; they read 0 otherwise).
+- `value-auction --max-fee-gwei`: the replayed auction's gas price (it was 0, so replays valued gas
+  as free).
+
 ## v0.4.3 (2026-11-20)
 
 Atlas bids are now submitted over the bid endpoint's WebSocket. **Fix for live bidding:** the first

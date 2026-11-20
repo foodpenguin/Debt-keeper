@@ -74,6 +74,10 @@ enum Cmd {
         /// makes sense with --at-block at (or right behind) the chain head.
         #[arg(long)]
         kyber: bool,
+        /// The auction's max fee per gas (gwei), which Atlas charges solver ops for their gas: what
+        /// the exits and the bid are weighed at. 0 = gas is free (the pre-0.5 replay).
+        #[arg(long, default_value_t = 0.0)]
+        max_fee_gwei: f64,
     },
     /// Loss analysis over the journal: who liquidated what, and how early we saw it.
     Report,
@@ -131,7 +135,7 @@ async fn run(cli: Cli, cfg: Config, live_signer: Option<alloy::signers::local::P
         Cmd::Scan { top } => runner.scan(top).await,
         Cmd::Watch { .. } => runner.run().await,
         Cmd::Plan { market, user, price_drop_bps, at_block, pending } => runner.plan(&market, user, price_drop_bps, at_block, pending).await,
-        Cmd::ValueAuction { market, price_drop_bps, at_block, users, kyber } => runner.value_auction(&market, price_drop_bps, at_block, &users, kyber).await,
+        Cmd::ValueAuction { market, price_drop_bps, at_block, users, kyber, max_fee_gwei } => runner.value_auction(&market, price_drop_bps, at_block, &users, kyber, (max_fee_gwei * 1e9) as u128).await,
         Cmd::Report => unreachable!("handled before connecting"),
         Cmd::Dashboard { .. } => unreachable!("handled before connecting"),
         Cmd::Live => unreachable!("handled before connecting"),

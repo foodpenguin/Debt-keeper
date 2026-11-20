@@ -34,7 +34,7 @@ use crate::{
     morpho::{Morpho, MorphoEngine, PositionView, evaluate_position, math, onchain::MarketMeta},
     planner::{PlanCtx, Planner},
     router::Kyber,
-    policy::{AuctionBidPolicy, PriorityBidPolicy},
+    policy::{AuctionBidCtx, AuctionBidPolicy, PriorityBidPolicy},
     ledger::Ledger,
     sim::{LiquidatorCode, Simulator},
 };
@@ -161,8 +161,8 @@ impl<P: Provider + Clone + Send + Sync + 'static> Runner<P> {
 
     /// Replays one market's Atlas auction valuation at a past block (diagnostic).
     #[doc(hidden)]
-    pub async fn value_auction(&mut self, market: &str, drop_bps: u64, at_block: u64, users: &[Address], use_kyber: bool) -> Result<()> {
-        value_auction_at(&mut self.engine, market, drop_bps, at_block, users, use_kyber, self.auction.clone(), self.priority.clone()).await
+    pub async fn value_auction(&mut self, market: &str, drop_bps: u64, at_block: u64, users: &[Address], use_kyber: bool, max_fee_wei: u128) -> Result<()> {
+        value_auction_at(&mut self.engine, market, drop_bps, at_block, users, use_kyber, max_fee_wei, self.auction.clone(), self.priority.clone()).await
     }
 }
 
@@ -926,9 +926,135 @@ struct AtlasState<P> {
     /// Head at which the meta-oracle markets' `currentOracle()` was last re-read (see
     /// `META_RECHECK_HEADS`). Starts at the load block, so the first recheck is a full interval in.
     last_meta_recheck: u64,
+    /// Solver ops waiting for their auction's metacall (`[atlas] resim`): execution labels.
+    resims: ResimQueue,
+    /// One execution label simulates at a time: labels are not urgent, and a crash burst executes
+    /// many auctions at once, exactly while new ones are being valued on the same endpoints.
+    resim_permits: Arc<tokio::sync::Semaphore>,
+}
+
+/// A valued solver op waiting for its auction's metacall to land (the feed's SVR secondary), to be
+/// simulated again on the block before it (`[atlas] resim`): its execution label.
+struct PendingResim {
+    parts: Arc<PlannerParts>,
+    key: ResimKey,
+    auction_id: String,
+    market: String,
+    sim_time: u64,
+    loan: Address,
+    /// The solver op's inner call, as simulated at the head.
+    inner: alloy::primitives::Bytes,
+    overrides: StateOverride,
+    bid_wei: U256,
+    /// The gas pay the op is sent with (from its simulated gas, see `send_terms`).
+    gas_pay_wei: U256,
+    liability_wei: U256,
+    loan_usd: f64,
+    loan_decimals: u8,
+    bid_usd: f64,
+    bonus_usd: f64,
+    positions: usize,
+    router: serde_json::Value,
+}
+
+type ResimQueue = Arc<std::sync::Mutex<Vec<PendingResim>>>;
+
+/// How long past its deadline a pending execution label waits for its metacall before it is
+/// journaled as not executed (no solver won the auction, or its secondary was not seen).
+const RESIM_GRACE_BLOCKS: u64 = 25;
+
+/// Which auction execution a pending label waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResimKey {
+    /// The SVR feed auctioned.
+    aggregator: Address,
+    /// The block the op was valued at.
+    head: u64,
+    /// The auction's last block.
+    deadline: u64,
+}
+
+impl ResimKey {
+    /// Whether the metacall of `aggregator` landing in `block` is this op's auction executing: same feed,
+    /// after the head it was valued at, by its deadline (with RESIM_GRACE_BLOCKS of slack).
+    fn executes_in(&self, aggregator: Address, block: u64) -> bool {
+        self.aggregator == aggregator && self.head < block && block <= self.deadline + RESIM_GRACE_BLOCKS
+    }
+
+    /// Whether its auction can no longer execute at `block`.
+    fn expired_at(&self, block: u64) -> bool {
+        block > self.deadline + RESIM_GRACE_BLOCKS
+    }
+}
+
+impl PendingResim {
+    fn row(&self) -> serde_json::Value {
+        json!({ "kind": "atlas_resim", "auction_id": self.auction_id, "market": self.market, "head": self.key.head, "deadline": self.key.deadline, "router": self.router,
+                "positions": self.positions, "bonus_usd": self.bonus_usd, "bid_usd": self.bid_usd })
+    }
+}
+
+/// An execution label: the op valued at `r.key.head` simulated again on the block before its auction's
+/// metacall (`exec_block`, timestamp `exec_ts`) — at no bid on both blocks (its value net of gas;
+/// the difference is how much it moved between bidding and execution) and as bid at execution
+/// (would it have run). Journaled as `atlas_resim`.
+async fn resim<P: Provider>(provider: P, r: PendingResim, exec_block: u64, exec_ts: u64, journal: tokio::sync::mpsc::UnboundedSender<String>, permits: Arc<tokio::sync::Semaphore>) {
+    let Some(solver) = &r.parts.solver else { return };
+    let Ok(_permit) = permits.acquire_owned().await else { return };
+    let sim = |block: u64, time: u64, bid: U256| sim_batch(&provider, solver, r.loan, &r.inner, &r.overrides, block, time, bid, r.gas_pay_wei, r.liability_wei);
+    let before = exec_block.saturating_sub(1);
+    let (at_head, at_exec, as_bid) = tokio::join!(sim(r.key.head, r.sim_time, U256::ZERO), sim(before, exec_ts, U256::ZERO), sim(before, exec_ts, r.bid_wei));
+    let usd = |s: &venue::SimResult| math::units(s.profit, r.loan_decimals) * r.loan_usd;
+    let err = |s: &Result<venue::SimResult>| s.as_ref().err().map(crate::revert::explain);
+    let (v_head, v_exec) = (at_head.as_ref().ok().map(usd), at_exec.as_ref().ok().map(usd));
+    let mut row = r.row();
+    for (k, v) in [
+        ("exec_block", json!(exec_block)),
+        ("value_head_usd", json!(v_head)),
+        ("value_exec_usd", json!(v_exec)),
+        ("drift_usd", json!(v_head.zip(v_exec).map(|(h, e)| e - h))),
+        ("bid_ok", json!(as_bid.as_ref().is_ok_and(|s| !s.profit.is_zero()))),
+        ("bid_profit_usd", json!(as_bid.as_ref().ok().map(usd))),
+        ("error_head", json!(err(&at_head))),
+        ("error_exec", json!(err(&at_exec))),
+        ("error_bid", json!(err(&as_bid))),
+    ] {
+        row[k] = v;
+    }
+    info!(auction = %r.auction_id, market = %r.market, exec_block, value_head_usd = ?v_head, value_exec_usd = ?v_exec, bid_usd = r.bid_usd, bid_ok = %row["bid_ok"], "ATLAS execution label");
+    let _ = journal.send(row.to_string());
 }
 
 impl<P: Provider + Clone + 'static> AtlasState<P> {
+    /// The auction of `aggregator` executed in `block` (its SVR secondary): label the ops valued for it.
+    fn on_executed(&self, aggregator: Address, block: u64, ts: u64) {
+        let due: Vec<PendingResim> = {
+            let mut q = self.resims.lock().unwrap();
+            let (due, keep) = std::mem::take(&mut *q).into_iter().partition(|r| r.key.executes_in(aggregator, block));
+            *q = keep;
+            due
+        };
+        for r in due {
+            tokio::spawn(resim(self.provider.clone(), r, block, ts, self.journal_tx.clone(), self.resim_permits.clone()));
+        }
+    }
+
+    /// Ops whose auction never executed by `block`: journaled without a label.
+    fn expire_resims(&self, block: u64) {
+        let expired: Vec<PendingResim> = {
+            let mut q = self.resims.lock().unwrap();
+            let (expired, keep) = std::mem::take(&mut *q).into_iter().partition(|r| r.key.expired_at(block));
+            *q = keep;
+            expired
+        };
+        for r in expired {
+            let mut row = r.row();
+            row["exec_block"] = serde_json::Value::Null;
+            row["outcome"] = json!("not_executed");
+            let _ = self.journal_tx.send(row.to_string());
+        }
+    }
+
     /// An oracle log event: applied now if its block's timestamp is known, else held for its head.
     fn on_oracle_log(&mut self, ev: oracle_logs::OracleLogEvent) {
         use oracle_logs::OracleLogEvent as E;
@@ -959,6 +1085,9 @@ impl<P: Provider + Clone + 'static> AtlasState<P> {
 
     fn apply_oracle_log(&mut self, ev: oracle_logs::OracleLogEvent, ts: u64) {
         use oracle_logs::OracleLogEvent as E;
+        if let E::Secondary { aggregator, at, .. } = &ev {
+            self.on_executed(*aggregator, at.block, ts);
+        }
         let (applied, path, aggregator, at) = match ev {
             E::Transmission { aggregator, round, answer, at } => (Some(self.model.apply_transmission(aggregator, round, answer, ts)), oracle::Path::Primary, aggregator, at),
             E::Secondary { aggregator, round, at } => (self.model.apply_secondary_round(aggregator, round, ts), oracle::Path::Secondary, aggregator, at),
@@ -984,6 +1113,7 @@ impl<P: Provider + Clone + 'static> AtlasState<P> {
     /// logs of that block have arrived; a mismatch is a missed event: resynced and counted).
     async fn on_head(&mut self, head: &Head, prev: Option<(u64, &[Option<morpho::onchain::MarketSnapshot>])>, replaying: bool) {
         self.block_ts.insert(head.number, head.timestamp);
+        self.expire_resims(head.number);
         self.block_ts.retain(|b, _| b + BLOCK_TS_KEEP > head.number);
         // Low-frequency meta-oracle `currentOracle()` recheck (the timelock gives hours of warning).
         // A switch rebuilds the market's model against its new underlying oracle, possibly adding
@@ -1115,6 +1245,21 @@ struct AuctionMarket {
     liq: Vec<PositionView>,
 }
 
+impl AuctionMarket {
+    /// The auction's move of this market's oracle price (new / old - 1); 0 when the old one is unknown.
+    fn price_move(&self) -> f64 {
+        let old = math::u256_f64(self.old_price);
+        if old > 0.0 { math::u256_f64(self.snap.price) / old - 1.0 } else { 0.0 }
+    }
+
+    /// The bid context of an op over this market's first `positions` liquidations (largest bonus
+    /// first, as bundles and the single fallback take them), worth `net_usd`.
+    fn bid_ctx(&self, positions: usize, net_usd: f64, eth_usd: f64) -> AuctionBidCtx<'_> {
+        let bonus_usd = self.liq.iter().take(positions).map(|v| v.bonus).sum();
+        AuctionBidCtx { market: Some(&self.meta.name), net_usd, bonus_usd, positions, price_move: self.price_move(), eth_usd }
+    }
+}
+
 /// Solver phase 0: value one SVR auction as if we were bidding, journal it, never submit.
 /// The price comes from the auction hint (the report about to be written). Which positions it
 /// makes liquidatable is evaluated here, in memory; the RPC work runs in a background task so a
@@ -1148,7 +1293,8 @@ fn on_auction<P: Provider + Clone + 'static>(
     // Valuations queue behind each other (atlas.max_concurrent, taken inside value_auction by the
     // one that values) instead of piling onto the RPC pool the block path needs; the wait is
     // journaled as queued_ms.
-    tokio::spawn(value_auction(provider, parts, a, markets, head, eth_usd, sim_time, atlas, true, journal, Some(permits), Some(shared)));
+    let resims = atlas.resim.then(|| st.resims.clone());
+    tokio::spawn(value_auction(provider, parts, a, markets, head, eth_usd, sim_time, atlas, true, journal, Some(permits), Some(shared), resims));
 }
 
 /// How long a report's valuation is shared with its sibling auction: they arrive milliseconds
@@ -1171,7 +1317,7 @@ fn auction_market<P: Provider>(engine: &MorphoEngine<P>, mi: usize, base: &morph
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngine<P>, market: &str, drop_bps: u64, at_block: u64, users: &[Address], use_kyber: bool, auction: Arc<dyn AuctionBidPolicy>, priority: Arc<dyn PriorityBidPolicy>) -> Result<()> {
+async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngine<P>, market: &str, drop_bps: u64, at_block: u64, users: &[Address], use_kyber: bool, max_fee_wei: u128, auction: Arc<dyn AuctionBidPolicy>, priority: Arc<dyn PriorityBidPolicy>) -> Result<()> {
     let mi = engine.market_by_name(market).with_context(|| format!("market {market} not in config"))?;
     anyhow::ensure!(drop_bps < 10_000, "--price-drop-bps must be < 10000");
     let h = heads::http_head(&engine.provider, BlockNumberOrTag::Number(at_block)).await?;
@@ -1194,14 +1340,14 @@ async fn value_auction_at<P: Provider + Clone + 'static>(engine: &mut MorphoEngi
         aggregator: Address::ZERO,
         median: U256::ZERO,
         deadline: h.number + 100,
-        max_fee_per_gas: 0,
+        max_fee_per_gas: max_fee_wei,
         user_op_gas: None,
         user_op_hash: alloy::primitives::B256::ZERO,
         seen: Instant::now(),
         seen_unix_ms: gates::unix_ms(),
     };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    value_auction(engine.provider.clone(), parts, a, vec![m], h, eth_usd, sim_time, engine.cfg.atlas.clone(), use_kyber, tx, None, None).await;
+    value_auction(engine.provider.clone(), parts, a, vec![m], h, eth_usd, sim_time, engine.cfg.atlas.clone(), use_kyber, tx, None, None, None).await;
     let row: serde_json::Value = serde_json::from_str(&rx.recv().await.context("no valuation row")?)?;
     println!("{}", serde_json::to_string_pretty(&row)?);
     Ok(())
@@ -1228,6 +1374,7 @@ async fn value_auction<P: Provider>(
     journal: tokio::sync::mpsc::UnboundedSender<String>,
     permits: Option<Arc<tokio::sync::Semaphore>>,
     shared: Option<Arc<tokio::sync::OnceCell<serde_json::Value>>>,
+    resims: Option<ResimQueue>,
 ) {
     // Whoever runs the valuation takes the permit (atlas.max_concurrent): the sibling of a report
     // that is still queued waits on the same cell instead of valuing outside the limit.
@@ -1247,7 +1394,7 @@ async fn value_auction<P: Provider>(
             let bonus: f64 = markets.iter().flat_map(|m| &m.liq).map(|v| v.bonus).sum();
             return json!({ "skipped": "queued_too_long", "queued_ms": queued_ms, "liquidatable": n_liq, "bonus_usd": bonus, "first_auction": a.id });
         }
-        let mut v = valuation(&provider, &parts, &a, &markets, head, eth_usd, sim_time, &atlas, live).await;
+        let mut v = valuation(&provider, &parts, &a, &markets, head, eth_usd, sim_time, &atlas, live, resims.as_ref().map(|q| (q, &parts))).await;
         v["queued_ms"] = json!(queued_ms);
         v
     };
@@ -1267,7 +1414,16 @@ async fn value_auction<P: Provider>(
     let bundle_net = v["bundle_net_usd"].as_f64().unwrap_or(0.0);
     // The journaled bid: the policy's bid on the bundle net (default: x (1 - atlas.margin)); the
     // dashboard's paper table tries the atlas.paper_margins ladder around it. None = no bid.
-    let bid_usd = parts.auction.bid_usd(None, bundle_net, eth_usd);
+    let biggest = markets.iter().max_by(|x, y| x.liq.iter().map(|v| v.bonus).sum::<f64>().total_cmp(&y.liq.iter().map(|v| v.bonus).sum::<f64>()));
+    let ctx = AuctionBidCtx {
+        market: None,
+        net_usd: bundle_net,
+        bonus_usd: v["bonus_usd"].as_f64().unwrap_or(0.0),
+        positions: v["liquidatable"].as_u64().unwrap_or(0) as usize,
+        price_move: biggest.map_or(0.0, |m| m.price_move()),
+        eth_usd,
+    };
+    let bid_usd = parts.auction.bid(&ctx);
     // From THIS auction's arrival to the op being sendable (the valuation and the overlapped batch-op
     // simulation are done; see valuation()). A shared valuation is timed per sibling: each one's own
     // arrival, not the first auction's. Paper trading times with it.
@@ -1309,6 +1465,10 @@ struct OpCandidate {
     loan_decimals: u8,
     /// Profit after the bid and the gas, in USD: how the auction's markets are ranked for its one op.
     profit_usd: f64,
+    /// Positions it liquidates (the market's largest first).
+    positions: usize,
+    /// The gas liability its simulation reported (the stand-in's), reused by its execution label.
+    liability_wei: U256,
 }
 
 /// What an auction's solver ops cost in gas: Atlas's charge per unit (max fee + surcharges), the
@@ -1431,8 +1591,11 @@ async fn batch_solver_op<P: Provider>(
     BatchOutcome::NeedSingle
 }
 
-/// The single-position solver op: the fallback when a market has no executable bundle plan. Wraps the
-/// top position's direct-route plan, so it needs the per-position plans (hence it runs after them).
+/// The single-position solver op: the fallback when a market has no executable bundle plan, and the
+/// alternative to a one-position bundle. Wraps the top position's direct-route plan, so it needs the
+/// per-position plans (hence it runs after them). Bid like a batch op (`sim_bid_op`): on what the op
+/// really returns at its own simulated gas — the plan's gas is the block path's liquidation alone,
+/// lighter than the solver op, so a bid on it would not survive the gas pay set at submission.
 #[allow(clippy::too_many_arguments)]
 async fn single_solver_op<P: Provider>(
     provider: &P,
@@ -1443,55 +1606,20 @@ async fn single_solver_op<P: Provider>(
     overrides: &StateOverride,
     block: u64,
     sim_time: u64,
+    solver_gas_limit: u64,
+    gas_headroom: f64,
     cost: OpCost,
     eth_usd: f64,
 ) -> Option<(serde_json::Value, Option<OpCandidate>)> {
     let (Some(solver), Venue::Callback(_)) = (&parts.solver, &parts.venue) else { return None };
     let Some(Ok(plan)) = top else { return None };
     let payload = plan.payload.as_ref().filter(|_| plan.router == "direct")?;
-    // Net of the op's gas as Atlas charges it (see valuation()).
-    let op_gas = plan.gas_used.unwrap_or(0);
-    let net = cost.bid_basis(plan.profit_usd.unwrap_or(0.0), op_gas);
-    let Some(bid_usd) = parts.auction.bid_usd(Some(&m.meta.name), net.max(0.0), eth_usd) else {
-        return Some((json!({ "bid_basis": "single_est", "ok": false, "skipped": "policy" }), None));
-    };
-    let bid_wei = U256::from((bid_usd / eth_usd.max(1.0) * 1e18) as u128);
-    // The op pays its own gas (estimated from the plan's) in ETH out of the proceeds.
-    let gas_pay_wei = cost.price.gas_pay_wei(op_gas);
-    let venue = atlas_venue::AtlasBid { solver, bid_wei, gas_pay_wei, gas_liability_wei: cost.liability(op_gas) };
-    let calldata = solver.calldata(m.meta.params.loanToken, &payload.calldata, bid_wei, U256::ZERO, gas_pay_wei);
-    let at = Some(venue::SimAt { number: block + 1, time: sim_time });
-    let r = venue::LiquidationVenue::<Morpho>::simulate(&venue, provider, calldata, alloy::eips::BlockId::number(block), overrides, at, None, None).await;
-    let gas_pay_eth = math::units(gas_pay_wei, 18);
-    Some(match r {
-        Ok(s) => {
-            let net_after_bid = math::units(s.profit, m.meta.loan_decimals);
-            let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, m.meta.params.loanToken, eth_usd).unwrap_or(0.0);
-            let cand = (!s.profit.is_zero()).then(|| OpCandidate {
-                market: mi,
-                payload: payload.clone(),
-                bid_wei,
-                profit: s.profit,
-                gas_used: s.gas_used,
-                gas_pay_wei,
-                loan_usd,
-                loan_decimals: m.meta.loan_decimals,
-                profit_usd: net_after_bid * loan_usd,
-            });
-            (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": true, "net_after_bid": net_after_bid, "net_after_bid_usd": net_after_bid * loan_usd, "gas_pay_eth": gas_pay_eth, "gas_used": s.gas_used }), cand)
-        }
-        Err(e) => (json!({ "bid_basis": "single_est", "bid_usd": bid_usd, "ok": false, "gas_pay_eth": gas_pay_eth, "error": crate::revert::explain(&e) }), None),
-    })
+    let op = SolverOp { inner: payload.calldata.clone(), positions: 1, gas_est: plan.gas_used.unwrap_or(0), quoted_gross_usd: plan.profit_usd.unwrap_or(0.0), label: "single" };
+    let row = json!({ "positions": 1, "router": "direct", "est_gas": op.gas_est });
+    Some(sim_bid_op(provider, parts, mi, m, solver, op, row, overrides, block, sim_time, solver_gas_limit, gas_headroom, cost, eth_usd).await)
 }
 
-/// A batch solver op over a bundle's whole plan. Two simulations: sim #1 bids on the conservative
-/// estimate (gross minus the whole metacall gas Atlas charges) and measures the real gas; the bid is
-/// then repriced on that simulated gas (x SIM_GAS_SAFETY) — higher when the estimate ran loose, the
-/// usual case — and sim #2 proves the repriced op before it can be sent (raising the bid enlarges the
-/// bid swap, which sim #1 did not price). The op pays its gas in ETH out of its proceeds (gasPayWei),
-/// so a simulation's profit is the real net after the bid and the gas, and it gates the send. Both
-/// bid bases and which was used are journaled. If the re-bid cannot be priced or does not simulate,
-/// the estimate-bid op (proven by sim #1) is kept.
+/// A batch solver op over a bundle's whole plan (see `sim_bid_op`).
 #[allow(clippy::too_many_arguments)]
 async fn batch_op<P: Provider>(
     provider: &P,
@@ -1510,96 +1638,150 @@ async fn batch_op<P: Provider>(
     cost: OpCost,
     eth_usd: f64,
 ) -> (serde_json::Value, Option<OpCandidate>) {
+    let op = SolverOp { inner: solver.batch_inner(&m.meta, plan, deadline), positions: plan.items.len(), gas_est: plan.gas_est, quoted_gross_usd: bundle.gross_usd, label: "batch" };
+    let row = json!({ "positions": plan.items.len(), "router": plan.router, "est_gas": plan.gas_est });
+    sim_bid_op(provider, parts, mi, m, solver, op, row, overrides, block, sim_time, solver_gas_limit, gas_headroom, cost, eth_usd).await
+}
+
+/// A solver op to value and bid: its inner MorphoLiquidator call and what it was quoted at.
+struct SolverOp {
+    inner: alloy::primitives::Bytes,
+    /// Positions it liquidates (the market's largest first).
+    positions: usize,
+    /// Its estimated gas (conservative: the gas floor and the bond liability).
+    gas_est: u64,
+    /// Its quoted gross (USD): the exit's output minus the repayment.
+    quoted_gross_usd: f64,
+    /// "batch" or "single" (journal: `bid_basis` = `<label>_est` / `<label>_sim`).
+    label: &'static str,
+}
+
+/// A solver op bid on what it really returns. Sim #1 runs the op at NO bid (its gas pay at the
+/// estimate): its profit is the exit's real proceeds after the repayment and the gas pay, and its gas
+/// the real gas — so the bid basis is the simulated gross (not the quote: a route can return less or
+/// more than quoted) minus the whole metacall gas at the simulated gas (x SIM_GAS_SAFETY), net of the
+/// bid swap's fee. Sim #2 proves the op at the policy's bid on that basis before it can be sent; if it
+/// does not run (the bid swap cost more than its fee), it is retried at each RETRY_BID_SHARES of the
+/// bid. The op pays its gas in ETH out of its proceeds (gasPayWei), so a simulation's profit is the
+/// real net after the bid and the gas, and it gates the send. The quote- and estimate-based basis
+/// (`bid_basis_est_usd`, the gas floor and the bond liability) and the gap between quoted and
+/// simulated gross (`quote_gap_bps`) are journaled into `row`.
+#[allow(clippy::too_many_arguments)]
+async fn sim_bid_op<P: Provider>(
+    provider: &P,
+    parts: &PlannerParts,
+    mi: usize,
+    m: &AuctionMarket,
+    solver: &atlas_venue::AtlasSolver,
+    op: SolverOp,
+    row: serde_json::Value,
+    overrides: &StateOverride,
+    block: u64,
+    sim_time: u64,
+    solver_gas_limit: u64,
+    gas_headroom: f64,
+    cost: OpCost,
+    eth_usd: f64,
+) -> (serde_json::Value, Option<OpCandidate>) {
     let loan = m.meta.params.loanToken;
     let decimals = m.meta.loan_decimals;
-    // Estimate-based bid: the conservative figure that also backs the swap budget and the bond
-    // liability. The bid itself is repriced on the simulated gas below.
-    let bid_basis_est = cost.bid_basis(bundle.gross_usd, plan.gas_est);
-    let gas_pay_wei_est = cost.price.gas_pay_wei(plan.gas_est);
+    let (est, sim) = (format!("{}_est", op.label), format!("{}_sim", op.label));
+    // Estimate-based basis: the conservative figure that backs the gas floor and the bond liability.
+    let bid_basis_est = cost.bid_basis(op.quoted_gross_usd, op.gas_est);
+    let gas_pay_wei_est = cost.price.gas_pay_wei(op.gas_est);
     let gas_pay_eth_est = math::units(gas_pay_wei_est, 18);
-    let row = |extra: serde_json::Value| {
-        let mut base = json!({ "positions": plan.items.len(), "router": plan.router, "est_gas": plan.gas_est, "gas_pay_eth": gas_pay_eth_est });
-        base.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-        base
+    let mut row = row;
+    row["gas_pay_eth"] = json!(gas_pay_eth_est);
+    let with = |row: &serde_json::Value, extra: serde_json::Value| {
+        let mut r = row.clone();
+        r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        r
     };
     // Gas floor: the estimated metacall gas already costs more than the gross -> do not bid.
     if bid_basis_est <= 0.0 {
-        return (row(json!({ "bid_basis": "batch_est", "bid_basis_est_usd": bid_basis_est, "ok": false, "skipped": "gas_floor" })), None);
+        return (with(&row, json!({ "bid_basis": est, "bid_basis_est_usd": bid_basis_est, "ok": false, "skipped": "gas_floor" })), None);
     }
-    let Some(bid_usd_est) = parts.auction.bid_usd(Some(&m.meta.name), bid_basis_est, eth_usd) else {
-        return (row(json!({ "bid_basis": "batch_est", "bid_basis_est_usd": bid_basis_est, "ok": false, "skipped": "policy" })), None);
-    };
-    let bid_wei_est = U256::from((bid_usd_est / eth_usd.max(1.0) * 1e18) as u128);
-    let inner = solver.batch_inner(&m.meta, plan, deadline);
 
-    // Sim #1: the estimate-bid op. It measures the real gas and is the proven fallback if the re-bid
-    // below cannot be priced or does not simulate.
+    // Sim #1: the op at no bid — what the exit really returns, and the real gas.
     let t_sim = std::time::Instant::now();
-    let r = sim_batch(provider, solver, loan, &inner, overrides, block, sim_time, bid_wei_est, gas_pay_wei_est, cost.liability(plan.gas_est)).await;
+    let r = sim_batch(provider, solver, loan, &op.inner, overrides, block, sim_time, U256::ZERO, gas_pay_wei_est, cost.liability(op.gas_est)).await;
     let batch_sim_ms = t_sim.elapsed().as_millis() as u64;
     let s = match r {
         Ok(s) => s,
-        Err(e) => return (row(json!({ "bid_basis": "batch_est", "bid_basis_est_usd": bid_basis_est, "bid_usd": bid_usd_est, "ok": false, "error": crate::revert::explain(&e), "batch_sim_ms": batch_sim_ms })), None),
+        Err(e) => return (with(&row, json!({ "bid_basis": sim, "bid_basis_est_usd": bid_basis_est, "ok": false, "error": crate::revert::explain(&e), "batch_sim_ms": batch_sim_ms })), None),
     };
     // The real sim gas is the hard safety (an aggregator exit can run well above its estimate): too
     // close to the DappControl's solverGasLimit and the op risks running out of gas on-chain, so it
     // is not sent even though the sim passed.
     if !atlas_venue::fits_solver_gas(s.gas_used, solver_gas_limit, gas_headroom) {
-        return (row(json!({ "bid_basis": "batch_est", "bid_basis_est_usd": bid_basis_est, "ok": false, "skipped": "gas_near_limit", "gas_used": s.gas_used, "limit": solver_gas_limit, "batch_sim_ms": batch_sim_ms })), None);
+        return (with(&row, json!({ "bid_basis": sim, "bid_basis_est_usd": bid_basis_est, "ok": false, "skipped": "gas_near_limit", "gas_used": s.gas_used, "limit": solver_gas_limit, "batch_sim_ms": batch_sim_ms })), None);
     }
     let loan_usd = protocol::LendingProtocol::loan_usd(&parts.protocol, &m.meta, &m.snap, loan, eth_usd).unwrap_or(0.0);
-    // Reprice the bid on the simulated gas (x SIM_GAS_SAFETY) instead of the conservative estimate:
-    // the estimate runs ~1.4x the real gas, so an estimate-based bid gives up gas savings that could
-    // be bid (and, when the sim ran dearer, over-bids). Raising the bid enlarges the bid swap (it
-    // buys bid + gas pay), which sim #1 did not price, so the re-bid op is SIMULATED AGAIN before it
-    // can be a candidate — never sent on the strength of sim #1 alone. minProfit still guards it.
-    let bid_basis_sim = cost.bid_basis_from_sim(bundle.gross_usd, s.gas_used);
-    let mk_cand = |bid_wei: U256, gas_pay_wei: U256, r: &venue::SimResult| OpCandidate {
-        market: mi,
-        payload: executor::Payload { to: solver.solver, calldata: inner.clone(), min_profit: atlas_venue::SOLVER_MIN_PROFIT },
-        bid_wei,
-        profit: r.profit,
-        gas_used: r.gas_used,
-        gas_pay_wei,
-        loan_usd,
-        loan_decimals: decimals,
-        profit_usd: math::units(r.profit, decimals) * loan_usd,
-    };
-    // The sim-gas bid, re-simulated. Some only when it prices, fits the gas limit and still pays.
-    let rebid = async {
-        if bid_basis_sim <= 0.0 {
-            return None;
-        }
-        let bid_usd_sim = parts.auction.bid_usd(Some(&m.meta.name), bid_basis_sim, eth_usd)?;
-        let bid_wei_sim = U256::from((bid_usd_sim / eth_usd.max(1.0) * 1e18) as u128);
-        let gas_pay_sim = cost.price.gas_pay_wei(sim_bid_gas(s.gas_used));
-        // The stub liability only has to cover the gas pay in the sim; keep it at the larger of the
-        // estimate and the sim-priced gas so the op pays its whole gas pay.
-        let liability = cost.liability(plan.gas_est.max(sim_bid_gas(s.gas_used)));
-        let t2 = std::time::Instant::now();
-        let s2 = sim_batch(provider, solver, loan, &inner, overrides, block, sim_time, bid_wei_sim, gas_pay_sim, liability).await.ok()?;
-        let rebid_sim_ms = t2.elapsed().as_millis() as u64;
-        (atlas_venue::fits_solver_gas(s2.gas_used, solver_gas_limit, gas_headroom) && !s2.profit.is_zero()).then_some((bid_usd_sim, bid_wei_sim, gas_pay_sim, s2, rebid_sim_ms))
+    // The simulated gross: sim #1's profit is the proceeds after the repayment minus the gas pay it
+    // bought (at the bid swap's fee). The basis is what that leaves for the bid after the whole
+    // metacall gas at the simulated gas, the bid itself bought at the same fee.
+    let fee = solver.bid_swap_fee(loan);
+    let gross_sim_usd = math::units(s.profit, decimals) * loan_usd + gas_pay_eth_est * eth_usd * (1.0 + fee);
+    let bid_basis_sim = cost.bid_basis_from_sim(gross_sim_usd / (1.0 + fee), s.gas_used);
+    let quote_gap_bps = if op.quoted_gross_usd > 0.0 { ((gross_sim_usd / op.quoted_gross_usd - 1.0) * 1e4).round() } else { 0.0 };
+    let row = with(&row, json!({ "bid_basis": sim, "bid_basis_est_usd": bid_basis_est, "bid_basis_sim_usd": bid_basis_sim, "gross_sim_usd": gross_sim_usd, "quote_gap_bps": quote_gap_bps, "gas_used": s.gas_used, "batch_sim_ms": batch_sim_ms }));
+    if bid_basis_sim <= 0.0 {
+        return (with(&row, json!({ "ok": false, "skipped": "gas_floor" })), None);
     }
-    .await;
-
-    match rebid {
-        Some((bid_usd_sim, bid_wei_sim, gas_pay_sim, s2, rebid_sim_ms)) => {
+    let Some(bid_usd) = parts.auction.bid(&m.bid_ctx(op.positions, bid_basis_sim, eth_usd)) else {
+        return (with(&row, json!({ "ok": false, "skipped": "policy" })), None);
+    };
+    // Sim #2 proves the op at the bid (gas pay at the simulated gas, as submission sets it); the bid is
+    // never sent on sim #1 alone (it priced no bid swap for the bid). Some only when it runs, fits the
+    // gas limit and pays.
+    let gas_pay_sim = cost.price.gas_pay_wei(sim_bid_gas(s.gas_used));
+    // The stub liability only has to cover the gas pay in the sim; keep it at the larger of the
+    // estimate and the sim-priced gas so the op pays its whole gas pay.
+    let liability = cost.liability(op.gas_est.max(sim_bid_gas(s.gas_used)));
+    let inner = &op.inner;
+    let prove = |bid_usd: f64| async move {
+        let bid_wei = U256::from((bid_usd / eth_usd.max(1.0) * 1e18) as u128);
+        let s2 = sim_batch(provider, solver, loan, inner, overrides, block, sim_time, bid_wei, gas_pay_sim, liability).await;
+        (bid_wei, s2.ok().filter(|s2| atlas_venue::fits_solver_gas(s2.gas_used, solver_gas_limit, gas_headroom) && !s2.profit.is_zero()))
+    };
+    let t2 = std::time::Instant::now();
+    let (mut bid_wei, mut s2) = prove(bid_usd).await;
+    let mut tried = bid_usd;
+    let mut retries = 0;
+    for share in RETRY_BID_SHARES {
+        if s2.is_some() {
+            break;
+        }
+        tried = bid_usd * share;
+        retries += 1;
+        (bid_wei, s2) = prove(tried).await;
+    }
+    let rebid_sim_ms = t2.elapsed().as_millis() as u64;
+    match s2 {
+        Some(s2) => {
             let net_after_bid = math::units(s2.profit, decimals);
-            let cand = Some(mk_cand(bid_wei_sim, gas_pay_sim, &s2));
-            (row(json!({ "bid_basis": "batch_sim", "bid_basis_est_usd": bid_basis_est, "bid_basis_sim_usd": bid_basis_sim, "bid_usd": bid_usd_sim, "ok": true, "net_after_bid": net_after_bid, "net_after_bid_usd": net_after_bid * loan_usd, "gas_used": s.gas_used, "sim_gas": s2.gas_used, "batch_sim_ms": batch_sim_ms, "rebid_sim_ms": rebid_sim_ms })), cand)
+            let cand = OpCandidate {
+                market: mi,
+                payload: executor::Payload { to: solver.solver, calldata: op.inner.clone(), min_profit: atlas_venue::SOLVER_MIN_PROFIT },
+                bid_wei,
+                profit: s2.profit,
+                gas_used: s2.gas_used,
+                gas_pay_wei: gas_pay_sim,
+                loan_usd,
+                loan_decimals: decimals,
+                profit_usd: net_after_bid * loan_usd,
+                positions: op.positions,
+                liability_wei: liability,
+            };
+            (with(&row, json!({ "bid_usd": tried, "retries": retries, "ok": true, "net_after_bid": net_after_bid, "net_after_bid_usd": net_after_bid * loan_usd, "sim_gas": s2.gas_used, "rebid_sim_ms": rebid_sim_ms })), Some(cand))
         }
-        None => {
-            // Keep the estimate-bid op, which sim #1 proved (the re-bid was below the gas floor at the
-            // simulated gas, rejected by policy, or did not simulate). Submission reprices its gas pay
-            // from the simulated gas, as before.
-            let net_after_bid = math::units(s.profit, decimals);
-            let ok = !s.profit.is_zero();
-            let cand = ok.then(|| mk_cand(bid_wei_est, gas_pay_wei_est, &s));
-            (row(json!({ "bid_basis": "batch_est", "bid_basis_est_usd": bid_basis_est, "bid_basis_sim_usd": bid_basis_sim, "bid_usd": bid_usd_est, "ok": ok, "net_after_bid": net_after_bid, "net_after_bid_usd": net_after_bid * loan_usd, "gas_used": s.gas_used, "batch_sim_ms": batch_sim_ms })), cand)
-        }
+        None => (with(&row, json!({ "bid_usd": tried, "retries": retries, "ok": false, "error": "the op did not run at the bid (nor at the retries)", "rebid_sim_ms": rebid_sim_ms })), None),
     }
 }
+
+/// The shares of a bid a solver op is retried at, in order, when it did not run at the bid itself
+/// (`sim_bid_op`): the bid swap's price impact can cost more than its pool fee.
+const RETRY_BID_SHARES: [f64; 2] = [0.99, 0.97];
 
 /// Why the bond does not let an op go (see `bond_allows`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1721,6 +1903,9 @@ async fn valuation<P: Provider>(
     sim_time: u64,
     atlas: &config::AtlasConfig,
     live: bool,
+    // `[atlas] resim`: where the ops that would pay wait for their execution labels (and the parts
+    // they are simulated with).
+    resims: Option<(&ResimQueue, &Arc<PlannerParts>)>,
 ) -> serde_json::Value {
     // Execution checks: the largest position also tries Kyber ("best": quote + build + sim proves
     // the aggregator route runs in our contract), the rest only the direct router: Kyber throttles
@@ -1770,10 +1955,29 @@ async fn valuation<P: Provider>(
         let plans_fut = futures::future::join_all(ctxs.iter().enumerate().map(|(i, c)| if i == 0 { planner_top.plan(provider, c) } else { planner.plan(provider, c) }));
         let (outcome, plans) = tokio::join!(batch_fut, plans_fut);
         let plans: Vec<_> = ctxs.iter().map(|c| c.view).zip(plans).map(|(v, p)| (v.clone(), p)).collect();
+        let top = plans.first().map(|(_, p)| p);
         let op = match outcome {
+            // A bundle of one position is the single op's liquidation in a batch's flash loan and
+            // fixed gas: the plain single op can bid more (or exist where the batch does not). Both
+            // are simulated; the higher bid goes, the other is journaled beside it.
+            BatchOutcome::Row(r, c) if r["positions"].as_u64() == Some(1) => {
+                let c = c.map(|c| *c);
+                match single_solver_op(provider, parts, mi, m, top, &overrides, head.number, sim_time, atlas.solver_gas_limit, atlas.bundle_gas_headroom, cost, eth_usd).await {
+                    Some((mut sr, Some(sc))) if c.as_ref().is_none_or(|b| sc.bid_wei > b.bid_wei) => {
+                        sr["batch_alt"] = r;
+                        Some((sr, Some(sc)))
+                    }
+                    Some((sr, _)) => {
+                        let mut r = r;
+                        r["single_alt"] = sr;
+                        Some((r, c))
+                    }
+                    None => Some((r, c)),
+                }
+            }
             BatchOutcome::Row(r, c) => Some((r, c.map(|c| *c))),
             BatchOutcome::NoRow => None,
-            BatchOutcome::NeedSingle => single_solver_op(provider, parts, mi, m, plans.first().map(|(_, p)| p), &overrides, head.number, sim_time, cost, eth_usd).await,
+            BatchOutcome::NeedSingle => single_solver_op(provider, parts, mi, m, top, &overrides, head.number, sim_time, atlas.solver_gas_limit, atlas.bundle_gas_headroom, cost, eth_usd).await,
         };
         (bundle, bundle_ms, overrides, plans, op)
     }))
@@ -1818,6 +2022,33 @@ async fn valuation<P: Provider>(
             if let Some(Some(row)) = solvers.get_mut(c.market) {
                 row["submitted"] = submitted;
             }
+        }
+    }
+    // Every op that would pay waits for the auction's metacall, to be simulated again there.
+    if let (Some((queue, owner)), Some(_)) = (resims, &parts.solver) {
+        let mut q = queue.lock().unwrap();
+        for (c, (_, _, overrides, _)) in cands.iter().zip(&valued) {
+            let Some(c) = c else { continue };
+            let m = &markets[c.market];
+            q.push(PendingResim {
+                parts: owner.clone(),
+                key: ResimKey { aggregator: a.aggregator, head: head.number, deadline: a.deadline },
+                auction_id: a.id.clone(),
+                market: m.meta.name.clone(),
+                sim_time,
+                loan: m.meta.params.loanToken,
+                inner: c.payload.calldata.clone(),
+                overrides: overrides.clone(),
+                bid_wei: c.bid_wei,
+                gas_pay_wei: cost.price.gas_pay_wei(c.gas_used),
+                liability_wei: c.liability_wei,
+                loan_usd: c.loan_usd,
+                loan_decimals: c.loan_decimals,
+                bid_usd: math::units(c.bid_wei, 18) * eth_usd,
+                bonus_usd: m.liq.iter().take(c.positions).map(|v| v.bonus).sum(),
+                positions: c.positions,
+                router: solvers.get(c.market).and_then(|r| r.as_ref()).map_or(serde_json::Value::Null, |r| r.get("router").cloned().unwrap_or(json!("single"))),
+            });
         }
     }
 
@@ -1940,6 +2171,12 @@ async fn send_approved<P: Provider>(e: &ExecHandle, parts: &PlannerParts, provid
     };
     if priority_fee_wei < checked_wei {
         info!(market = %meta.name, user = %v.user, bid_gwei = checked_wei as f64 / 1e9, cut_gwei = priority_fee_wei as f64 / 1e9, "bid cut to fit exec.max_tx_cost_eth");
+    }
+    // The risk gate checked the curve's bid against the predicted winner; the priority actually sent
+    // can be lower (the base priority when the bid did not pay at its own priority, or a cut), so the
+    // same rule holds for it.
+    if let Some(why) = risk::outbid(cfg, priority_fee_wei, competitor_wei) {
+        return refused(&why, gas_limit as u128 * (base_fee_wei * 2 + priority_fee_wei) + l1_fee_wei);
     }
     let worst_wei = gas_limit as u128 * (base_fee_wei * 2 + priority_fee_wei) + l1_fee_wei;
     // The background reading minus what the txs in flight may still burn; a live read only before
@@ -2311,6 +2548,8 @@ async fn watch<P: Provider + Clone + Send + Sync + 'static>(
             journal_tx: journal_tx.clone(),
             valuations: Arc::new(tokio::sync::Semaphore::new(engine.cfg.atlas.max_concurrent.max(1))),
             auction_cache: Arc::default(),
+            resims: Arc::default(),
+            resim_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             dropped,
             dropped_journaled: 0,
             last_meta_recheck: last_block,
@@ -2889,6 +3128,19 @@ fn price_human(price: U256, meta: &MarketMeta) -> f64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_execution_label_waits_for_its_own_feeds_metacall_until_past_the_deadline() {
+        let (feed, other) = (Address::repeat_byte(1), Address::repeat_byte(2));
+        let k = ResimKey { aggregator: feed, head: 100, deadline: 120 };
+        assert!(k.executes_in(feed, 101));
+        assert!(k.executes_in(feed, 120 + RESIM_GRACE_BLOCKS), "a metacall a little past the deadline still counts");
+        assert!(!k.executes_in(other, 110), "another feed's metacall");
+        assert!(!k.executes_in(feed, 100), "not before the block it was valued after");
+        assert!(!k.executes_in(feed, 121 + RESIM_GRACE_BLOCKS));
+        assert!(!k.expired_at(120 + RESIM_GRACE_BLOCKS));
+        assert!(k.expired_at(121 + RESIM_GRACE_BLOCKS));
+    }
+
     /// An SVR primary past its cutoff is in effect from the head that applies it: the previous
     /// block (still the old price on-chain) is not a missed update, and the next block agrees.
     /// Found in a shadow run (2026-11-02): two false "missed" warnings and a block valued at the old
@@ -2916,6 +3168,8 @@ mod tests {
             journal_tx,
             valuations: Arc::new(tokio::sync::Semaphore::new(1)),
             auction_cache: Arc::default(),
+            resims: Arc::default(),
+            resim_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             dropped: Arc::default(),
             dropped_journaled: 0,
             last_meta_recheck: 0,

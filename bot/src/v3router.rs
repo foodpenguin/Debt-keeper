@@ -196,11 +196,21 @@ pub struct Allocation {
     pub seize: U256,
     pub expected_out: U256,
     pub est_swap_gas: u64,
+    /// Collateral beyond the grid (`seize - unit x units`) that the source leg with the most units
+    /// also sells: a full-sale allocation (`allocate_full`) spends exactly the amount asked for,
+    /// not the grid's rounded-down total. Zero for prefix allocations.
+    pub remainder: U256,
 }
 
 impl Allocation {
     pub fn legs_used(&self) -> usize {
         self.source_units.iter().chain(&self.sink_units).filter(|u| **u > 0).count()
+    }
+
+    /// The source leg that carries `remainder`: the one with the most units (the first on a tie).
+    fn remainder_leg(&self) -> Option<usize> {
+        let max = *self.source_units.iter().max()?;
+        (max > 0).then(|| self.source_units.iter().position(|u| *u == max)).flatten()
     }
 }
 
@@ -353,9 +363,11 @@ impl V3Router {
             out.push(flags | leg.zero_for_one as u8);
             out.extend_from_slice(&amount.to_be_bytes());
         };
+        let carry = alloc.remainder_leg();
         for (i, &u) in alloc.source_units.iter().enumerate() {
             if u > 0 {
-                push(sources[i], 0, (grid.unit * U256::from(u)).to::<u128>());
+                let extra = if carry == Some(i) { alloc.remainder } else { U256::ZERO };
+                push(sources[i], 0, (grid.unit * U256::from(u) + extra).to::<u128>());
             }
         }
         let used: Vec<(usize, u64)> = alloc.sink_units.iter().copied().enumerate().filter(|(_, u)| *u > 0).collect();
@@ -415,11 +427,11 @@ pub fn allocate(
         return None;
     }
     let sink = SinkCurve::build(grid);
-    let mut best = greedy(grid, n_direct, &sink, &vec![true; n], &repay, gas_per_extra_leg, &gas_cost, &to_units);
+    let mut best = greedy(grid, n_direct, &sink, &vec![true; n], &repay, gas_per_extra_leg, &gas_cost, &to_units, None);
     for s in 0..n {
         let mut only = vec![false; n];
         only[s] = true;
-        if let Some(c) = greedy(grid, n_direct, &sink, &only, &repay, gas_per_extra_leg, &gas_cost, &to_units)
+        if let Some(c) = greedy(grid, n_direct, &sink, &only, &repay, gas_per_extra_leg, &gas_cost, &to_units, None)
             && best.as_ref().is_none_or(|b| c.0 > b.0)
         {
             best = Some(c);
@@ -428,6 +440,83 @@ pub fn allocate(
     best.filter(|b| b.0 > 0.0).map(|b| b.1)
 }
 
+/// Most source legs a full-sale allocation combines (every subset up to this size is searched).
+pub const FULL_SALE_MAX_LEGS: usize = 3;
+
+/// The best allocation that sells exactly `total` (a bundle: every seized unit must go, the route
+/// spends exactly what the liquidations seized). The grid covers `unit x K <= total`; the
+/// rounding remainder rides on the leg with the most units (`Allocation::remainder`), and the
+/// value is net of `repay(total)`.
+///
+/// Searched over the greedy split of all legs and of every subset of up to FULL_SALE_MAX_LEGS
+/// source legs, each valued net of its route gas at `gas_cost` — at a high gas price (an Atlas
+/// auction) one or two deep pools beat a many-leg split whose extra output does not pay for its
+/// gas, which a split by marginal output alone never sees. Allocations above `gas_budget` are left
+/// out. Ok(None) = no subset nets a positive value; Err(gas) = profitable ones exist but none fits
+/// the budget (the least gas among them).
+#[allow(clippy::too_many_arguments)]
+pub fn allocate_full(
+    grid: &Grid,
+    n_direct: usize,
+    total: U256,
+    repay: impl Fn(U256) -> U256,
+    gas_per_extra_leg: u64,
+    gas_cost: impl Fn(u64) -> f64,
+    to_units: impl Fn(U256) -> f64,
+    gas_budget: Option<u64>,
+) -> Result<Option<Allocation>, u64> {
+    let n = grid.sources.len();
+    if n == 0 || grid.unit.is_zero() || total < grid.unit {
+        return Ok(None);
+    }
+    let sink = SinkCurve::build(grid);
+    let mut subsets: Vec<Vec<bool>> = vec![vec![true; n]];
+    for size in 1..=FULL_SALE_MAX_LEGS.min(n) {
+        for_each_subset(n, size, &mut |idx| {
+            let mut allowed = vec![false; n];
+            idx.iter().for_each(|&i| allowed[i] = true);
+            subsets.push(allowed);
+        });
+    }
+    let (mut best, mut least_over): (Option<(f64, Allocation)>, Option<u64>) = (None, None);
+    for allowed in subsets {
+        let Some(c) = greedy(grid, n_direct, &sink, &allowed, &repay, gas_per_extra_leg, &gas_cost, &to_units, Some(total)) else { continue };
+        if c.0 <= 0.0 {
+            continue;
+        }
+        if gas_budget.is_some_and(|b| c.1.est_swap_gas > b) {
+            least_over = Some(least_over.map_or(c.1.est_swap_gas, |g| g.min(c.1.est_swap_gas)));
+            continue;
+        }
+        if best.as_ref().is_none_or(|b| c.0 > b.0) {
+            best = Some(c);
+        }
+    }
+    match (best, least_over) {
+        (Some(b), _) => Ok(Some(b.1)),
+        (None, Some(g)) => Err(g),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Calls `f` with every `size`-element subset of 0..n (indices ascending).
+fn for_each_subset(n: usize, size: usize, f: &mut impl FnMut(&[usize])) {
+    fn rec(start: usize, n: usize, size: usize, cur: &mut Vec<usize>, f: &mut impl FnMut(&[usize])) {
+        if cur.len() == size {
+            f(cur);
+            return;
+        }
+        for i in start..n {
+            cur.push(i);
+            rec(i + 1, n, size, cur, f);
+            cur.pop();
+        }
+    }
+    rec(0, n, size, &mut Vec::with_capacity(size), f);
+}
+
+/// Greedy split by marginal output over the `allowed` source legs. `full` = None: the best prefix
+/// (any size); Some(total): only the allocation that places every grid unit, as a sale of `total`.
 #[allow(clippy::too_many_arguments)]
 fn greedy(
     grid: &Grid,
@@ -438,6 +527,7 @@ fn greedy(
     gas_per_extra_leg: u64,
     gas_cost: &impl Fn(u64) -> f64,
     to_units: &impl Fn(U256) -> f64,
+    full: Option<U256>,
 ) -> Option<(f64, Allocation)> {
     let n = grid.sources.len();
     let k_max = grid.sources[0].out.len() as u64;
@@ -471,8 +561,12 @@ fn greedy(
         } else {
             conn_total += delta;
         }
+        if full.is_some() && step < k_max {
+            continue;
+        }
         let total_out = direct_out + sink.value_at(conn_total, grid.conn_unit);
-        let seize = grid.unit * U256::from(step);
+        let gridded = grid.unit * U256::from(step);
+        let seize = full.unwrap_or(gridded);
         let used_sources = units.iter().filter(|u| **u > 0).count() as u64;
         let sink_idx = if conn_total.is_zero() { 0 } else { sink.index_for(conn_total, grid.conn_unit) };
         let swap_gas = units.iter().enumerate().map(|(i, &u)| grid.sources[i].gas_at(u)).sum::<u64>()
@@ -481,7 +575,7 @@ fn greedy(
         let value = to_units(total_out) - to_units(repay(seize)) - gas_cost(swap_gas);
         if best.as_ref().is_none_or(|b| value > b.0) {
             let sink_units = if conn_total.is_zero() { vec![] } else { sink.split.get(sink_idx).cloned().unwrap_or_default() };
-            best = Some((value, Allocation { source_units: units.clone(), sink_units, seize, expected_out: total_out, est_swap_gas: swap_gas }));
+            best = Some((value, Allocation { source_units: units.clone(), sink_units, seize, expected_out: total_out, est_swap_gas: swap_gas, remainder: seize.saturating_sub(gridded) }));
         }
     }
     best
@@ -528,6 +622,62 @@ mod tests {
         // Unprofitable at any price: Ok(None).
         let poor = Grid { unit: U256::from(100u64), sources: vec![curve(&[50, 90, 120, 140])], ..Default::default() };
         assert!(allocate_within(&poor, 1, repay90, 60_000, 1e-6, u, Some(1_000_000)).unwrap().is_none());
+    }
+
+    #[test]
+    fn full_sale_sells_exactly_the_total_with_the_remainder_on_the_biggest_leg() {
+        // 403 to sell on a 4 x 100 grid: the 3 left over ride on the leg with the most units, and
+        // the value is net of repaying all 403. A prefix allocation would stop where the marginal
+        // unit stops paying; a bundle cannot.
+        let g = Grid { unit: U256::from(100u64), sources: vec![curve(&[120, 230, 280, 300]), curve(&[110, 215, 315, 410])], ..Default::default() };
+        let a = allocate_full(&g, 2, U256::from(403u64), repay90, 0, |_| 0.0, u, None).unwrap().unwrap();
+        assert_eq!(a.source_units.iter().sum::<u64>(), 4, "every unit placed: {a:?}");
+        assert_eq!((a.seize, a.remainder), (U256::from(403u64), U256::from(3u64)));
+        let mut r = V3Router { factories: vec![], connectors: vec![], quoter_code: Bytes::new(), routes: HashMap::new(), max_legs: 4, grid_points: 4 };
+        let pair = Pair { collateral: Address::ZERO, debt: Address::ZERO };
+        let leg = |b: u8| Leg { pool: Address::repeat_byte(b), zero_for_one: false, label: String::new() };
+        r.routes.insert(pair, MarketRoutes { direct: vec![leg(1), leg(2)], ..Default::default() });
+        let b = r.encode(pair, &g, &a);
+        let spent: u128 = (0..b.len() / 37).map(|i| u128::from_be_bytes(b[i * 37 + 21..i * 37 + 37].try_into().unwrap())).sum();
+        assert_eq!(spent, 403, "the route spends exactly the seized amount");
+    }
+
+    #[test]
+    fn full_sale_weighs_leg_gas_at_the_given_price() {
+        // Free gas: the 2/2 split (445 out) beats either leg alone (p1 x4 = 410). At a dear gas price
+        // the second leg (100k + 60k extra) costs more than the 35 it adds: one leg sells it all.
+        let g = Grid { unit: U256::from(100u64), sources: vec![curve(&[120, 230, 280, 300]), curve(&[110, 215, 315, 410])], ..Default::default() };
+        let cheap = allocate_full(&g, 2, U256::from(400u64), repay90, 60_000, |_| 0.0, u, None).unwrap().unwrap();
+        assert_eq!(cheap.source_units, vec![2, 2]);
+        let dear = allocate_full(&g, 2, U256::from(400u64), repay90, 60_000, |gas| gas as f64 * 4e-4, u, None).unwrap().unwrap();
+        assert_eq!(dear.source_units, vec![0, 4], "{dear:?}");
+        // The budget leaves out the split; nothing fits a budget below one leg's gas.
+        let fit = allocate_full(&g, 2, U256::from(400u64), repay90, 60_000, |_| 0.0, u, Some(150_000)).unwrap().unwrap();
+        assert_eq!(fit.source_units, vec![0, 4]);
+        assert_eq!(allocate_full(&g, 2, U256::from(400u64), repay90, 60_000, |_| 0.0, u, Some(50_000)).unwrap_err(), 100_000);
+    }
+
+    #[test]
+    fn full_sale_finds_a_pair_the_all_leg_greedy_misses() {
+        // Three legs; the greedy over all of them spreads into the shallow third leg (first unit
+        // 101), paying its fixed gas. The best is legs 0 + 1 only, which only a subset search sees.
+        let g = Grid {
+            unit: U256::from(100u64),
+            sources: vec![curve(&[100, 199, 297, 394]), curve(&[100, 199, 297, 394]), curve(&[101, 102, 103, 104])],
+            ..Default::default()
+        };
+        let a = allocate_full(&g, 3, U256::from(400u64), repay90, 50_000, |gas| gas as f64 / 50_000.0, u, None).unwrap().unwrap();
+        assert_eq!(a.source_units[2], 0, "{a:?}");
+        assert_eq!(a.source_units.iter().sum::<u64>(), 4);
+    }
+
+    #[test]
+    fn full_sale_is_none_when_selling_everything_loses() {
+        // Selling all 4 units returns 360 for 360 repaid: nothing left after any gas.
+        let g = Grid { unit: U256::from(100u64), sources: vec![curve(&[120, 230, 300, 360])], ..Default::default() };
+        assert!(allocate_full(&g, 1, U256::from(400u64), repay90, 0, |gas| gas as f64 * 1e-6, u, None).unwrap().is_none());
+        // ...while a prefix allocation would still take the profitable first units.
+        assert!(allocate(&g, 1, repay90, 0, |gas| gas as f64 * 1e-6, u).is_some());
     }
 
     #[test]
